@@ -13,6 +13,21 @@ from flocks.hub import local
 from flocks.hub.models import HubCatalogEntry, HubIndex, HubIndexEntry, HubPluginManifest, HubTaxonomy, PluginType
 from flocks.hub.paths import get_bundled_hub_root
 
+_LEGACY_REMOVED_PLUGINS: dict[tuple[PluginType, str], dict[str, Optional[str]]] = {
+    ("agent", "alert-triage-agent"): {
+        "replacement": "swarm-orchestrator",
+        "reason": "Superseded by the pentest agent pack.",
+    },
+    ("workflow", "quick-alert-summary"): {
+        "replacement": "tdp_alert_triage",
+        "reason": "Replaced by maintained bundled triage workflows.",
+    },
+    ("tool", "hub_echo"): {
+        "replacement": None,
+        "reason": "Removed from bundled Hub plugins.",
+    },
+}
+
 
 def _read_json(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
@@ -26,6 +41,21 @@ def _read_yaml(path: Path) -> dict[str, Any]:
         return data if isinstance(data, dict) else {}
     except Exception:
         return {}
+
+
+def _contains_cjk(value: str) -> bool:
+    return any("\u4e00" <= char <= "\u9fff" for char in value or "")
+
+
+def legacy_removed_plugin_message(plugin_type: PluginType, plugin_id: str) -> Optional[str]:
+    info = _LEGACY_REMOVED_PLUGINS.get((plugin_type, plugin_id))
+    if not info:
+        return None
+    replacement = info.get("replacement")
+    reason = info.get("reason") or "Removed from bundled Hub plugins."
+    if replacement:
+        return f"{plugin_type}:{plugin_id} has been removed. {reason} Use {replacement} instead."
+    return f"{plugin_type}:{plugin_id} has been removed. {reason}"
 
 
 def _frontmatter(path: Path) -> dict[str, Any]:
@@ -119,6 +149,7 @@ def _base_manifest(
     name: str,
     description: str,
     category: str,
+    description_cn: Optional[str] = None,
     tags: Optional[list[str]] = None,
     use_cases: Optional[list[str]] = None,
     capabilities: Optional[list[str]] = None,
@@ -136,6 +167,7 @@ def _base_manifest(
         type=plugin_type,
         name=name or plugin_id,
         description=description or "",
+        descriptionCn=description_cn,
         version="1.0.0",
         author="Flocks Team",
         license="MIT",
@@ -194,7 +226,8 @@ def _agent_manifest(plugin_id: str, root: Path) -> Optional[HubPluginManifest]:
         plugin_type="agent",
         plugin_id=plugin_id,
         name=str(data.get("name") or plugin_id),
-        description=str(data.get("description_cn") or data.get("description") or ""),
+        description=str(data.get("description") or data.get("description_cn") or ""),
+        description_cn=str(data.get("description_cn") or "") or None,
         category="detection",
         tags=_safe_tags([str(item) for item in data.get("tags", []) if isinstance(item, str)]),
         use_cases=["alert-triage"],
@@ -215,12 +248,19 @@ def _workflow_manifest(plugin_id: str, root: Path) -> Optional[HubPluginManifest
         return None
     data = _read_json(workflow_file) if workflow_file.is_file() else {}
     entrypoints = [name for name in ("workflow.json", "workflow.md") if (root / name).exists()]
+    description_raw = str(data.get("description") or "")
+    description_en = str(data.get("description_en") or "").strip()
+    description_cn = str(data.get("description_cn") or data.get("descriptionCn") or "").strip()
+    description = description_en or description_raw
+    if not description_cn and _contains_cjk(description_raw):
+        description_cn = description_raw
     return _base_manifest(
         plugin_type="workflow",
         plugin_id=plugin_id,
         name=str(data.get("name") or data.get("id") or plugin_id),
-        description=str(data.get("description") or ""),
+        description=description,
         category="workflow-automation",
+        description_cn=description_cn or None,
         tags=_safe_tags(["siem", "ndr"] if "tdp" in plugin_id else ["hids", "linux"]),
         use_cases=["alert-triage"] if "tdp" in plugin_id else ["endpoint-forensics"],
         capabilities=["workflow"],
@@ -241,12 +281,65 @@ def _has_direct_tool_payload(root: Path) -> bool:
     )
 
 
+def _tool_tags(plugin_id: str, description: str) -> list[str]:
+    manual_tags: dict[str, list[str]] = {
+        "fofa": ["network-mapping", "network", "threat-intelligence"],
+        "greynoise": ["threat-intelligence", "network", "ioc"],
+        "ngtip_api": ["threat-intelligence", "ioc"],
+        "onesec": ["edr", "hids", "threat-intelligence"],
+        "onesig": ["network", "web-security", "threat-intelligence"],
+        "qingteng": ["hids", "edr", "vulnerability"],
+        "sangfor_sip": ["siem", "network", "threat-intelligence"],
+        "sangfor_xdr": ["xdr", "edr", "ndr"],
+        "skyeye_api": ["ndr", "network", "threat-intelligence"],
+        "tdp_api": ["ndr", "network", "threat-intelligence"],
+        "threatbook-cn": ["threat-intelligence", "ioc"],
+        "threatbook-io": ["threat-intelligence", "ioc"],
+        "urlscan": ["network-mapping", "web-security", "threat-intelligence"],
+        "virustotal": ["threat-intelligence", "ioc"],
+        "mcp": ["integration"],
+        "python": ["integration"],
+    }
+    if plugin_id in manual_tags:
+        return _safe_tags(manual_tags[plugin_id])
+
+    text = (f"{plugin_id} {description}").lower()
+    inferred: list[str] = []
+    if any(token in text for token in ("threat", "intel", "ioc", "情报", "virustotal", "threatbook", "greynoise")):
+        inferred.append("threat-intelligence")
+    if any(token in text for token in ("xdr",)):
+        inferred.extend(["xdr", "edr", "ndr"])
+    if any(token in text for token in ("edr", "endpoint", "终端")):
+        inferred.append("edr")
+    if any(token in text for token in ("hids", "host intrusion", "主机安全")):
+        inferred.append("hids")
+    if any(token in text for token in ("ndr", "traffic", "network detection", "流量")):
+        inferred.append("ndr")
+    if any(token in text for token in ("fofa", "mapping", "测绘", "asset discovery")):
+        inferred.append("network-mapping")
+    if any(token in text for token in ("network", "gateway", "dns", "ip")):
+        inferred.append("network")
+    if any(token in text for token in ("web", "url", "waf")):
+        inferred.append("web-security")
+    if not inferred:
+        inferred = ["threat-intelligence"]
+    return _safe_tags(inferred)
+
+
 def _tool_manifest(plugin_id: str, root: Path) -> Optional[HubPluginManifest]:
     if not _has_direct_tool_payload(root):
         return None
     provider = _read_yaml(root / "_provider.yaml") if (root / "_provider.yaml").is_file() else {}
     yaml_files = sorted(path for path in root.glob("*.y*ml") if not path.name.startswith("_"))
     first_tool = _read_yaml(yaml_files[0]) if yaml_files else {}
+    provider_description = str(provider.get("description") or "").strip()
+    provider_description_cn = str(provider.get("description_cn") or "").strip()
+    first_tool_description = str(first_tool.get("description") or "").strip()
+    first_tool_description_cn = str(first_tool.get("description_cn") or "").strip()
+    description = provider_description or first_tool_description or provider_description_cn or first_tool_description_cn
+    description_cn = provider_description_cn or first_tool_description_cn
+    if not description_cn and _contains_cjk(description):
+        description_cn = description
     entrypoints = [
         path.name
         for path in sorted(root.iterdir(), key=lambda item: item.name)
@@ -256,9 +349,10 @@ def _tool_manifest(plugin_id: str, root: Path) -> Optional[HubPluginManifest]:
         plugin_type="tool",
         plugin_id=plugin_id,
         name=str(provider.get("name") or first_tool.get("name") or plugin_id),
-        description=str(provider.get("description_cn") or provider.get("description") or first_tool.get("description") or ""),
+        description=description,
         category="integration",
-        tags=_safe_tags(["ioc", "vulnerability"]),
+        description_cn=description_cn or None,
+        tags=_tool_tags(plugin_id, f"{description} {description_cn}"),
         use_cases=["integration", "threat-intelligence"],
         capabilities=["external-api"],
         entrypoints=entrypoints,
@@ -301,6 +395,10 @@ def system_plugin_manifest(plugin_type: PluginType, plugin_id: str) -> Optional[
     root = system_plugin_root(plugin_type, plugin_id)
     if root is None:
         return None
+    return _manifest_for_system_root(plugin_type, plugin_id, root)
+
+
+def _manifest_for_system_root(plugin_type: PluginType, plugin_id: str, root: Path) -> Optional[HubPluginManifest]:
     if plugin_type == "skill":
         return _skill_manifest(plugin_id, root)
     if plugin_type == "agent":
@@ -328,7 +426,7 @@ def _os_compatible(manifest: HubPluginManifest) -> bool:
 
 def _entry_from_manifest(manifest: HubPluginManifest) -> HubCatalogEntry:
     record = local.get_record(manifest.type, manifest.id)
-    install_path = _resolve_install_path(manifest.type, manifest.id, record)
+    install_path = _resolve_install_path(manifest.type, manifest.id, record, local.infer_local_installs())
 
     state = "available"
     installed_version: Optional[str] = None
@@ -345,6 +443,7 @@ def _entry_from_manifest(manifest: HubPluginManifest) -> HubCatalogEntry:
         type=manifest.type,
         name=manifest.name,
         description=manifest.description,
+        descriptionCn=getattr(manifest, "descriptionCn", None),
         version=manifest.version,
         category=manifest.category,
         tags=manifest.tags,
@@ -366,21 +465,25 @@ def _resolve_install_path(
     plugin_type: PluginType,
     plugin_id: str,
     record: Optional[local.InstalledPluginRecord],
+    inferred_installs: Optional[dict[tuple[PluginType, str], Path]] = None,
 ) -> Optional[Path]:
     if record and record.installPath:
         path = Path(record.installPath)
         if local.has_install_payload(plugin_type, path):
             return path
         local.remove_installed_record(plugin_type, plugin_id)
+    if inferred_installs is not None:
+        return inferred_installs.get((plugin_type, plugin_id))
     return local.infer_local_install(plugin_type, plugin_id)
 
 
 def _entry_from_index(
     item: HubIndexEntry,
     records: dict[str, local.InstalledPluginRecord],
+    inferred_installs: dict[tuple[PluginType, str], Path],
 ) -> HubCatalogEntry:
     record = records.get(f"{item.type}:{item.id}")
-    install_path = _resolve_install_path(item.type, item.id, record)
+    install_path = _resolve_install_path(item.type, item.id, record, inferred_installs)
 
     state = "available"
     installed_version: Optional[str] = None
@@ -395,6 +498,7 @@ def _entry_from_index(
         type=item.type,
         name=item.name,
         description=item.description,
+        descriptionCn=item.descriptionCn,
         version=item.version,
         category=item.category,
         tags=item.tags,
@@ -416,6 +520,7 @@ def _entry_from_system_manifest(manifest: HubPluginManifest, root: Path) -> HubC
         type=manifest.type,
         name=manifest.name,
         description=manifest.description,
+        descriptionCn=getattr(manifest, "descriptionCn", None),
         version=manifest.version,
         category=manifest.category,
         tags=manifest.tags,
@@ -465,15 +570,16 @@ def list_catalog(
     q: Optional[str] = None,
 ) -> list[HubCatalogEntry]:
     records = local.load_installed_records()
+    inferred_installs = local.infer_local_installs()
     entries = [
-        _entry_from_index(item, records)
+        _entry_from_index(item, records, inferred_installs)
         for item in load_index().plugins
     ]
     indexed = {(entry.type, entry.id) for entry in entries}
     for (system_type, system_id), root in _system_plugin_roots().items():
         if (system_type, system_id) in indexed:
             continue
-        manifest = system_plugin_manifest(system_type, system_id)
+        manifest = _manifest_for_system_root(system_type, system_id, root)
         if manifest:
             entries.append(_entry_from_system_manifest(manifest, root))
     query = (q or "").strip().lower()
@@ -494,7 +600,17 @@ def list_catalog(
         if risk and entry.riskLevel not in risk:
             return False
         if query:
-            haystack = " ".join([entry.id, entry.name, entry.description, entry.category, *entry.tags, *entry.useCases]).lower()
+            haystack = " ".join(
+                [
+                    entry.id,
+                    entry.name,
+                    entry.description,
+                    entry.descriptionCn or "",
+                    entry.category,
+                    *entry.tags,
+                    *entry.useCases,
+                ]
+            ).lower()
             if query not in haystack:
                 return False
         return True

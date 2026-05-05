@@ -48,7 +48,12 @@
     "api-security",
     "web-security",
     "ioc",
-    "vulnerability"
+    "vulnerability",
+    "threat-intelligence",
+    "network-mapping",
+    "xdr",
+    "network",
+    "integration"
   ],
   "useCases": [
     "threat-detection",
@@ -56,6 +61,7 @@
     "incident-response",
     "log-analysis",
     "endpoint-forensics",
+    "penetration-testing",
     "vulnerability-management",
     "threat-intelligence",
     "security-reporting",
@@ -151,6 +157,26 @@
     "vulnerability": {
       "name": "Vulnerability",
       "nameCn": "漏洞"
+    },
+    "threat-intelligence": {
+      "name": "Threat Intelligence",
+      "nameCn": "威胁情报"
+    },
+    "network-mapping": {
+      "name": "Network Mapping",
+      "nameCn": "网络测绘"
+    },
+    "xdr": {
+      "name": "XDR",
+      "nameCn": "XDR"
+    },
+    "network": {
+      "name": "Network",
+      "nameCn": "网络"
+    },
+    "integration": {
+      "name": "Integration",
+      "nameCn": "集成"
     }
   },
   "useCaseLabels": {
@@ -193,6 +219,10 @@
     "other": {
       "name": "Other",
       "nameCn": "其他"
+    },
+    "penetration-testing": {
+      "name": "Penetration Testing",
+      "nameCn": "渗透测试"
     }
   }
 }

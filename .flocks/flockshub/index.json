@@ -25,53 +25,679 @@
       "manifestPath": "plugins/skills/ndr-alert-analysis/manifest.json"
     },
     {
-      "id": "alert-triage-agent",
+      "id": "ad-attacker",
       "type": "agent",
-      "name": "Alert Triage Agent",
-      "description": "面向安全告警分诊的轻量子 Agent。",
+      "name": "AD Attacker",
+      "description": "Delegates to this agent when the user wants to perform Active Directory attacks, run BloodHound analysis, use Impacket tools, execute Kerberos attacks, perform AD enumeration with CrackMapExec or NetExec, test AD delegation abuse, or conduct lateral movement through Active Directory environments during authorized penetration testing.",
       "version": "1.0.0",
       "category": "workflow-automation",
       "tags": [
-        "siem"
+        "active-directory",
+        "windows"
       ],
       "useCases": [
-        "alert-triage"
+        "penetration-testing"
       ],
-      "trust": "official",
+      "trust": "community",
+      "riskLevel": "high",
+      "manifestPath": "plugins/agents/pentest-ai-agents/ad-attacker/manifest.json",
+      "descriptionCn": "Active Directory 攻击与评估 Agent：用于授权环境下的域信息收集、权限关系分析、Kerberos/LDAP 风险研判和域内攻击路径规划。"
+    },
+    {
+      "id": "api-security",
+      "type": "agent",
+      "name": "API Security",
+      "description": "Delegates to this agent when the user asks about API security testing, REST API attacks, GraphQL exploitation, OAuth/OIDC vulnerabilities, JWT attacks, API enumeration, or web service penetration testing methodology.",
+      "version": "1.0.0",
+      "category": "workflow-automation",
+      "tags": [
+        "api-security",
+        "web-security",
+        "vulnerability"
+      ],
+      "useCases": [
+        "penetration-testing"
+      ],
+      "trust": "community",
       "riskLevel": "medium",
-      "manifestPath": "plugins/agents/alert-triage-agent/manifest.json"
+      "manifestPath": "plugins/agents/pentest-ai-agents/api-security/manifest.json",
+      "descriptionCn": "API 安全测试 Agent：用于接口资产梳理、鉴权与授权缺陷分析、参数与业务逻辑测试，以及 API 漏洞验证建议。"
     },
     {
-      "id": "hub_echo",
-      "type": "tool",
-      "name": "Hub Echo Tool",
-      "description": "用于验证 Hub 工具安装链路的本地 echo 工具。",
-      "version": "1.0.0",
-      "category": "devtools",
-      "tags": [],
-      "useCases": [
-        "other"
-      ],
-      "trust": "official",
-      "riskLevel": "low",
-      "manifestPath": "plugins/tools/hub_echo/manifest.json"
-    },
-    {
-      "id": "quick-alert-summary",
-      "type": "workflow",
-      "name": "Quick Alert Summary",
-      "description": "将告警输入快速归一化为简短摘要。",
+      "id": "attack-planner",
+      "type": "agent",
+      "name": "Attack Planner",
+      "description": "Delegates to this agent when the user wants to correlate findings from multiple tools or agents, build multi-step attack chains, identify the optimal exploitation path through a network, prioritize attack vectors across an engagement, or plan lateral movement strategies for authorized penetration testing.",
       "version": "1.0.0",
       "category": "workflow-automation",
       "tags": [
-        "siem"
+        "network"
       ],
       "useCases": [
-        "alert-triage"
+        "penetration-testing"
       ],
-      "trust": "official",
+      "trust": "community",
+      "riskLevel": "medium",
+      "manifestPath": "plugins/agents/pentest-ai-agents/attack-planner/manifest.json",
+      "descriptionCn": "攻击路径规划 Agent：根据侦察结果和已知弱点制定授权渗透测试策略，排序可行攻击链、前置条件和风险控制点。"
+    },
+    {
+      "id": "bizlogic-hunter",
+      "type": "agent",
+      "name": "Bizlogic Hunter",
+      "description": "Delegates to this agent when the user wants to test for business logic flaws, find workflow bypass vulnerabilities, detect price manipulation or payment tampering, identify race conditions in transactions, test authorization boundaries between user roles, or discover logic errors that standard vulnerability scanners miss during authorized penetration testing.",
+      "version": "1.0.0",
+      "category": "workflow-automation",
+      "tags": [
+        "web-security",
+        "api-security",
+        "vulnerability"
+      ],
+      "useCases": [
+        "penetration-testing"
+      ],
+      "trust": "community",
+      "riskLevel": "high",
+      "manifestPath": "plugins/agents/pentest-ai-agents/bizlogic-hunter/manifest.json",
+      "descriptionCn": "业务逻辑漏洞分析 Agent：用于发现越权、支付与订单流程缺陷、状态机绕过、风控缺口和高影响业务滥用场景。"
+    },
+    {
+      "id": "bug-bounty",
+      "type": "agent",
+      "name": "Bug Bounty",
+      "description": "Delegates to this agent when the user is working on bug bounty programs, submitting vulnerability reports to HackerOne or Bugcrowd, needs help with bug bounty methodology, wants to prioritize targets from a bug bounty scope, or needs help writing quality vulnerability reports for bounty submissions.",
+      "version": "1.0.0",
+      "category": "workflow-automation",
+      "tags": [
+        "web-security",
+        "api-security",
+        "vulnerability"
+      ],
+      "useCases": [
+        "penetration-testing"
+      ],
+      "trust": "community",
+      "riskLevel": "medium",
+      "manifestPath": "plugins/agents/pentest-ai-agents/bug-bounty/manifest.json",
+      "descriptionCn": "漏洞赏金辅助 Agent：面向授权赏金范围进行目标理解、测试思路设计、漏洞影响评估和报告要点整理。"
+    },
+    {
+      "id": "c2-operator",
+      "type": "agent",
+      "name": "C2 Operator",
+      "description": "Delegates to this agent when the user asks about command-and-control framework operations, Sliver/Mythic/Havoc/Cobalt Strike configuration, listener and beacon tuning, malleable C2 profiles, sleep and jitter strategy, redirector and CDN fronting infrastructure, or operating an established foothold during authorized red team engagements.",
+      "version": "1.0.0",
+      "category": "workflow-automation",
+      "tags": [
+        "network",
+        "threat-intelligence"
+      ],
+      "useCases": [
+        "penetration-testing"
+      ],
+      "trust": "community",
+      "riskLevel": "medium",
+      "manifestPath": "plugins/agents/pentest-ai-agents/c2-operator/manifest.json",
+      "descriptionCn": "C2 与对抗演练规划 Agent：用于授权红队演练中的回连通道设计、通信约束评估、日志痕迹分析和防守可见性说明。"
+    },
+    {
+      "id": "cicd-redteam",
+      "type": "agent",
+      "name": "CICD Redteam",
+      "description": "Delegates to this agent when the user wants to integrate red teaming into CI/CD pipelines, set up continuous automated security testing on every code push, generate pipeline configurations for automated pentesting, configure scheduled security assessments in deployment workflows, or build a continuous red team capability that catches vulnerabilities before production.",
+      "version": "1.0.0",
+      "category": "workflow-automation",
+      "tags": [
+        "integration",
+        "cloud",
+        "vulnerability"
+      ],
+      "useCases": [
+        "penetration-testing"
+      ],
+      "trust": "community",
+      "riskLevel": "high",
+      "manifestPath": "plugins/agents/pentest-ai-agents/cicd-redteam/manifest.json",
+      "descriptionCn": "CI/CD 红队评估 Agent：用于分析流水线、代码仓库、制品、凭据、Runner 和部署链路中的攻击面与权限提升路径。"
+    },
+    {
+      "id": "cloud-security",
+      "type": "agent",
+      "name": "Cloud Security",
+      "description": "Delegates to this agent when the user asks about cloud security testing, AWS/Azure/GCP penetration testing, cloud misconfiguration analysis, IAM privilege escalation, container security, Kubernetes attacks, serverless security, or cloud-native attack paths.",
+      "version": "1.0.0",
+      "category": "workflow-automation",
+      "tags": [
+        "cloud",
+        "iam",
+        "kubernetes"
+      ],
+      "useCases": [
+        "penetration-testing"
+      ],
+      "trust": "community",
+      "riskLevel": "medium",
+      "manifestPath": "plugins/agents/pentest-ai-agents/cloud-security/manifest.json",
+      "descriptionCn": "云安全评估 Agent：覆盖 AWS、Azure、GCP 的 IAM、存储、计算、Kubernetes、Serverless 配置风险和云上攻击路径分析。"
+    },
+    {
+      "id": "container-breakout",
+      "type": "agent",
+      "name": "Container Breakout",
+      "description": "Delegates to this agent when the user asks about container escape, Docker breakout, Kubernetes pod escape, runc/containerd CVE exploitation, capability abuse, privileged container hunting, kubelet API attacks, service account token abuse, or any technique that pivots from inside a container to the host or cluster control plane during authorized testing.",
+      "version": "1.0.0",
+      "category": "workflow-automation",
+      "tags": [
+        "kubernetes",
+        "linux",
+        "cloud",
+        "vulnerability"
+      ],
+      "useCases": [
+        "penetration-testing"
+      ],
+      "trust": "community",
+      "riskLevel": "medium",
+      "manifestPath": "plugins/agents/pentest-ai-agents/container-breakout/manifest.json",
+      "descriptionCn": "容器逃逸评估 Agent：用于分析容器配置、挂载、特权模式、运行时、Kubernetes RBAC 与节点逃逸风险。"
+    },
+    {
+      "id": "credential-tester",
+      "type": "agent",
+      "name": "Credential Tester",
+      "description": "Delegates to this agent when the user asks about password attacks, credential testing, hash cracking, brute force methodology, default credential checks, password spraying, or needs help with tools like hydra, john, hashcat, medusa, or CrackMapExec for authorized penetration testing engagements.",
+      "version": "1.0.0",
+      "category": "workflow-automation",
+      "tags": [
+        "iam",
+        "active-directory"
+      ],
+      "useCases": [
+        "penetration-testing"
+      ],
+      "trust": "community",
+      "riskLevel": "medium",
+      "manifestPath": "plugins/agents/pentest-ai-agents/credential-tester/manifest.json",
+      "descriptionCn": "凭据安全验证 Agent：用于授权范围内的凭据有效性确认、密码喷洒风险评估、复用分析和账号锁定风险控制。"
+    },
+    {
+      "id": "ctf-solver",
+      "type": "agent",
+      "name": "CTF Solver",
+      "description": "Delegates to this agent when the user is working on CTF challenges, capture the flag competitions, HackTheBox machines, TryHackMe rooms, or needs help with CTF methodology including web exploitation, binary exploitation, cryptography, forensics, reverse engineering, or privilege escalation challenges.",
+      "version": "1.0.0",
+      "category": "workflow-automation",
+      "tags": [
+        "web-security",
+        "linux"
+      ],
+      "useCases": [
+        "penetration-testing"
+      ],
+      "trust": "community",
+      "riskLevel": "medium",
+      "manifestPath": "plugins/agents/pentest-ai-agents/ctf-solver/manifest.json",
+      "descriptionCn": "CTF 解题 Agent：用于安全竞赛中的 Web、逆向、密码、取证、Pwn 与杂项题目分析和解题思路规划。"
+    },
+    {
+      "id": "detection-engineer",
+      "type": "agent",
+      "name": "Detection Engineer",
+      "description": "Delegates to this agent when the user asks about detection rules, SIEM queries, threat hunting, indicator analysis, log analysis, blue team detection for specific attack techniques, or creating detection engineering content.",
+      "version": "1.0.0",
+      "category": "workflow-automation",
+      "tags": [
+        "siem",
+        "ioc",
+        "threat-intelligence"
+      ],
+      "useCases": [
+        "penetration-testing"
+      ],
+      "trust": "community",
+      "riskLevel": "medium",
+      "manifestPath": "plugins/agents/pentest-ai-agents/detection-engineer/manifest.json",
+      "descriptionCn": "检测工程 Agent：根据攻击技术和日志来源生成检测思路、Sigma/YARA/SIEM 查询、告警逻辑和验证建议。"
+    },
+    {
+      "id": "engagement-planner",
+      "type": "agent",
+      "name": "Engagement Planner",
+      "description": "Delegates to this agent when the user needs to plan a penetration test, define attack methodology, scope an engagement, map techniques to MITRE ATT&CK, or create a rules of engagement template.",
+      "version": "1.0.0",
+      "category": "workflow-automation",
+      "tags": [
+        "integration"
+      ],
+      "useCases": [
+        "penetration-testing"
+      ],
+      "trust": "community",
+      "riskLevel": "medium",
+      "manifestPath": "plugins/agents/pentest-ai-agents/engagement-planner/manifest.json",
+      "descriptionCn": "渗透测试项目规划 Agent：用于梳理授权范围、目标、时间窗口、规则约束、阶段计划、交付物和沟通机制。"
+    },
+    {
+      "id": "exploit-chainer",
+      "type": "agent",
+      "name": "Exploit Chainer",
+      "description": "Delegates to this agent when the user wants to automatically chain isolated vulnerabilities into multi-step attack paths, pivot through a system from a low-severity finding to full compromise, execute exploit chains step-by-step with approval at each stage, or demonstrate real-world attack escalation during authorized penetration testing.",
+      "version": "1.0.0",
+      "category": "workflow-automation",
+      "tags": [
+        "network",
+        "vulnerability"
+      ],
+      "useCases": [
+        "penetration-testing"
+      ],
+      "trust": "community",
+      "riskLevel": "high",
+      "manifestPath": "plugins/agents/pentest-ai-agents/exploit-chainer/manifest.json",
+      "descriptionCn": "漏洞利用链分析 Agent：用于把多个弱点串联成可验证攻击路径，明确前置条件、链路步骤、影响和中断点。"
+    },
+    {
+      "id": "exploit-guide",
+      "type": "agent",
+      "name": "Exploit Guide",
+      "description": "Delegates to this agent when the user asks about exploitation techniques, attack methodologies, tool configurations for authorized testing, post-exploitation activities, or specific vulnerability exploitation paths.",
+      "version": "1.0.0",
+      "category": "workflow-automation",
+      "tags": [
+        "web-security",
+        "vulnerability"
+      ],
+      "useCases": [
+        "penetration-testing"
+      ],
+      "trust": "community",
+      "riskLevel": "medium",
+      "manifestPath": "plugins/agents/pentest-ai-agents/exploit-guide/manifest.json",
+      "descriptionCn": "漏洞利用指导 Agent：用于授权环境下解释漏洞利用思路、验证步骤、安全边界、证据采集和修复建议。"
+    },
+    {
+      "id": "forensics-analyst",
+      "type": "agent",
+      "name": "Forensics Analyst",
+      "description": "Delegates to this agent when the user asks about digital forensics, incident response, evidence acquisition, memory forensics, disk forensics, network forensics, timeline analysis, or chain of custody",
+      "version": "1.0.0",
+      "category": "workflow-automation",
+      "tags": [
+        "ioc",
+        "threat-intelligence",
+        "network"
+      ],
+      "useCases": [
+        "penetration-testing"
+      ],
+      "trust": "community",
       "riskLevel": "low",
-      "manifestPath": "plugins/workflows/quick-alert-summary/manifest.json"
+      "manifestPath": "plugins/agents/pentest-ai-agents/forensics-analyst/manifest.json",
+      "descriptionCn": "取证分析 Agent：用于主机、日志、文件、内存和时间线证据研判，定位入侵迹象、影响范围和处置建议。"
+    },
+    {
+      "id": "llm-redteam",
+      "type": "agent",
+      "name": "LLM Redteam",
+      "description": "Delegates to this agent when the user asks about LLM and AI system red teaming, prompt injection (direct and indirect), jailbreak techniques, RAG poisoning, model exfiltration, training data extraction, agent and tool-use abuse, MCP server exploitation, AI guardrail bypass, or red teaming a deployed Claude/GPT/Gemini/open-weight application during authorized testing.",
+      "version": "1.0.0",
+      "category": "workflow-automation",
+      "tags": [
+        "web-security",
+        "api-security"
+      ],
+      "useCases": [
+        "penetration-testing"
+      ],
+      "trust": "community",
+      "riskLevel": "medium",
+      "manifestPath": "plugins/agents/pentest-ai-agents/llm-redteam/manifest.json",
+      "descriptionCn": "大模型红队测试 Agent：用于授权 AI 系统的提示注入、越权工具调用、数据泄露、越狱和安全边界评估。"
+    },
+    {
+      "id": "malware-analyst",
+      "type": "agent",
+      "name": "Malware Analyst",
+      "description": "Delegates to this agent when the user asks about malware analysis, reverse engineering, binary analysis, disassembly, debugging, sandbox analysis, static analysis, dynamic analysis, or suspicious file triage",
+      "version": "1.0.0",
+      "category": "workflow-automation",
+      "tags": [
+        "ioc",
+        "threat-intelligence",
+        "vulnerability"
+      ],
+      "useCases": [
+        "penetration-testing"
+      ],
+      "trust": "community",
+      "riskLevel": "low",
+      "manifestPath": "plugins/agents/pentest-ai-agents/malware-analyst/manifest.json",
+      "descriptionCn": "恶意样本分析 Agent：用于静态/动态分析样本行为、IOC、持久化、通信特征、规避手法和检测规则建议。"
+    },
+    {
+      "id": "mobile-pentester",
+      "type": "agent",
+      "name": "Mobile Pentester",
+      "description": "Delegates to this agent when the user asks about mobile application security testing, Android pentesting, iOS pentesting, APK analysis, IPA analysis, mobile API testing, certificate pinning bypass, or mobile reverse engineering",
+      "version": "1.0.0",
+      "category": "workflow-automation",
+      "tags": [
+        "api-security",
+        "web-security"
+      ],
+      "useCases": [
+        "penetration-testing"
+      ],
+      "trust": "community",
+      "riskLevel": "low",
+      "manifestPath": "plugins/agents/pentest-ai-agents/mobile-pentester/manifest.json",
+      "descriptionCn": "移动应用安全测试 Agent：用于 Android/iOS 应用的静态分析、动态测试、存储、通信、鉴权和深链风险评估。"
+    },
+    {
+      "id": "opsec-anonymizer",
+      "type": "agent",
+      "name": "Opsec Anonymizer",
+      "description": "Delegates to this agent when the user asks about operator-side identity hygiene, source IP separation, traffic anonymization for authorized red team work, Tor and proxy chains, burner infrastructure provisioning, attribution avoidance, or pre-engagement opsec posture before tools are run against scope.",
+      "version": "1.0.0",
+      "category": "workflow-automation",
+      "tags": [
+        "network",
+        "threat-intelligence"
+      ],
+      "useCases": [
+        "penetration-testing"
+      ],
+      "trust": "community",
+      "riskLevel": "medium",
+      "manifestPath": "plugins/agents/pentest-ai-agents/opsec-anonymizer/manifest.json",
+      "descriptionCn": "OPSEC 与行动安全 Agent：用于授权测试中的噪声评估、痕迹控制、证据命名、身份隔离和操作安全建议。"
+    },
+    {
+      "id": "osint-collector",
+      "type": "agent",
+      "name": "OSINT Collector",
+      "description": "Delegates to this agent when the user asks about OSINT, reconnaissance, information gathering, target profiling, email harvesting, subdomain enumeration, social media recon, breach data, open source intelligence, or building a target dossier for authorized engagements.",
+      "version": "1.0.0",
+      "category": "workflow-automation",
+      "tags": [
+        "threat-intelligence",
+        "network-mapping",
+        "ioc"
+      ],
+      "useCases": [
+        "penetration-testing"
+      ],
+      "trust": "community",
+      "riskLevel": "low",
+      "manifestPath": "plugins/agents/pentest-ai-agents/osint-collector/manifest.json",
+      "descriptionCn": "OSINT 情报收集 Agent：用于公开来源收集域名、子域、人员、泄露凭据、技术栈、证书和组织暴露面线索。"
+    },
+    {
+      "id": "payload-crafter",
+      "type": "agent",
+      "name": "Payload Crafter",
+      "description": "Delegates to this agent when the user asks about generating offensive payloads, building shellcode, working with msfvenom, packing or encoding payloads, building reverse shells, creating EDR-test binaries, or producing initial-access artifacts during authorized red team engagements.",
+      "version": "1.0.0",
+      "category": "workflow-automation",
+      "tags": [
+        "windows",
+        "linux"
+      ],
+      "useCases": [
+        "penetration-testing"
+      ],
+      "trust": "community",
+      "riskLevel": "low",
+      "manifestPath": "plugins/agents/pentest-ai-agents/payload-crafter/manifest.json",
+      "descriptionCn": "Payload 构造 Agent：用于授权测试中设计安全可控的验证载荷、回显方式、编码变体和误伤控制策略。"
+    },
+    {
+      "id": "phishing-operator",
+      "type": "agent",
+      "name": "Phishing Operator",
+      "description": "Delegates to this agent when the user asks about setting up phishing infrastructure, configuring Evilginx3 or GoPhish, adversary-in-the-middle credential capture, MFA token relay, domain lookalike detection with dnstwist, or building phishing landing pages for authorized red team engagements.",
+      "version": "1.0.0",
+      "category": "workflow-automation",
+      "tags": [
+        "email-security",
+        "web-security",
+        "iam"
+      ],
+      "useCases": [
+        "penetration-testing"
+      ],
+      "trust": "community",
+      "riskLevel": "low",
+      "manifestPath": "plugins/agents/pentest-ai-agents/phishing-operator/manifest.json",
+      "descriptionCn": "钓鱼演练规划 Agent：用于授权安全意识演练中的场景设计、投递链路、落地页要素、指标设计和合规约束。"
+    },
+    {
+      "id": "poc-validator",
+      "type": "agent",
+      "name": "POC Validator",
+      "description": "Delegates to this agent when the user wants to validate a vulnerability finding with a safe Proof of Concept, eliminate false positives from scan results, automatically generate and execute PoC scripts for confirmed vulnerabilities, or verify that a reported bug is real before including it in a pentest report.",
+      "version": "1.0.0",
+      "category": "workflow-automation",
+      "tags": [
+        "web-security",
+        "vulnerability"
+      ],
+      "useCases": [
+        "penetration-testing"
+      ],
+      "trust": "community",
+      "riskLevel": "high",
+      "manifestPath": "plugins/agents/pentest-ai-agents/poc-validator/manifest.json",
+      "descriptionCn": "PoC 验证 Agent：用于复核漏洞证明代码和验证步骤，区分误报、确认影响、控制风险并整理可复现证据。"
+    },
+    {
+      "id": "privesc-advisor",
+      "type": "agent",
+      "name": "Privesc Advisor",
+      "description": "Delegates to this agent when the user asks about privilege escalation techniques, local enumeration, Linux or Windows privilege escalation, container escape, or needs help escalating access on a compromised system during authorized testing.",
+      "version": "1.0.0",
+      "category": "workflow-automation",
+      "tags": [
+        "linux",
+        "windows",
+        "kubernetes"
+      ],
+      "useCases": [
+        "penetration-testing"
+      ],
+      "trust": "community",
+      "riskLevel": "medium",
+      "manifestPath": "plugins/agents/pentest-ai-agents/privesc-advisor/manifest.json",
+      "descriptionCn": "权限提升分析 Agent：用于 Linux、Windows、云与域环境中的本地/横向权限提升路径、条件和检测痕迹分析。"
+    },
+    {
+      "id": "recon-advisor",
+      "type": "agent",
+      "name": "Recon Advisor",
+      "description": "Delegates to this agent when the user pastes scan output (Nmap, Nessus, Nikto, masscan, etc.), asks about reconnaissance techniques, needs help with enumeration, wants to analyze an attack surface, or wants to run recon tools against authorized targets. Can execute reconnaissance commands directly with user approval.",
+      "version": "1.0.0",
+      "category": "workflow-automation",
+      "tags": [
+        "network-mapping",
+        "network",
+        "threat-intelligence"
+      ],
+      "useCases": [
+        "penetration-testing"
+      ],
+      "trust": "community",
+      "riskLevel": "high",
+      "manifestPath": "plugins/agents/pentest-ai-agents/recon-advisor/manifest.json",
+      "descriptionCn": "侦察建议 Agent：用于授权范围内的端口、服务、指纹、子域、证书、目录和技术栈枚举策略设计。"
+    },
+    {
+      "id": "report-generator",
+      "type": "agent",
+      "name": "Report Generator",
+      "description": "Delegates to this agent when the user needs to write a penetration test report, compile findings into a document, create an executive summary, format technical findings, or produce any security assessment documentation.",
+      "version": "1.0.0",
+      "category": "workflow-automation",
+      "tags": [
+        "integration",
+        "vulnerability"
+      ],
+      "useCases": [
+        "penetration-testing"
+      ],
+      "trust": "community",
+      "riskLevel": "low",
+      "manifestPath": "plugins/agents/pentest-ai-agents/report-generator/manifest.json",
+      "descriptionCn": "安全报告生成 Agent：用于把测试证据整理成漏洞描述、影响分析、复现步骤、修复建议和管理层摘要。"
+    },
+    {
+      "id": "reverse-engineer",
+      "type": "agent",
+      "name": "Reverse Engineer",
+      "description": "Delegates to this agent when the user asks about static reverse engineering, working with Ghidra, Radare2, IDA, JadX, decompiling Android APKs, analyzing firmware with Binwalk, reading disassembly, or understanding the structure of a binary without running it.",
+      "version": "1.0.0",
+      "category": "workflow-automation",
+      "tags": [
+        "ioc",
+        "threat-intelligence"
+      ],
+      "useCases": [
+        "penetration-testing"
+      ],
+      "trust": "community",
+      "riskLevel": "low",
+      "manifestPath": "plugins/agents/pentest-ai-agents/reverse-engineer/manifest.json",
+      "descriptionCn": "逆向分析 Agent：用于二进制、脚本、移动应用或恶意样本的结构理解、控制流分析和关键逻辑还原。"
+    },
+    {
+      "id": "social-engineer",
+      "type": "agent",
+      "name": "Social Engineer",
+      "description": "Delegates to this agent when the user asks about social engineering, phishing campaigns, pretexting, vishing, physical social engineering, security awareness testing, or human-factor security assessments",
+      "version": "1.0.0",
+      "category": "workflow-automation",
+      "tags": [
+        "email-security",
+        "iam"
+      ],
+      "useCases": [
+        "penetration-testing"
+      ],
+      "trust": "community",
+      "riskLevel": "low",
+      "manifestPath": "plugins/agents/pentest-ai-agents/social-engineer/manifest.json",
+      "descriptionCn": "社会工程防护评估 Agent：用于授权演练中的人员风险场景设计、诱导链路分析、防护建议和合规边界把控。"
+    },
+    {
+      "id": "stig-analyst",
+      "type": "agent",
+      "name": "STIG Analyst",
+      "description": "Delegates to this agent when the user asks about STIG findings, security compliance, system hardening, GPO configurations, security baselines, or needs to document findings in STIG format including keep-open justifications.",
+      "version": "1.0.0",
+      "category": "workflow-automation",
+      "tags": [
+        "windows",
+        "linux"
+      ],
+      "useCases": [
+        "penetration-testing"
+      ],
+      "trust": "community",
+      "riskLevel": "medium",
+      "manifestPath": "plugins/agents/pentest-ai-agents/stig-analyst/manifest.json",
+      "descriptionCn": "STIG 合规分析 Agent：用于按安全技术实施指南检查系统配置、识别不符合项并生成加固建议。"
+    },
+    {
+      "id": "swarm-orchestrator",
+      "type": "agent",
+      "name": "Swarm Orchestrator",
+      "description": "Delegates to this agent when the user wants to coordinate multiple pentest agents as a team, run a full automated red team engagement, orchestrate parallel reconnaissance and exploitation workflows, manage agent-to-agent handoffs, or execute a complete pentest lifecycle from planning through reporting with autonomous agent delegation.",
+      "version": "1.0.0",
+      "category": "workflow-automation",
+      "tags": [
+        "integration"
+      ],
+      "useCases": [
+        "penetration-testing"
+      ],
+      "trust": "community",
+      "riskLevel": "low",
+      "manifestPath": "plugins/agents/pentest-ai-agents/swarm-orchestrator/manifest.json",
+      "descriptionCn": "红队多 Agent 编排 Agent：用于把规划、侦察、验证、攻击链、检测和报告任务分派给合适的安全子 Agent。"
+    },
+    {
+      "id": "threat-modeler",
+      "type": "agent",
+      "name": "Threat Modeler",
+      "description": "Delegates to this agent when the user asks about threat modeling, attack surface analysis, STRIDE, DREAD, attack trees, data flow diagrams, trust boundaries, or security architecture review",
+      "version": "1.0.0",
+      "category": "workflow-automation",
+      "tags": [
+        "api-security"
+      ],
+      "useCases": [
+        "penetration-testing"
+      ],
+      "trust": "community",
+      "riskLevel": "low",
+      "manifestPath": "plugins/agents/pentest-ai-agents/threat-modeler/manifest.json",
+      "descriptionCn": "威胁建模 Agent：用于识别系统资产、信任边界、攻击面、滥用场景、威胁路径和缓解控制。"
+    },
+    {
+      "id": "vuln-scanner",
+      "type": "agent",
+      "name": "Vuln Scanner",
+      "description": "Delegates to this agent when the user wants to run vulnerability scans, identify CVEs in target systems, use tools like nuclei, nikto, or OpenVAS, parse vulnerability scan results, or prioritize vulnerabilities for exploitation during authorized penetration testing.",
+      "version": "1.0.0",
+      "category": "workflow-automation",
+      "tags": [
+        "web-security",
+        "network-mapping",
+        "vulnerability"
+      ],
+      "useCases": [
+        "penetration-testing"
+      ],
+      "trust": "community",
+      "riskLevel": "high",
+      "manifestPath": "plugins/agents/pentest-ai-agents/vuln-scanner/manifest.json",
+      "descriptionCn": "漏洞扫描与研判 Agent：用于授权范围内规划扫描策略、解读扫描结果、去重误报并给出验证优先级。"
+    },
+    {
+      "id": "web-hunter",
+      "type": "agent",
+      "name": "Web Hunter",
+      "description": "Delegates to this agent when the user wants to perform web application penetration testing, run directory brute forcing with ffuf or gobuster, test for SQL injection, discover hidden endpoints, fuzz parameters, or perform active web application security testing during authorized engagements.",
+      "version": "1.0.0",
+      "category": "workflow-automation",
+      "tags": [
+        "web-security",
+        "api-security"
+      ],
+      "useCases": [
+        "penetration-testing"
+      ],
+      "trust": "community",
+      "riskLevel": "high",
+      "manifestPath": "plugins/agents/pentest-ai-agents/web-hunter/manifest.json",
+      "descriptionCn": "Web 应用安全测试 Agent：用于目录发现、参数测试、认证与授权缺陷、注入、XSS、SSRF 和隐藏接口枚举。"
+    },
+    {
+      "id": "wireless-pentester",
+      "type": "agent",
+      "name": "Wireless Pentester",
+      "description": "Delegates to this agent when the user asks about wireless security testing, WiFi pentesting, WPA/WPA2/WPA3 attacks, Bluetooth security, wireless reconnaissance, rogue access points, evil twin attacks, or RF security",
+      "version": "1.0.0",
+      "category": "workflow-automation",
+      "tags": [
+        "network"
+      ],
+      "useCases": [
+        "penetration-testing"
+      ],
+      "trust": "community",
+      "riskLevel": "low",
+      "manifestPath": "plugins/agents/pentest-ai-agents/wireless-pentester/manifest.json",
+      "descriptionCn": "无线安全测试 Agent：用于授权无线网络的配置审查、加密与认证风险、客户端攻击面和无线测试步骤规划。"
     },
     {
       "id": "acquiring-disk-image-with-dd-and-dcfldd",

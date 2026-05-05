@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import {
   Archive,
   CheckCircle,
@@ -22,6 +22,7 @@ import { hubAPI, HubCatalogEntry, HubFileContent, HubFileNode, HubManifest, HubP
 import FlowCanvas from '@/pages/WorkflowDetail/FlowCanvas';
 import type { WorkflowJSON } from '@/api/workflow';
 import { useTranslation } from 'react-i18next';
+import { getCatalogDescription } from '@/utils/mcpCatalog';
 
 type ViewMode = 'table' | 'tree';
 
@@ -156,15 +157,82 @@ function formatTaxonomyLabel(id: string, labels?: Record<string, HubTaxonomyLabe
   return language.toLowerCase().startsWith('zh') ? (nameCn || name || id) : (name || nameCn || id);
 }
 
+function getHubDescription(entry: Pick<HubCatalogEntry, 'description' | 'descriptionCn'>, language: string) {
+  return getCatalogDescription(
+    { description: entry.description, descriptionCn: entry.descriptionCn },
+    language,
+  );
+}
+
+interface HubFilterSnapshot {
+  query?: string;
+  type?: HubPluginType | '';
+  useCase?: string;
+  tag?: string;
+  state?: string;
+}
+
+interface HubFacetCounts {
+  type: Record<string, number>;
+  useCases: Record<string, number>;
+  tags: Record<string, number>;
+  state: Record<string, number>;
+}
+
+function matchesCatalogEntry(entry: HubCatalogEntry, filters: HubFilterSnapshot) {
+  if (filters.type && entry.type !== filters.type) return false;
+  if (filters.useCase && !entry.useCases.includes(filters.useCase)) return false;
+  if (filters.tag && !entry.tags.includes(filters.tag)) return false;
+  if (filters.state && entry.state !== filters.state) return false;
+  const query = filters.query?.trim().toLowerCase();
+  if (query) {
+    const haystack = [
+      entry.id,
+      entry.name,
+      entry.description,
+      entry.descriptionCn ?? '',
+      entry.category,
+      ...entry.tags,
+      ...entry.useCases,
+    ].join(' ').toLowerCase();
+    if (!haystack.includes(query)) return false;
+  }
+  return true;
+}
+
+function addFacetCount(counts: Record<string, number>, key: string) {
+  counts[key] = (counts[key] ?? 0) + 1;
+}
+
+function buildFacetCounts(items: HubCatalogEntry[], filters: HubFilterSnapshot): HubFacetCounts {
+  const counts: HubFacetCounts = { type: {}, useCases: {}, tags: {}, state: {} };
+
+  items.forEach(item => {
+    if (matchesCatalogEntry(item, { query: filters.query })) {
+      addFacetCount(counts.type, item.type);
+    }
+    if (matchesCatalogEntry(item, { query: filters.query, type: filters.type })) {
+      item.useCases.forEach(useCase => addFacetCount(counts.useCases, useCase));
+    }
+    if (matchesCatalogEntry(item, { query: filters.query, type: filters.type, useCase: filters.useCase })) {
+      item.tags.forEach(tag => addFacetCount(counts.tags, tag));
+    }
+    if (matchesCatalogEntry(item, { query: filters.query, type: filters.type, useCase: filters.useCase, tag: filters.tag })) {
+      addFacetCount(counts.state, item.state);
+    }
+  });
+
+  return counts;
+}
+
 export default function HubPage() {
   const { i18n } = useTranslation();
   const text = i18n.language.toLowerCase().startsWith('zh') ? HUB_TEXT.zh : HUB_TEXT.en;
-  const [items, setItems] = useState<HubCatalogEntry[]>([]);
+  const [catalogItems, setCatalogItems] = useState<HubCatalogEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [query, setQuery] = useState('');
   const [typeFilter, setTypeFilter] = useState<HubPluginType | ''>('');
-  const [categoryFilter, setCategoryFilter] = useState('');
   const [stateFilter, setStateFilter] = useState('');
   const [tagFilter, setTagFilter] = useState('');
   const [useCaseFilter, setUseCaseFilter] = useState('');
@@ -175,21 +243,13 @@ export default function HubPage() {
   const [selected, setSelected] = useState<HubCatalogEntry | null>(null);
   const [actionId, setActionId] = useState<string | null>(null);
   const [taxonomy, setTaxonomy] = useState<HubTaxonomyResponse | null>(null);
-  const didMountRef = useRef(false);
 
   const fetchCatalog = async (silent = false) => {
     try {
       if (!silent) setLoading(true);
-      const res = await hubAPI.catalog({
-        q: query || undefined,
-        type: typeFilter || undefined,
-        category: categoryFilter || undefined,
-        tags: tagFilter || undefined,
-        useCases: useCaseFilter || undefined,
-        state: stateFilter || undefined,
-      });
+      const res = await hubAPI.catalog();
       const nextItems = Array.isArray(res.data) ? res.data : [];
-      setItems(nextItems);
+      setCatalogItems(nextItems);
       setSelected(current => {
         if (!current) return current;
         return nextItems.find(item => item.type === current.type && item.id === current.id) ?? current;
@@ -206,29 +266,40 @@ export default function HubPage() {
   }, []);
 
   useEffect(() => {
-    if (!didMountRef.current) {
-      didMountRef.current = true;
-      return;
-    }
-    const timer = window.setTimeout(() => {
-      fetchCatalog(true);
-    }, 200);
-    return () => window.clearTimeout(timer);
-  }, [query, typeFilter, categoryFilter, stateFilter, tagFilter, useCaseFilter]);
-
-  useEffect(() => {
     setPage(1);
-  }, [query, typeFilter, categoryFilter, stateFilter, tagFilter, useCaseFilter, viewMode, pageSize]);
+  }, [query, typeFilter, stateFilter, tagFilter, useCaseFilter, viewMode, pageSize]);
+
+  const items = useMemo(
+    () => catalogItems.filter(item => matchesCatalogEntry(item, {
+      query,
+      type: typeFilter,
+      useCase: useCaseFilter,
+      tag: tagFilter,
+      state: stateFilter,
+    })),
+    [catalogItems, query, typeFilter, useCaseFilter, tagFilter, stateFilter],
+  );
+
+  const facetCounts = useMemo(
+    () => buildFacetCounts(catalogItems, {
+      query,
+      type: typeFilter,
+      useCase: useCaseFilter,
+      tag: tagFilter,
+      state: stateFilter,
+    }),
+    [catalogItems, query, typeFilter, useCaseFilter, tagFilter, stateFilter],
+  );
 
   const useCases = useMemo(
-    () => taxonomy?.useCases ?? Array.from(new Set(items.flatMap(item => item.useCases))).sort(),
-    [items, taxonomy],
+    () => taxonomy?.useCases ?? Array.from(new Set(catalogItems.flatMap(item => item.useCases))).sort(),
+    [catalogItems, taxonomy],
   );
   const tags = useMemo(
-    () => taxonomy?.tags ?? Array.from(new Set(items.flatMap(item => item.tags))).sort(),
-    [items, taxonomy],
+    () => taxonomy?.tags ?? Array.from(new Set(catalogItems.flatMap(item => item.tags))).sort(),
+    [catalogItems, taxonomy],
   );
-  const activeFilterCount = [typeFilter, categoryFilter, useCaseFilter, tagFilter, stateFilter].filter(Boolean).length;
+  const activeFilterCount = [typeFilter, useCaseFilter, tagFilter, stateFilter].filter(Boolean).length;
   const totalPages = Math.max(1, Math.ceil(items.length / pageSize));
   const currentPage = Math.min(page, totalPages);
   const pagedItems = useMemo(
@@ -264,7 +335,6 @@ export default function HubPage() {
 
   const resetFacetFilters = () => {
     setTypeFilter('');
-    setCategoryFilter('');
     setUseCaseFilter('');
     setTagFilter('');
     setStateFilter('');
@@ -322,7 +392,7 @@ export default function HubPage() {
                 ...(['skill', 'agent', 'tool', 'workflow'] as HubPluginType[]).map(type => ({
                   value: type,
                   label: TYPE_LABEL[type],
-                  count: taxonomy?.counts?.type?.[type] ?? 0,
+                  count: facetCounts.type[type] ?? 0,
                 })),
               ]}
             />
@@ -340,7 +410,7 @@ export default function HubPage() {
                     value: useCase,
                     label: formatTaxonomyLabel(useCase, taxonomy?.useCaseLabels, i18n.language),
                     title: useCase,
-                    count: taxonomy?.counts?.useCases?.[useCase] ?? 0,
+                    count: facetCounts.useCases[useCase] ?? 0,
                   })),
                 ]}
               />
@@ -354,7 +424,7 @@ export default function HubPage() {
                     value: tag,
                     label: formatTaxonomyLabel(tag, taxonomy?.tagLabels, i18n.language),
                     title: tag,
-                    count: taxonomy?.counts?.tags?.[tag] ?? 0,
+                    count: facetCounts.tags[tag] ?? 0,
                   })),
                 ]}
               />
@@ -367,7 +437,7 @@ export default function HubPage() {
                   ...(['available', 'installed', 'updateAvailable', 'incompatible'] as const).map(state => ({
                     value: state,
                     label: text.states[state],
-                    count: taxonomy?.counts?.state?.[state] ?? 0,
+                    count: facetCounts.state[state] ?? 0,
                   })),
                 ]}
               />
@@ -419,6 +489,7 @@ export default function HubPage() {
       {selected && (
         <PluginDetail
           entry={selected}
+          language={i18n.language}
           onClose={() => setSelected(null)}
           onAction={runAction}
           actionId={actionId}
@@ -561,7 +632,7 @@ function HubTable({ items, actionId, tagLabels, language, text, onSelect, onActi
               <td className="max-w-0 px-3 py-2">
                 <button onClick={() => onSelect(item)} className="w-full text-left">
                   <div className="truncate font-medium text-gray-900 hover:text-slate-700">{item.name}</div>
-                  <div className="truncate text-[11px] text-gray-500">{item.description}</div>
+                  <div className="truncate text-[11px] text-gray-500">{getHubDescription(item, language)}</div>
                 </button>
               </td>
               <td className="max-w-0 px-3 py-2">
@@ -709,8 +780,9 @@ function countPluginNodes(node: HubTreeNode): number {
   return (node.entry ? 1 : 0) + node.children.reduce((sum, child) => sum + countPluginNodes(child), 0);
 }
 
-function PluginDetail({ entry, onClose, onAction, actionId, text }: {
+function PluginDetail({ entry, language, onClose, onAction, actionId, text }: {
   entry: HubCatalogEntry;
+  language: string;
   onClose: () => void;
   actionId: string | null;
   text: HubText;
@@ -767,7 +839,7 @@ function PluginDetail({ entry, onClose, onAction, actionId, text }: {
             <h2 className="text-lg font-semibold text-gray-900">{entry.name}</h2>
             <StateBadge state={entry.state} text={text} />
           </div>
-          <p className="text-sm text-gray-500 mt-1">{entry.description}</p>
+          <p className="text-sm text-gray-500 mt-1">{getHubDescription(entry, language)}</p>
         </div>
         <button onClick={onClose} className="p-1 rounded-lg hover:bg-gray-100"><X className="w-5 h-5" /></button>
       </div>

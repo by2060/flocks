@@ -81,6 +81,7 @@ class HubIndexEntry(BaseModel):
     type: PluginType
     name: str
     description: str = ""
+    descriptionCn: Optional[str] = None
     version: str = "0.0.0"
     category: str = "default"
     tags: list[str] = Field(default_factory=list)
@@ -114,6 +115,7 @@ class HubCatalogEntry(BaseModel):
     type: PluginType
     name: str
     description: str = ""
+    descriptionCn: Optional[str] = None
     version: str = "0.0.0"
     category: str = "default"
     tags: list[str] = Field(default_factory=list)

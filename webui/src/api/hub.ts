@@ -14,6 +14,7 @@ export interface HubCatalogEntry {
   type: HubPluginType;
   name: string;
   description: string;
+  descriptionCn?: string;
   version: string;
   category: string;
   tags: string[];

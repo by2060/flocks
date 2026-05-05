@@ -146,3 +146,41 @@ def infer_local_install(plugin_type: PluginType, plugin_id: str) -> Optional[Pat
                 if has_install_payload(plugin_type, candidate.parent):
                     return candidate.parent
     return None
+
+
+def infer_local_installs() -> dict[tuple[PluginType, str], Path]:
+    """Scan installed plugin roots once and return plugin id -> install path."""
+    result: dict[tuple[PluginType, str], Path] = {}
+
+    for plugin_type in ("skill", "agent", "workflow"):
+        for scope in ("global", "project"):
+            base = install_root(plugin_type, scope)
+            if not base.is_dir():
+                continue
+            for child in base.iterdir():
+                if child.is_dir() and has_install_payload(plugin_type, child):
+                    result.setdefault((plugin_type, child.name), child)
+
+    for scope in ("global", "project"):
+        base = install_root("tool", scope)
+        if not base.is_dir():
+            continue
+        for child in base.iterdir():
+            if child.is_dir() and has_install_payload("tool", child):
+                result.setdefault(("tool", child.name), child)
+        for group in ("api", "mcp", "generated"):
+            group_dir = base / group
+            if not group_dir.is_dir():
+                continue
+            for child in group_dir.iterdir():
+                if child.is_dir() and has_install_payload("tool", child):
+                    result.setdefault(("tool", child.name), child)
+        for candidate in base.rglob("*"):
+            if not candidate.is_file() or candidate.name == "__init__.py":
+                continue
+            if candidate.suffix not in {".yaml", ".yml", ".py"}:
+                continue
+            if has_install_payload("tool", candidate.parent):
+                result.setdefault(("tool", candidate.stem), candidate.parent)
+
+    return result

@@ -43,6 +43,22 @@ def test_bundled_hub_catalog_loads():
     assert {entry.type for entry in entries} >= {"skill", "agent", "tool", "workflow"}
 
 
+def test_pentest_agents_are_listed_in_agent_catalog():
+    entries = list_catalog(plugin_type="agent")
+    ids = {entry.id for entry in entries}
+
+    assert "pentest-ai-agents" not in ids
+    assert "web-hunter" in ids
+    assert "cloud-security" in ids
+    assert "swarm-orchestrator" in ids
+
+
+def test_catalog_query_matches_description_cn():
+    entries = list_catalog(plugin_type="agent", q="目录发现")
+    ids = {entry.id for entry in entries}
+    assert "web-hunter" in ids
+
+
 def test_project_builtin_plugins_are_listed_as_installed():
     entries = list_catalog()
     by_key = {(entry.type, entry.id): entry for entry in entries}
@@ -81,6 +97,13 @@ def test_bundled_hub_manifest_and_files_load():
     nested_content = read_file_content("skill", "triaging-security-incident", "SKILL.md")
     assert "Triaging Security Incidents" in nested_content.content
 
+    agent_manifest = load_manifest("agent", "web-hunter")
+    assert agent_manifest.id == "web-hunter"
+    agent_tree = file_tree("agent", "web-hunter")
+    assert any(child.name == "agent.yaml" for child in agent_tree.children)
+    agent_content = read_file_content("agent", "web-hunter", "agent.yaml")
+    assert "name: web-hunter" in agent_content.content
+
 
 async def test_hub_installs_and_uninstalls_skill(isolated_hub_env):
     record = await install_plugin("skill", "ndr-alert-analysis")
@@ -104,6 +127,18 @@ async def test_hub_installs_nested_anthropic_skill(isolated_hub_env):
     assert not skill_dir.exists()
 
 
+async def test_hub_installs_pentest_subagent(isolated_hub_env):
+    record = await install_plugin("agent", "web-hunter")
+    agent_dir = isolated_hub_env["home"] / ".flocks" / "plugins" / "agents" / "web-hunter"
+    assert (agent_dir / "agent.yaml").is_file()
+    assert (agent_dir / "prompt.md").is_file()
+    assert record.id == "web-hunter"
+
+    removed = await uninstall_plugin("agent", "web-hunter")
+    assert removed is True
+    assert not agent_dir.exists()
+
+
 async def test_catalog_clears_stale_skill_record_after_external_delete(isolated_hub_env):
     await install_plugin("skill", "ndr-alert-analysis")
     skill_dir = isolated_hub_env["home"] / ".flocks" / "plugins" / "skills" / "ndr-alert-analysis"
@@ -116,19 +151,6 @@ async def test_catalog_clears_stale_skill_record_after_external_delete(isolated_
     entry = next(item for item in entries if item.id == "ndr-alert-analysis")
     assert entry.state == "available"
     assert local.get_record("skill", "ndr-alert-analysis") is None
-
-
-async def test_catalog_clears_stale_tool_record_after_tool_files_deleted(isolated_hub_env):
-    await install_plugin("tool", "hub_echo")
-    tool_dir = isolated_hub_env["home"] / ".flocks" / "plugins" / "tools" / "hub_echo"
-    assert (tool_dir / "hub_echo.yaml").is_file()
-
-    (tool_dir / "hub_echo.yaml").unlink()
-    (tool_dir / "hub_echo.handler.py").unlink()
-    entries = list_catalog(plugin_type="tool")
-    entry = next(item for item in entries if item.id == "hub_echo")
-    assert entry.state == "available"
-    assert local.get_record("tool", "hub_echo") is None
 
 
 def test_hub_routes_cover_catalog_files_install_and_uninstall(isolated_hub_env):
@@ -171,3 +193,15 @@ def test_hub_routes_cover_catalog_files_install_and_uninstall(isolated_hub_env):
     assert removed.status_code == 200
     available_catalog = client.get("/api/hub/catalog", params={"state": "available"}).json()
     assert any(item["id"] == "ndr-alert-analysis" for item in available_catalog)
+
+
+def test_hub_routes_legacy_removed_plugins_return_gone(isolated_hub_env):
+    from flocks.server.routes.hub import router
+
+    app = FastAPI()
+    app.include_router(router, prefix="/api")
+    client = TestClient(app, raise_server_exceptions=True)
+
+    response = client.get("/api/hub/plugins/agent/alert-triage-agent")
+    assert response.status_code == 410
+    assert "removed" in response.json()["detail"]
