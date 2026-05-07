@@ -1,4 +1,4 @@
-name: onesig_v2_5_older_assets
+name: onesig_v2_5_3_D20250710_assets
 description: >
   OneSIG asset management grouped tool. Use the `action` parameter to manage
   assets, asset groups, asset types, and import / export workflows under
@@ -9,7 +9,7 @@ description_cn: >
 category: custom
 enabled: true
 requires_confirmation: true
-provider: onesig_v2_5_older_api
+provider: onesig_v2_5_3_D20250710_api
 inputSchema:
   type: object
   properties:
@@ -86,5 +86,5 @@ inputSchema:
     - action
 handler:
   type: script
-  script_file: onesig_v2_5_older.handler.py
+  script_file: onesig_v2_5_3_D20250710.handler.py
   function: assets

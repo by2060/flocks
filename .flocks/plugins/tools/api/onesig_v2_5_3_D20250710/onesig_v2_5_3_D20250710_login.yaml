@@ -1,4 +1,4 @@
-name: onesig_v2_5_older_login
+name: onesig_v2_5_3_D20250710_login
 description: >
   OneSIG (older v2.5) login / session management grouped tool. Same surface
   as the standard `onesig_login`, but the login endpoint receives the
@@ -6,7 +6,7 @@ description: >
   `POST /v3/login`). Use the `action` parameter to log in (build a cookie
   session), log out, change the current user's password, pull captcha /
   pubkey / account info, and manage product news / TOTP recovery codes.
-  Most other `onesig_v2_5_older_*` tools auto-login on demand so explicit
+  Most other `onesig_v2_5_3_D20250710_*` tools auto-login on demand so explicit
   `login` calls are only needed when captcha or TOTP is required.
 
   Auth-flow endpoints handled internally (NOT registered as ActionSpecs):
@@ -26,7 +26,7 @@ description_cn: >
   一致，区别仅在于登录链路：本插件 `POST /v3/login` 直接发送**明文**密码，
   不再调 `GET /v3/pubkey` 也不做 RSA-OAEP 加密。
   通过 `action` 调用登录、登出、改密、拉取验证码 / 账户信息，以及产品动态、
-  TOTP 恢复码等接口。其他 `onesig_v2_5_older_*` 工具会按需自动登录，仅在设备
+  TOTP 恢复码等接口。其他 `onesig_v2_5_3_D20250710_*` 工具会按需自动登录，仅在设备
   启用图形验证码或 TOTP 时需要显式调用 `login` 并传入 `captcha`/`totp`。
 
   专用鉴权流程（已在处理器内部封装，不以 ActionSpec 形式开放）：
@@ -44,7 +44,7 @@ description_cn: >
 category: custom
 enabled: true
 requires_confirmation: true
-provider: onesig_v2_5_older_api
+provider: onesig_v2_5_3_D20250710_api
 inputSchema:
   type: object
   properties:
@@ -130,5 +130,5 @@ inputSchema:
     - action
 handler:
   type: script
-  script_file: onesig_v2_5_older.handler.py
+  script_file: onesig_v2_5_3_D20250710.handler.py
   function: login

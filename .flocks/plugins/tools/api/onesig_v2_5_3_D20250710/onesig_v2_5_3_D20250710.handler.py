@@ -18,9 +18,9 @@ from flocks.config.config_writer import ConfigWriter
 from flocks.tool.registry import ToolContext, ToolResult
 
 
-SERVICE_ID = "onesig_v2_5_older_api"
+SERVICE_ID = "onesig_v2_5_3_D20250710_api"
 
-# OneSIG v2.5.x 老版本（``onesig_v2_5_older``）设备直接监听 ``/v3/...``，没有
+# OneSIG v2.5.x 老版本（``onesig_v2_5_3_D20250710``）设备直接监听 ``/v3/...``，没有
 # 任何额外前缀；与新版插件对齐，``api_prefix`` 留空即可。需要前缀的部署在 UI
 # 上把 ``api_prefix`` 设成 ``"/api"`` 等值即可覆盖。
 DEFAULT_API_PREFIX = ""
@@ -33,12 +33,12 @@ DEFAULT_VERIFY_SSL = False
 DEFAULT_PERSIST_COOKIES = True
 
 # Bumped whenever the on-disk shape under
-# ``onesig_v2_5_older_session_cookie__*`` changes in an incompatible way;
+# ``onesig_v2_5_3_D20250710_session_cookie__*`` changes in an incompatible way;
 # older snapshots are silently discarded. Prefix is intentionally distinct
 # from the encrypted-login plugin so the two coexist without clobbering
 # each other's persisted cookie jars.
 _COOKIE_SNAPSHOT_VERSION = 1
-_COOKIE_SECRET_PREFIX = "onesig_v2_5_older_session_cookie__"
+_COOKIE_SECRET_PREFIX = "onesig_v2_5_3_D20250710_session_cookie__"
 
 _RESPONSE_CODE_OK = 0
 _RESPONSE_CODE_TOTP_REQUIRED = 1012
@@ -126,7 +126,7 @@ def _resolve_verify_ssl(raw: dict[str, Any]) -> bool:
     # Prefer the plaintext-login-specific env var, fall back to the shared
     # ``ONESIG_VERIFY_SSL`` so a single CLI/container env can drive both
     # plugins side-by-side without re-declaring the toggle twice.
-    candidates.append(os.getenv("ONESIG_V2_5_OLDER_VERIFY_SSL"))
+    candidates.append(os.getenv("ONESIG_V2_5_3_D20250710_VERIFY_SSL"))
     candidates.append(os.getenv("ONESIG_VERIFY_SSL"))
 
     for value in candidates:
@@ -160,7 +160,7 @@ def _resolve_persist_cookies(raw: dict[str, Any]) -> bool:
     custom = raw.get("custom_settings")
     if isinstance(custom, dict):
         candidates.append(custom.get("persist_cookies"))
-    candidates.append(os.getenv("ONESIG_V2_5_OLDER_PERSIST_COOKIES"))
+    candidates.append(os.getenv("ONESIG_V2_5_3_D20250710_PERSIST_COOKIES"))
     candidates.append(os.getenv("ONESIG_PERSIST_COOKIES"))
 
     for value in candidates:
@@ -209,21 +209,21 @@ def _resolve_runtime_config() -> OneSIGRuntimeConfig:
     base_url = (
         _resolve_ref(raw.get("base_url"))
         or _resolve_ref(raw.get("baseUrl"))
-        or os.getenv("ONESIG_V2_5_OLDER_BASE_URL")
+        or os.getenv("ONESIG_V2_5_3_D20250710_BASE_URL")
         or os.getenv("ONESIG_BASE_URL")
     )
     if not base_url:
         raise ValueError(
             "OneSIG (older v2.5) base_url not configured. Set "
-            "api_services.onesig_v2_5_older_api.base_url or "
-            "ONESIG_V2_5_OLDER_BASE_URL."
+            "api_services.onesig_v2_5_3_D20250710_api.base_url or "
+            "ONESIG_V2_5_3_D20250710_BASE_URL."
         )
     base_url = base_url.rstrip("/")
 
     api_prefix = (
         _resolve_ref(raw.get("api_prefix"))
         or _resolve_ref(raw.get("apiPrefix"))
-        or os.getenv("ONESIG_V2_5_OLDER_API_PREFIX")
+        or os.getenv("ONESIG_V2_5_3_D20250710_API_PREFIX")
         or os.getenv("ONESIG_API_PREFIX")
         or DEFAULT_API_PREFIX
     )
@@ -234,28 +234,28 @@ def _resolve_runtime_config() -> OneSIGRuntimeConfig:
     username = (
         _resolve_ref(raw.get("username"))
         or _resolve_ref(raw.get("user"))
-        or os.getenv("ONESIG_V2_5_OLDER_USERNAME")
+        or os.getenv("ONESIG_V2_5_3_D20250710_USERNAME")
         or os.getenv("ONESIG_USERNAME")
     )
     if not username:
         raise ValueError(
             "OneSIG (older v2.5) username not configured. Set "
-            "api_services.onesig_v2_5_older_api.username or "
-            "ONESIG_V2_5_OLDER_USERNAME."
+            "api_services.onesig_v2_5_3_D20250710_api.username or "
+            "ONESIG_V2_5_3_D20250710_USERNAME."
         )
 
     secret_manager = _get_secret_manager()
     password = (
         _resolve_ref(raw.get("password"))
-        or secret_manager.get("onesig_v2_5_older_password")
+        or secret_manager.get("onesig_v2_5_3_D20250710_password")
         or secret_manager.get(f"{SERVICE_ID}_password")
-        or os.getenv("ONESIG_V2_5_OLDER_PASSWORD")
+        or os.getenv("ONESIG_V2_5_3_D20250710_PASSWORD")
         or os.getenv("ONESIG_PASSWORD")
     )
     if not password:
         raise ValueError(
             "OneSIG (older v2.5) password not configured. Save it as the "
-            "onesig_v2_5_older_password secret or set ONESIG_V2_5_OLDER_PASSWORD."
+            "onesig_v2_5_3_D20250710_password secret or set ONESIG_V2_5_3_D20250710_PASSWORD."
         )
 
     # OAEP hash 只对 *非登录* 的敏感字段（改密 / 删用户 / 删审计 / 接口启停 /
@@ -263,7 +263,7 @@ def _resolve_runtime_config() -> OneSIGRuntimeConfig:
     oaep_hash = (
         _resolve_ref(raw.get("oaep_hash"))
         or _resolve_ref(raw.get("oaepHash"))
-        or os.getenv("ONESIG_V2_5_OLDER_OAEP_HASH")
+        or os.getenv("ONESIG_V2_5_3_D20250710_OAEP_HASH")
         or os.getenv("ONESIG_OAEP_HASH")
         or DEFAULT_OAEP_HASH
     ).lower()
@@ -611,7 +611,7 @@ class OneSIGSession:
             enable_totp_inline = bool(captcha_data.get("enableTotp"))
             if enable_captcha and not captcha:
                 raise ValueError(
-                    "OneSIG 设备已启用图形验证码，请通过 onesig_v2_5_older_login(action='login', captcha='...') 提供。"
+                    "OneSIG 设备已启用图形验证码，请通过 onesig_v2_5_3_D20250710_login(action='login', captcha='...') 提供。"
                 )
             if enable_totp_inline and not totp:
                 # Inline mode: the captcha endpoint already advertises
@@ -621,7 +621,7 @@ class OneSIGSession:
                 # see an opaque 1017 / "checksum 不能为空" later.
                 raise ValueError(
                     "OneSIG 设备已启用 inline TOTP（同屏「用户口令」），请通过 "
-                    "onesig_v2_5_older_login(action='login', totp='...') 提供动态口令或恢复码。"
+                    "onesig_v2_5_3_D20250710_login(action='login', totp='...') 提供动态口令或恢复码。"
                 )
 
             # ---------------------------------------------------------
@@ -678,7 +678,7 @@ class OneSIGSession:
             elif response_code in (_RESPONSE_CODE_DEFAULT_PWD, _RESPONSE_CODE_PWD_EXPIRED):
                 raise ValueError(
                     f"OneSIG 要求修改密码（responseCode={response_code}：{login_resp.get('verboseMsg')})。"
-                    " 请先通过控制台或 `onesig_v2_5_older_login(action='change_password', ...)` 修改密码。"
+                    " 请先通过控制台或 `onesig_v2_5_3_D20250710_login(action='change_password', ...)` 修改密码。"
                 )
             elif response_code != _RESPONSE_CODE_OK:
                 raise ValueError(
@@ -1939,7 +1939,7 @@ def _save_binary(path: str, body: bytes, content_type: str) -> str:
     elif "octet-stream" in ct:
         ext = ".bin"
     timestamp = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
-    target = Path(_outputs_dir()) / f"onesig_v2_5_older_{safe_name}_{timestamp}{ext}"
+    target = Path(_outputs_dir()) / f"onesig_v2_5_3_D20250710_{safe_name}_{timestamp}{ext}"
     target.write_bytes(body)
     return str(target)
 
