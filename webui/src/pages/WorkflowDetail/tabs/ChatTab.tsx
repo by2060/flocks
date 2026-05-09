@@ -5,7 +5,7 @@ import SessionChat, { NodeRef, type SSEChatEvent } from '@/components/common/Ses
 import { useSessionChat } from '@/hooks/useSessionChat';
 import { useDefaultModelVision } from '@/hooks/useDefaultModelVision';
 import type { ImagePartData } from '@/utils/imageUpload';
-import { workflowAPI, Workflow, WorkflowNode } from '@/api/workflow';
+import { workflowAPI, Workflow, WorkflowExecution, WorkflowNode } from '@/api/workflow';
 import { formatSessionDate } from '@/utils/time';
 import client from '@/api/client';
 
