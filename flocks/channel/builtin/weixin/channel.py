@@ -236,6 +236,16 @@ class WeixinChannel(ChannelPlugin):
             "account_id": safe_id(self._account_id),
             "base_url": self._base_url,
         })
+        if self._group_policy != "disabled":
+            log.warning("weixin.group_policy.note", {
+                "group_policy": self._group_policy,
+                "note": (
+                    "QR-login connects an iLink bot identity (e.g. ...@im.bot), not a "
+                    "normal personal WeChat account. Ordinary WeChat group messages are "
+                    "typically NOT delivered by iLink for this account type. "
+                    "groupPolicy only takes effect if iLink actually delivers group events."
+                ),
+            })
 
         try:
             await self._poll_loop(on_message, abort_event)
