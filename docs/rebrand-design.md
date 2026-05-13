@@ -759,3 +759,294 @@ jobs:
 - **PR#3**：执行 DEL 清单（#1-#13）
 - **PR#4**：执行必要的 SHRINK（跟随第 2 步品牌改造一起做）
 
+
+
+
+---
+
+## 十四、顶层目录与被遗漏路径的补充评估（v1.1 补充）
+
+> 前九章仅聚焦 `flocks/` Python 包与 `.flocks/` 插件目录，未覆盖仓库顶层的 `docker/`、`tests/`、`tui/`、`webui/`、`scripts/`、`packaging/`、`docs/`、根目录配置文件等。本章将这些补齐，形成真正的"全集"。
+
+### 14.1 根目录文件评估
+
+| 路径 | 操作 | 说明 |
+|---|---|---|
+| `AGENTS.md` | **KEEP → SHRINK（B 步改写，C 步翻译）** | Sentry 全局指令，23 处 flocks 引用 |
+| `LICENSE.txt` | **KEEP** | 无品牌字符串 |
+| `Makefile` | **KEEP** | 1 处 `flocks` 字样，第 2 步品牌替换 |
+| `pyproject.toml` | **KEEP** | 6 处，第 2 步包名/entry_point 替换 |
+| `README.md` / `README_zh.md` | **KEEP**（第 2 步大改 + C 步翻译） | 49/47 处 flocks |
+| `uv.lock` | **KEEP** | 第 2 步 `uv sync` 自动重新生成 |
+| `.gitignore` | **KEEP**（SHRINK） | 引用 `.flocks/` 路径，第 2 步改 + 加入 exclude 黑名单 |
+| `.dockerignore` | **KEEP**（SHRINK） | 同上，含 `.flocks/*.db` 等路径 |
+| `.gitattributes` | **KEEP** | 无品牌字符串 |
+| `install.sh` / `install.ps1` | **KEEP**（第 2 步改品牌） | 12/18 处 flocks |
+| `install_zh.sh` / `install_zh.ps1` | **KEEP**（第 2 步改品牌） | 22/38 处 flocks |
+
+### 14.2 docker/ 目录
+
+| 路径 | 操作 | 说明 |
+|---|---|---|
+| `docker/Dockerfile` | **KEEP**（第 2 步深度改品牌） | 2.6 KB，16 处 `FLOCKS_*` 环境变量 + `/opt/flocks` 等路径 + `flocks` 用户名 + `VITE_APP_NAME=Flocks` |
+
+### 14.3 docs/ 目录
+
+| 路径 | 操作 | 说明 |
+|---|---|---|
+| `docs/CONTRIBUTING.md` | **KEEP**（第 2 步改品牌 + C 步翻译） | 4 处 flocks |
+| `docs/rebrand-design.md` | **KEEP** | 本文档 |
+
+### 14.4 scripts/ 目录全集（之前只提了 4 个，现在共 11 个）
+
+| # | 路径 | 操作 | 说明 |
+|---|---|---|---|
+| SCR01 | `scripts/validate_flockshub.py` | **DEL**（已列，再次重申） | bundled hub 删空后无用 |
+| SCR02 | `scripts/container-start.sh` | **KEEP**（第 2 步） | `/opt/flocks`、`FLOCKS_*` 需改 |
+| SCR03 | `scripts/dev.sh` | **KEEP**（第 2 步） | `uvicorn flocks.server.app:app`、`_FLOCKS_WEBUI_*` 需改 |
+| SCR04 | `scripts/serve_webui.py` | **KEEP** | 带 SPA fallback 的 WebUI 静态服务，无品牌耦合 |
+| SCR05 | `scripts/install.sh` | **KEEP**（第 2 步） | 32 KB，大量 `FLOCKS_INSTALL_*` |
+| SCR06 | `scripts/install.ps1` | **KEEP**（第 2 步） | 46 KB，Windows PS 版本 |
+| SCR07 | `scripts/install_zh.sh` | **KEEP**（第 2 步） | 中文国内镜像版 |
+| SCR08 | `scripts/install_zh.ps1` | **KEEP**（第 2 步） | 同上 |
+| SCR09 | `scripts/migrate_legacy_task_tables.py` | **KEEP** | 数据迁移，需评估是否仍有调用 |
+| SCR10 | `scripts/run_legacy_task_migration.sh` | **KEEP** | 配套 SCR09 |
+| SCR11 | `scripts/recover_raw_flocks_db.py` | **KEEP**（第 2 步改名为 `recover_raw_smartclaw_db.py`） | 数据库灾难恢复工具 |
+
+> 注：根目录的 `install.sh` / `install.ps1` / `install_zh.sh` / `install_zh.ps1` 与 `scripts/` 下同名文件为"一键在线安装入口"与"离线落地安装"两套，都保留但品牌要同步替换。
+
+### 14.5 packaging/windows/ 目录全集（之前只提了 3 个，现在共 9 个）
+
+| # | 路径 | 操作 | 说明 |
+|---|---|---|---|
+| PKG01 | `packaging/README.md` | **KEEP**（第 2 步品牌改写） | Windows 打包说明 |
+| PKG02 | `packaging/windows/flocks-setup.iss` | **SHRINK** | Inno Setup 脚本，第 2 步改名为 `smartclaw-setup.iss` |
+| PKG03 | `packaging/windows/bootstrap-windows.ps1` | **KEEP**（第 2 步） | 安装引导，含 `FLOCKS_*` 变量 |
+| PKG04 | `packaging/windows/build-installer.ps1` | **KEEP**（第 2 步） | 调用 Inno Setup 打 exe |
+| PKG05 | `packaging/windows/build-staging.ps1` | **KEEP**（第 2 步） | 搭 staging 目录，含 `FLOCKS_INSTALL_ROOT` 等 |
+| PKG06 | `packaging/windows/staging-layout.json` | **KEEP**（第 2 步） | 安装目录布局 |
+| PKG07 | `packaging/windows/versions.manifest.json` | **KEEP** | 版本清单 |
+| PKG08 | `packaging/windows/DOWNLOAD-HOSTING.txt` | **SHRINK** | 下载镜像说明，品牌替换 |
+| PKG09 | `packaging/windows/start-flocks-elevated.ps1` | **SHRINK** | 第 2 步改名为 `start-smartclaw-elevated.ps1` |
+| PKG10 | `packaging/windows/uninstall-flocks-user-state.ps1` | **SHRINK** | 同上改名 |
+
+### 14.6 tui/ 目录（TypeScript TUI，3.4 MB）
+
+> ⚠️ 这是个值得单独决策的大件：113 处 flocks 引用，38 个子目录，package 名 `flocks-tui`。
+
+**背景**：
+- `tui/flocks/` 是**早期 TypeScript 版 Flocks 的完整移植**，作为 TUI 的底层实现依赖
+- 与 Python 主包通过 `flocks tui` 子命令 + 本地 HTTP API 通信
+- 若放弃 TUI，可整个 `tui/` DEL；若保留 TUI，需要 3.4 MB TS 代码做品牌替换
+
+**建议分两种情形决策**：
+
+| 情形 | 操作 | 理由 |
+|---|---|---|
+| A. 保留 TUI 界面（终端用户需要） | **KEEP + 第 2 步改名 `tui/flocks/` → `tui/smartclaw/`** | TUI 是 CLI 用户的主要交互方式，不建议弃用 |
+| B. 仅保留 WebUI，不维护 TUI | **DEL 整个 tui/** | 3.4 MB 代码 + 113 处 flocks → smartclaw 替换是大工程 |
+
+#### 14.6.1 若保留 TUI，需处理的路径
+
+| 路径 | 操作 |
+|---|---|
+| `tui/flocks/` （38 个子目录） | **RENAME → `tui/smartclaw/`**（第 2 步） |
+| `tui/sdk/` | **KEEP**（第 2 步内部 import 替换） |
+| `tui/util/` | **KEEP**（第 2 步内部 import 替换） |
+| `tui/src/index.ts` | **KEEP**（第 2 步品牌替换） |
+| `tui/package.json` | **KEEP**（第 2 步改 `"name": "smartclaw-tui"`） |
+| `tui/README.md` | **KEEP**（第 2 步 + C 步翻译） |
+| `tui/tsconfig.json` / `tui/bunfig.toml` | **KEEP**（第 2 步路径别名替换） |
+| `tui/bun.lock` | **KEEP**（自动重新生成） |
+
+**请在进入第 1 步前确认：tui 保留（情形 A）或删除（情形 B）？**
+
+### 14.7 webui/ 目录（React + Vite，5.1 MB）
+
+> 品牌替换 + 翻译的主战场之一，76 处 flocks 引用。
+
+| 路径 | 操作 | 说明 |
+|---|---|---|
+| `webui/src/App.tsx` / `main.tsx` | **KEEP**（第 2 步） | |
+| `webui/src/pages/`（24 个页面） | **KEEP**（第 2 步 + C 步翻译） | AdminUsers/Agent/Channel/... 等 |
+| `webui/src/components/layout/Layout.tsx` | **KEEP**（第 2 步） | Header 中 `Flocks` 品牌字样 |
+| `webui/src/locales/en-US/*.json` | **KEEP**（第 2 步品牌替换） | 8 个 i18n 字典 |
+| `webui/src/locales/zh-CN/*.json` | **KEEP**（第 2 步品牌替换） | 同上中文版 |
+| `webui/src/i18n.ts` | **KEEP** | i18n 基础设施 |
+| `webui/src/api/` / `hooks/` / `utils/` | **KEEP**（第 2 步 import 路径替换） | |
+| `webui/index.html` | **KEEP**（第 2 步改 `<title>`） | `<title>Flocks - AI Native SecOps Platform</title>` |
+| `webui/package.json` | **KEEP**（第 2 步改 `"name"`） | |
+| `webui/public/favicon.svg` | **KEEP**（第 2 步建议换 logo） | |
+| `webui/public/vite.svg` | **KEEP** | Vite 自带 |
+| `webui/public/gitee-logo.png` | **SHRINK**（若不再用 Gitee 则删） | |
+| `webui/public/channel-feishu.png` | **KEEP** | 飞书引导图 |
+| `webui/public/channel-wecom.png` | **KEEP** | 企微引导图 |
+| `webui/public/channel-dingtalk.png` | **KEEP** | 钉钉引导图 |
+| `webui/public/channel-weixin.png` | **DEL** | 对应已 DEL 的 weixin 渠道 |
+| `webui/public/channel-telegram.png` | **DEL** | 对应已 DEL 的 telegram 渠道 |
+| `webui/public/feishu-bot-guide.pdf` | **KEEP** | 1.1 MB 飞书机器人引导 |
+| `webui/public/wecom-bot-guide.pdf` | **KEEP** | 779 KB 企微机器人引导 |
+| `webui/public/dingtalk-channel-guide.pdf` | **KEEP** | 290 KB 钉钉引导 |
+| `webui/vite.config.ts` / `vitest.config.ts` | **KEEP** | |
+| `webui/eslint.config.js` / `postcss.config.js` / `tailwind.config.js` | **KEEP** | |
+| `webui/.env.example` | **KEEP**（第 2 步改变量前缀） | |
+
+### 14.8 tests/ 目录（Python 测试套件，3.6 MB，38 子目录，282 个测试文件）
+
+> **268/282 个测试文件含 flocks 引用**，第 2 步 import 替换时必须同步改。
+
+#### 14.8.1 整体策略
+
+- **268 个含 `from flocks...` 的测试文件**：第 2 步跟随主代码 import 替换（批量 sed）
+- **部分测试因 DEL 而失效**，需要删除对应测试文件（见 14.8.2）
+- **测试目录结构整体保留**
+
+#### 14.8.2 需要删除的测试（跟随 DEL/MOVE）
+
+| # | 测试路径 | DEL 原因 |
+|---|---|---|
+| T01 | `tests/hub/test_bundled_tools.py` | 对应 `scripts/validate_flockshub.py` DEL 和 bundled hub 清空 |
+| T02 | `tests/hub/test_hub_catalog.py` | 同上 |
+| T03 | `tests/channel/test_weixin.py`（如有） | 对应 weixin 渠道 DEL |
+| T04 | `tests/channel/test_telegram.py` | 对应 telegram 渠道 DEL |
+| T05 | `tests/mcp/test_mcp_threatbook_demo.py` | SecOps 依赖，MOVE 到插件仓库 |
+| T06 | `tests/skill/test_skyeye_project_skills.py` | 对应 skyeye 系列 skill MOVE |
+| T07 | `tests/skill/test_product_use_project_skills.py` | SecOps 厂商 skill 测试，评估后 MOVE |
+| T08 | `tests/skill/test_onboarding_skill.py` | `onboarding/` SHRINK 需重写，测试同步重写 |
+| T09 | `tests/skill/test_onboarding_status.py` | 同上 |
+
+#### 14.8.3 需要评估删除的测试目录
+
+| 路径 | 评估结论 |
+|---|---|
+| `tests/docker/` | **KEEP**（Dockerfile 回归测试） |
+| `tests/packaging/` | **KEEP**（Windows 安装器回归测试） |
+| `tests/integration/` | **KEEP** |
+| `tests/cli/`、`tests/server/`、`tests/session/` 等主流程目录 | **KEEP**（核心回归） |
+| `tests/conftest.py` | **KEEP** |
+
+---
+
+## 十五、v1.1 补充后删减总量重算
+
+| 分类 | DEL | MOVE | 备注 |
+|---|---|---|---|
+| Bundled Hub | 2 大目录（~290 项） | 4 项 | 不变 |
+| 内置 Agents | 3 | 0 | 不变 |
+| 插件 Agents | 0 | 8 | 不变 |
+| 插件 Skills | 0 | 7 | 不变 |
+| 插件 Tools | 0 | 19 | 不变 |
+| 插件 Tasks/Workflows | 0 | 3 | 不变 |
+| 代码工具 | 1 | 1 | 不变 |
+| IM 渠道 | 2 | 0 | 不变 |
+| CI / 脚本 | 2 | 0 | 不变 |
+| Assets | 1 | 0 | 不变 |
+| npm-wrapper | 1 整目录 | 0 | 不变 |
+| **webui/public 图标** | **2（channel-weixin.png / channel-telegram.png）** | 0 | **v1.1 新增** |
+| **tests（DEL 失效测试）** | **9（T01-T09）** | 0 | **v1.1 新增** |
+| **tui/（若选情形 B）** | **1 大目录（~3.4 MB）** | 0 | **待决策** |
+| **合计（不含 tui 情形 B）** | **~310 项** | **~42 项** | **~41 MB** |
+| **合计（含 tui 情形 B）** | **~311 项** | **~42 项** | **~44 MB** |
+
+---
+
+## 十六、v1.1 版执行清单补丁
+
+原第 12.1-12.4 清单保持不变，在其后追加以下条目：
+
+### 16.1 额外 DEL
+
+| # | 路径 | 说明 |
+|---|---|---|
+| 14 | `webui/public/channel-weixin.png` | 对应 weixin 渠道 DEL |
+| 15 | `webui/public/channel-telegram.png` | 对应 telegram 渠道 DEL |
+| 16 | `tests/hub/test_bundled_tools.py` | hub 删空后失效 |
+| 17 | `tests/hub/test_hub_catalog.py` | 同上 |
+| 18 | `tests/channel/test_weixin.py`（如存在） | 对应渠道 DEL |
+| 19 | `tests/channel/test_telegram.py` | 对应渠道 DEL |
+| 20 | `tests/mcp/test_mcp_threatbook_demo.py` | SecOps 依赖 MOVE |
+| 21 | `tests/skill/test_skyeye_project_skills.py` | SecOps skill MOVE |
+| 22 | `tests/skill/test_product_use_project_skills.py` | SecOps skill MOVE |
+| 23 | `tests/skill/test_onboarding_skill.py` | onboarding 将重写 |
+| 24 | `tests/skill/test_onboarding_status.py` | 同上 |
+| 25 | `tui/`（整目录，若选情形 B） | **待决策**：是否放弃 TUI 界面 |
+
+### 16.2 额外 SHRINK（第 2 步执行，非 Step 1）
+
+| 路径 | 操作 |
+|---|---|
+| `docker/Dockerfile` | 品牌替换（16 处） |
+| `docs/CONTRIBUTING.md` | 品牌替换（4 处） |
+| 根目录 `Makefile` / `pyproject.toml` / `install*.{sh,ps1}` / `LICENSE.txt` | 品牌替换 |
+| `.gitignore` / `.dockerignore` | 路径与注释替换 |
+| 全部 11 个 `scripts/*` 脚本 | 路径+品牌替换 |
+| 全部 10 个 `packaging/windows/*` 文件 | 路径+品牌替换 |
+| `webui/` 全量 | import 路径 + i18n 字典 + title 品牌替换 |
+| `tui/flocks/` → `tui/smartclaw/`（若选情形 A） | 整目录重命名 |
+| `tests/` 中 268 个测试的 `from flocks...` | 批量替换 |
+
+### 16.3 新增 `.upstream-sync/exclude-paths.txt` 条目
+
+```
+# === v1.1 补充：对应已 DEL 的 IM 渠道图标 ===
+webui/public/channel-weixin.png
+webui/public/channel-telegram.png
+
+# === v1.1 补充：对应已 DEL 的测试 ===
+tests/hub/test_bundled_tools.py
+tests/hub/test_hub_catalog.py
+tests/mcp/test_mcp_threatbook_demo.py
+tests/skill/test_skyeye_project_skills.py
+tests/skill/test_product_use_project_skills.py
+tests/skill/test_onboarding_skill.py
+tests/skill/test_onboarding_status.py
+
+# === v1.1 待决策：若选情形 B 则启用 ===
+# tui/
+```
+
+### 16.4 新增 `.upstream-sync/keep-ours.txt` 条目
+
+```
+# === v1.1 补充：webui i18n 字典 + 品牌字符串 ===
+webui/index.html
+webui/src/locales/en-US/common.json
+webui/src/locales/zh-CN/common.json
+webui/src/components/layout/Layout.tsx
+
+# === v1.1 补充：tui 若保留则全量保持本地版本 ===
+tui/package.json
+tui/src/index.ts
+tui/README.md
+
+# === v1.1 补充：安装脚本（内嵌大量 FLOCKS_* 环境变量，第 2 步深度改造）===
+install.sh
+install.ps1
+install_zh.sh
+install_zh.ps1
+scripts/install.sh
+scripts/install.ps1
+scripts/install_zh.sh
+scripts/install_zh.ps1
+scripts/container-start.sh
+scripts/dev.sh
+scripts/recover_raw_flocks_db.py
+
+# === v1.1 补充：Windows 打包 ===
+packaging/README.md
+packaging/windows/bootstrap-windows.ps1
+packaging/windows/build-installer.ps1
+packaging/windows/build-staging.ps1
+packaging/windows/versions.manifest.json
+packaging/windows/DOWNLOAD-HOSTING.txt
+```
+
+---
+
+## 十七、新增待确认决策（1 项）
+
+| 编号 | 决策项 | 选项 |
+|---|---|---|
+| 4 | **`tui/` 是否保留？** | A：保留（改名 `tui/smartclaw/`，工作量大）<br>B：整体 DEL（3.4 MB TS 代码不再维护） |
+
+> 其他已覆盖：产品定位 C / weixin+telegram DEL / npm-wrapper DEL。确认 tui 情形后第 1 步即可开工。
