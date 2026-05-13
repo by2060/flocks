@@ -382,7 +382,7 @@ Rex 主 prompt 当前约 858 行英文，内部硬写 `"Rex"` 自称及第三人
 | `scripts/migrate_legacy_task_tables.py` / `run_legacy_task_migration.sh` | **KEEP** | 数据迁移 |
 | 根目录 `install*.sh` / `install*.ps1`（4 份）+ `scripts/install*.sh` / `install*.ps1`（4 份） | **SHRINK** | 第 2 步统一处理 |
 | `packaging/windows/flocks-setup.iss` / `uninstall-flocks-user-state.ps1` / `start-flocks-elevated.ps1` | **SHRINK** | 第 2 步改名 |
-| `npm-wrapper/` | **EVAL（待确认）** | 若不发 npm 包可整体 **DEL** |
+| `npm-wrapper/` | **DEL** | 仅为 `npx → uvx` 转发壳程序（50 行 mjs），非必需。npm 用户直接装 uv 即可 |
 
 #### 9.3.11 Assets & 品牌资源
 
@@ -391,7 +391,12 @@ Rex 主 prompt 当前约 858 行英文，内部硬写 `"Rex"` 自称及第三人
 | `assets/flocks.webp` | **DEL**（第 2 步替换 logo） |
 | `assets/community-wecom-qr.png` | **KEEP**（社区二维码可替换内容） |
 
-### 9.4 删减总量统计
+### 9.4 删减总量统计（已根据最终决策更新）
+
+依据已确认的 3 项决策：
+- 产品定位：**选项 C**（通用核心 + SecOps 可选插件包）
+- weixin / telegram 渠道：**DEL**（直接删除，不搬迁）
+- npm-wrapper：**DEL**
 
 | 分类 | DEL | MOVE | 节省 |
 |---|---|---|---|
@@ -402,10 +407,11 @@ Rex 主 prompt 当前约 858 行英文，内部硬写 `"Rex"` 自称及第三人
 | 插件 Tools | 0 | 19 | ~1.2 MB |
 | 插件 Tasks/Workflows | 0 | 3 | ~30 KB |
 | 代码工具 | 1 | 1 | 少量 |
-| IM 渠道 | 0 | 2 | ~170 KB |
+| IM 渠道 | 2 | 0 | ~170 KB |
 | CI / 脚本 | 2 | 0 | 少量 |
 | Assets | 1 | 0 | ~800 KB |
-| **合计** | **~296 项** | **~44 项** | **~40 MB** |
+| npm-wrapper | 1 整个目录 | 0 | ~12 KB |
+| **合计** | **~299 项** | **~42 项** | **~40 MB** |
 
 ---
 
@@ -474,7 +480,7 @@ flocks/agent/agents/momus/
 flocks/tool/wecom/
 flocks/tool/agent/call_omo_agent.py
 
-# === IM 渠道移出 ===
+# === IM 渠道删除 ===
 flocks/channel/builtin/weixin/
 flocks/channel/builtin/telegram/
 
@@ -484,6 +490,9 @@ scripts/validate_flockshub.py
 
 # === 品牌资产 ===
 assets/flocks.webp
+
+# === npm wrapper 删除 ===
+npm-wrapper/
 ```
 
 ### 10.5 `.upstream-sync/keep-ours.txt` 示例
@@ -508,7 +517,6 @@ docker/Dockerfile
 packaging/windows/flocks-setup.iss
 packaging/windows/staging-layout.json
 webui/index.html
-npm-wrapper/package.json
 tui/package.json
 ```
 
@@ -579,14 +587,175 @@ jobs:
 
 ---
 
-## 十一、需最终确认的三件事
+## 十一、关键决策（已确认）
 
-1. **产品定位选项 C 是否确认**（通用核心 + SecOps 可选插件包）？
-2. **weixin / telegram 两个 IM 渠道**：`MOVE` 到插件包？还是直接 `DEL`？
-3. **npm-wrapper 是否保留**：继续发 npm 包？还是直接 `DEL`？
+| 编号 | 决策项 | 结果 | 影响 |
+|---|---|---|---|
+| 1 | 产品定位 | **选项 C**：通用核心 + SecOps 可选插件包 | SecOps 内容 MOVE 到独立插件仓库 |
+| 2 | weixin / telegram IM 渠道 | **DEL**（直接删除） | 不在主仓库保留，也不搬迁 |
+| 3 | npm-wrapper | **DEL** | 不继续维护 npm 发布通道 |
 
-确认后即可进入第 1 步执行，产出预计 3 个 PR：
+---
 
-- **PR#1**：建立 `.upstream-sync/` 机制 + `upstream-guard.yml` CI
-- **PR#2**：执行 DEL 清单（bundled hub + 内置 agent + 脚本）
-- **PR#3**：执行 MOVE 清单（SecOps 内容搬到独立插件仓库，需先建立该仓库）
+## 十二、完整删除与搬迁清单（附录）
+
+> 本节列出**每一个具体的目录和文件**，可直接作为第 1 步执行脚本的输入。
+
+### 12.1 DEL — 整目录删除
+
+| # | 路径 | 类型 | 体积 | 说明 |
+|---|---|---|---|---|
+| 1 | `.flocks/flockshub/plugins/agents/pentest-ai-agents/` | 目录（37 子目录） | 860 KB | 社区渗透 subagent 集合 |
+| 2 | `.flocks/flockshub/plugins/skills/Anthropic-Cybersecurity-Skills/` | 目录（755 子目录） | 38 MB | 社区 Cybersecurity skill 集合 |
+| 3 | `flocks/agent/agents/hephaestus/` | 目录 | ~15 KB | 与 rex_junior 职责重叠 |
+| 4 | `flocks/agent/agents/metis/` | 目录 | ~12 KB | 预规划顾问，Rex 可直接承担 |
+| 5 | `flocks/agent/agents/momus/` | 目录 | ~13 KB | 计划评审，Rex 可直接承担 |
+| 6 | `flocks/tool/wecom/` | 目录 | ~40 KB | 第 2 步后将移出；第 1 步先 MOVE |
+| 7 | `flocks/channel/builtin/weixin/` | 目录（11 文件） | 100 KB | 个人微信渠道，主仓库不再维护 |
+| 8 | `flocks/channel/builtin/telegram/` | 目录（8 文件） | 72 KB | 海外渠道，不保留 |
+| 9 | `npm-wrapper/` | 目录（3 文件） | 12 KB | npx → uvx 转发壳，用户可直接装 uv |
+
+### 12.2 DEL — 单文件删除
+
+| # | 路径 | 说明 |
+|---|---|---|
+| 10 | `flocks/tool/agent/call_omo_agent.py` | 外部 OMO agent 调用，无业务依赖 |
+| 11 | `.github/workflows/sync-gitee.yml` | Gitee 同步 workflow（不继续同步 Gitee） |
+| 12 | `scripts/validate_flockshub.py` | bundled hub 删空后失效 |
+| 13 | `assets/flocks.webp` | 旧品牌 logo，第 2 步替换 |
+
+### 12.3 MOVE — 搬到 SecOps 插件仓库
+
+> 目标仓库：`by2060/smartclaw-secops`（第 1 步前需新建）
+
+#### 12.3.1 Bundled Hub（bundled 的 SecOps 插件）
+
+| # | 路径 |
+|---|---|
+| M01 | `.flocks/flockshub/plugins/skills/ndr-alert-analysis/` |
+| M02 | `.flocks/flockshub/plugins/tools/api/onesig_v2_5_3_D20250710/` |
+| M03 | `.flocks/flockshub/plugins/tools/api/sangfor_af_v8_0_48/` |
+| M04 | `.flocks/flockshub/plugins/tools/api/sangfor_af_v8_0_85/` |
+
+#### 12.3.2 插件 Agents（8 个，整块搬迁）
+
+| # | 路径 |
+|---|---|
+| M05 | `.flocks/plugins/agents/asset-survey/` |
+| M06 | `.flocks/plugins/agents/host-forensics/` |
+| M07 | `.flocks/plugins/agents/host-forensics-fast/` |
+| M08 | `.flocks/plugins/agents/hrti_threat_intelligence/` |
+| M09 | `.flocks/plugins/agents/ndr-analyst/` |
+| M10 | `.flocks/plugins/agents/phishing-detector/` |
+| M11 | `.flocks/plugins/agents/ti-analyst/` |
+| M12 | `.flocks/plugins/agents/vul_threat_intelligence/` |
+
+#### 12.3.3 插件 Skills（7 个，SecOps 专属）
+
+| # | 路径 |
+|---|---|
+| M13 | `.flocks/plugins/skills/ndr-alert-analysis/` |
+| M14 | `.flocks/plugins/skills/onesec-use/` |
+| M15 | `.flocks/plugins/skills/onesig-use/` |
+| M16 | `.flocks/plugins/skills/qingteng-use/` |
+| M17 | `.flocks/plugins/skills/skyeye-sensor-data-fetch/` |
+| M18 | `.flocks/plugins/skills/skyeye-use/` |
+| M19 | `.flocks/plugins/skills/tdp-use/` |
+
+#### 12.3.4 插件 Tools（19 个）
+
+**API 工具（16 个）**
+
+| # | 路径 |
+|---|---|
+| M20 | `.flocks/plugins/tools/api/fofa/` |
+| M21 | `.flocks/plugins/tools/api/greynoise/` |
+| M22 | `.flocks/plugins/tools/api/ngsoc_v4_15_1/` |
+| M23 | `.flocks/plugins/tools/api/ngtip_v5_1_5/` |
+| M24 | `.flocks/plugins/tools/api/onesec_v2_8_2/` |
+| M25 | `.flocks/plugins/tools/api/onesig_v2_5_3_D20260321/` |
+| M26 | `.flocks/plugins/tools/api/qingteng_v3_4_1_66/` |
+| M27 | `.flocks/plugins/tools/api/sangfor_af_v8_0_106/` |
+| M28 | `.flocks/plugins/tools/api/sangfor_sip_v92/` |
+| M29 | `.flocks/plugins/tools/api/sangfor_xdr_v2_2/` |
+| M30 | `.flocks/plugins/tools/api/skyeye_v4_0_14_0_SP2/` |
+| M31 | `.flocks/plugins/tools/api/tdp_v3_3_10/` |
+| M32 | `.flocks/plugins/tools/api/threatbook-cn/` |
+| M33 | `.flocks/plugins/tools/api/threatbook-io/` |
+| M34 | `.flocks/plugins/tools/api/urlscan/` |
+| M35 | `.flocks/plugins/tools/api/virustotal/` |
+
+**MCP 工具（3 个）**
+
+| # | 路径 |
+|---|---|
+| M36 | `.flocks/plugins/tools/mcp/nsfocus_mcp.yaml` |
+| M37 | `.flocks/plugins/tools/mcp/qianxin_mcp.yaml` |
+| M38 | `.flocks/plugins/tools/mcp/threatbook_mcp.yaml` |
+
+#### 12.3.5 Tasks / Workflows
+
+| # | 路径 |
+|---|---|
+| M39 | `.flocks/plugins/tasks/daily-intel.yaml` |
+| M40 | `.flocks/plugins/workflows/loop_host_forensics_fast/` |
+| M41 | `.flocks/plugins/workflows/tdp_alert_triage/` |
+
+### 12.4 SHRINK — 保留但精简
+
+| # | 路径 | 操作 |
+|---|---|---|
+| S01 | `.flocks/flockshub/index.json` | bundled hub 删减后重新生成 |
+| S02 | `.flocks/flockshub/taxonomy.json` | 同上 |
+| S03 | `.flocks/plugins/skills/onboarding/` | 文案强耦合品牌，第 2/3/4 步逐步重写 |
+| S04 | `.github/workflows/ci.yml` | 移除 `validate_flockshub.py` 步骤 |
+| S05 | `.github/workflows/docker-publish.yml` | 第 2 步改镜像名 |
+| S06 | `.github/workflows/windows-packaging.yml` | 第 2 步改 artifact 名 |
+| S07 | `.github/workflows/windows-packaging-publish.yml` | 同上 |
+| S08 | `.github/ISSUE_TEMPLATE/plugin_request.yml` | 去品牌化 |
+| S09 | `flocks/cli/commands/stats.py` | 可简化展示逻辑 |
+| S10 | 根目录 `install.sh` / `install.ps1` / `install_zh.sh` / `install_zh.ps1` | 第 2 步统一处理品牌 |
+| S11 | `scripts/install.sh` / `install.ps1` / `install_zh.sh` / `install_zh.ps1` | 同上 |
+| S12 | `packaging/windows/flocks-setup.iss` | 第 2 步改安装器名 |
+| S13 | `packaging/windows/uninstall-flocks-user-state.ps1` | 第 2 步改名 |
+| S14 | `packaging/windows/start-flocks-elevated.ps1` | 第 2 步改名 |
+| S15 | `packaging/windows/staging-layout.json` | 第 2 步改路径变量 |
+| S16 | `scripts/recover_raw_flocks_db.py` | 第 2 步改名 |
+| S17 | `assets/community-wecom-qr.png` | 二维码内容更换为 smartClaw 社区入口 |
+
+### 12.5 KEEP — 保留（通用核心）
+
+保留的核心内容概览，不需逐条列出：
+
+- **内置 Agents**：`rex`、`rex_junior`、`explore`、`plan`、`self_enhance`、`multimodal_looker`、`oracle`、`librarian` —— 第 3 步主 agent 改名为 `sentry`、`sentry_junior`
+- **代码工具** `flocks/tool/`：除 9.3.7 标注外，其余全部保留（约 35 个通用工具）
+- **IM 渠道**：`flocks/channel/` 框架代码 + `builtin/feishu`、`builtin/wecom`、`builtin/dingtalk`
+- **核心模块**：`server/`、`session/`、`provider/`、`mcp/`、`memory/`、`workflow/`、`task/`、`skill/`、`plugin/`、`browser/`、`acp/`、`auth/`、`config/` 等
+- **CLI 子命令**：`session`、`admin`、`skill`、`mcp`、`task`、`update`、`browser`、`acp`、`export`、`import`、`agent`、`debug`
+- **前端**：`webui/`、`tui/`
+- **打包**：`docker/`、`packaging/windows/`（内容精简）
+- **脚本**：`scripts/migrate_legacy_task_tables.py`、`run_legacy_task_migration.sh`、`dev.sh`、`container-start.sh`、`run-tests.py` 等
+
+### 12.6 执行顺序建议
+
+| 序号 | 动作 | 依赖 |
+|---|---|---|
+| Step 0 | 新建 `by2060/smartclaw-secops` 仓库（用于接收 MOVE 内容） | 无 |
+| Step 1 | 在当前仓库建立 `.upstream-sync/` 目录与 `upstream-guard.yml` CI | 无（可先做） |
+| Step 2 | 执行 MOVE（12.3）—— 将 SecOps 内容搬到 smartclaw-secops，本地 `git rm` | Step 0 |
+| Step 3 | 执行 DEL（12.1 + 12.2）—— 删除冗余目录和文件 | Step 1（保证 CI 守卫到位） |
+| Step 4 | 执行 SHRINK（12.4）—— 精简保留内容（可在第 2/3/4 步陆续完成） | 第 2 步改名时顺带 |
+
+---
+
+## 十三、接下来的动作
+
+确认无误即可开始执行 **Step 1（建立 `.upstream-sync/` + CI 守卫）**，这一步不依赖外部插件仓库的建立，可以立刻开工。
+
+**对应 PR 计划**：
+
+- **PR#1（立即可做）**：建立 `.upstream-sync/exclude-paths.txt` + `keep-ours.txt` + `sync.sh` + `upstream-guard.yml`
+- **PR#2**（需先建 smartclaw-secops 仓库）：执行 MOVE 清单（M01-M41）
+- **PR#3**：执行 DEL 清单（#1-#13）
+- **PR#4**：执行必要的 SHRINK（跟随第 2 步品牌改造一起做）
+
