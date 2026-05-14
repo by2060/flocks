@@ -1,0 +1,18 @@
+{
+  "recommendations": [
+    "eamodio.gitlens",
+    "mhutchie.git-graph",
+    "pomber.git-file-history",
+    "donjayamanne.githistory",
+    "ms-python.python",
+    "ms-python.vscode-pylance",
+    "charliermarsh.ruff",
+    "dbaeumer.vscode-eslint",
+    "esbenp.prettier-vscode",
+    "redhat.vscode-yaml",
+    "tamasfe.even-better-toml",
+    "yzhang.markdown-all-in-one",
+    "davidanson.vscode-markdownlint"
+  ],
+  "unwantedRecommendations": []
+}

@@ -1,0 +1,33 @@
+# ==============================================================================
+# 本地排除清单（sync-upstream.sh 使用）
+# ==============================================================================
+# 这里列出上游有但你本地不想要的文件 / 文件夹。
+# 每次 subtree pull 后，sync-upstream.sh 会自动删除这些路径。
+#
+# 语法：
+#   - 每行一个路径，相对于 flocks-0509/（PREFIX）
+#   - # 开头的行为注释，空行忽略
+#   - 目录可以以 / 结尾（可选，脚本会自动识别）
+#
+# 使用方式：
+#   1. 把此文件复制为 flocks-0509/.local-excludes
+#   2. 按需编辑，取消注释 / 增加条目
+#   3. 运行 ./scripts/sync-upstream.sh
+# ==============================================================================
+
+# ---- 示例：不需要的文档 ----
+# docs/
+
+# ---- 示例：Windows 打包相关 ----
+# packaging/windows/
+# packaging/windows/bootstrap-windows.ps1
+
+# ---- 示例：单个文件 ----
+# webui/public/channel-weixin.png
+
+# ---- 示例：整个模块 ----
+# flocks/browser/
+
+# ---- 示例：CI 配置 ----
+# .github/workflows/windows-packaging.yml
+# .github/workflows/windows-packaging-publish.yml

@@ -1,0 +1,45 @@
+{
+  "git.mergeEditor": true,
+  "git.autofetch": true,
+  "git.autofetchPeriod": 180,
+  "git.enableSmartCommit": true,
+  "git.confirmSync": false,
+  "diffEditor.ignoreTrimWhitespace": false,
+  "diffEditor.renderSideBySide": true,
+  "diffEditor.experimental.showMoves": true,
+  "editor.rulers": [100],
+  "editor.renderWhitespace": "boundary",
+  "files.insertFinalNewline": true,
+  "files.trimTrailingWhitespace": true,
+  "workbench.colorCustomizations": {
+    "merge.currentHeaderBackground": "#367366aa",
+    "merge.currentContentBackground": "#27403bbb",
+    "merge.incomingHeaderBackground": "#395f8faa",
+    "merge.incomingContentBackground": "#28384dbb",
+    "merge.commonHeaderBackground": "#383838cc",
+    "merge.commonContentBackground": "#2f2f2faa"
+  },
+  "search.exclude": {
+    "**/node_modules": true,
+    "**/.git": true,
+    "**/dist": true,
+    "**/build": true,
+    "**/__pycache__": true,
+    "**/*.lock": true,
+    "**/*.pyc": true,
+    "flocks-0509/webui/node_modules": true,
+    "flocks-0509/tui/node_modules": true,
+    "flocks-0509/.flocks/data": true
+  },
+  "files.watcherExclude": {
+    "**/.git/objects/**": true,
+    "**/node_modules/**": true,
+    "**/__pycache__/**": true,
+    "flocks-0509/webui/node_modules/**": true,
+    "flocks-0509/tui/node_modules/**": true
+  },
+  "python.analysis.extraPaths": ["./flocks-0509"],
+  "python.testing.pytestEnabled": true,
+  "python.testing.pytestArgs": ["flocks-0509/tests"],
+  "terminal.integrated.scrollback": 10000
+}

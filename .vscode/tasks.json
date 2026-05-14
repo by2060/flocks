@@ -1,0 +1,61 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Sync: Preview upstream (DRY RUN)",
+      "type": "shell",
+      "command": "DRY_RUN=1 ./scripts/sync-upstream.sh",
+      "problemMatcher": [],
+      "presentation": {
+        "echo": true,
+        "reveal": "always",
+        "focus": true,
+        "panel": "dedicated",
+        "clear": true
+      },
+      "detail": "只 fetch 上游并显示最近 5 个 commit"
+    },
+    {
+      "label": "Sync: Merge upstream (no push)",
+      "type": "shell",
+      "command": "./scripts/sync-upstream.sh --gui=vscode",
+      "problemMatcher": [],
+      "presentation": {
+        "echo": true,
+        "reveal": "always",
+        "focus": true,
+        "panel": "dedicated",
+        "clear": true
+      },
+      "detail": "拉取并合并，冲突时自动打开 VS Code"
+    },
+    {
+      "label": "Sync: Merge upstream + push to GitLab",
+      "type": "shell",
+      "command": "./scripts/sync-upstream.sh --push --gui=vscode",
+      "problemMatcher": [],
+      "presentation": {
+        "echo": true,
+        "reveal": "always",
+        "focus": true,
+        "panel": "dedicated",
+        "clear": true
+      },
+      "detail": "完整同步：合并 → 排除清单 → 推送 GitLab"
+    },
+    {
+      "label": "Sync: Merge upstream (NO_SQUASH mode)",
+      "type": "shell",
+      "command": "NO_SQUASH=1 ./scripts/sync-upstream.sh --gui=vscode",
+      "problemMatcher": [],
+      "presentation": {
+        "echo": true,
+        "reveal": "always",
+        "focus": true,
+        "panel": "dedicated",
+        "clear": true
+      },
+      "detail": "不压缩历史，更精确的 3-way merge"
+    }
+  ]
+}
