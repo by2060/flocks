@@ -761,6 +761,142 @@ jobs:
 
 
 
+---
+
+## 十八、v1.2 最终决策（TUI 删除 + WebUI 最小化改造）
+
+> **背景变化**：smartclaw 作为**后端 API 服务**被集成到你们自己的平台，最终用户使用的是你们自己的平台 UI，不会看到 smartclaw 的 WebUI / TUI。这两个内置前端**仅供研发团队调试**。
+
+基于这一定位，对 v1.1 的 `tui/` 去留决策和 `webui/` 改造范围重新评估并最终定案。
+
+### 18.1 最终决策
+
+| 编号 | 决策项 | 结果 | 替代之前的 |
+|---|---|---|---|
+| 4 | **TUI 去留** | **B：DEL（整目录删除）** | v1.1 十四章 14.6 节的 A/B 待决策 |
+| 5 | **WebUI 改造范围** | **SHRINK 最小化** | v1.1 十四章 14.7 节的全量品牌替换 |
+
+### 18.2 决策理由
+
+#### 18.2.1 为什么 TUI 选 DEL
+
+| 维度 | 判断 |
+|---|---|
+| **目标用户** | 用户用的是你们自己的平台，不会用 TUI |
+| **调试场景** | 研发调试 WebUI 已经完全够用（看 session、手动发消息、查 agent 响应、看工具调用），且富文本/代码/diff 体验更好 |
+| **维护成本** | 3.4 MB TS 代码 + 113 处 flocks 引用；同时维护两套前端的改名/翻译/跟上游成本是单套的 ~2 倍 |
+| **未来可逆** | 若后续确需终端界面，可从上游 `AgentFlocks/flocks` 重新移植，不会造成不可逆损失 |
+
+**结论**：TUI 对当前产品形态**没有真实价值**，留下只是在浪费后续每一步改造和维护的精力。
+
+#### 18.2.2 为什么 WebUI 选 SHRINK 最小化
+
+| 维度 | 判断 |
+|---|---|
+| **曝光面** | 仅研发调试用，最终用户看不到 |
+| **品牌一致性要求** | 低（内部工具） |
+| **工作量收益比** | 76 处 flocks 引用大部分是 import 路径 / i18n key 名，和"用户体验"无关；完整替换价值低 |
+| **调试可用性** | 只需页面标题、Header 不要显示 "Flocks" 字样造成视觉违和即可 |
+
+**最小化范围**（只改 3 处用户可见品牌字样）：
+
+| # | 位置 | 改动 |
+|---|---|---|
+| W1 | `webui/index.html` `<title>` | `Flocks - AI Native SecOps Platform` → `smartClaw - 调试控制台` |
+| W2 | `webui/src/components/layout/Layout.tsx` 顶部 Header | 品牌显示字样替换 |
+| W3 | `webui/public/favicon.svg` | 替换为 smartClaw logo（或用中性图标） |
+
+**不做的事**（属于 KEEP 范畴，不浪费精力）：
+
+- ❌ 76 处代码里 `flocks` import 路径的替换（第 2 步主 API 改名时已由 shim 兼容）
+- ❌ `webui/src/locales/*.json` 的 i18n 字典品牌字段更新（调试用语英文就行）
+- ❌ 24 个页面的文案品牌审核
+- ❌ 文档/注释里的 flocks 字样
+- ❌ WebUI 的中文化（i18n 切换语言时本来就能选中文，调试场景默认英文不影响）
+
+### 18.3 TUI 删除的具体动作清单
+
+| # | 动作 | 路径 |
+|---|---|---|
+| TUI-01 | 删除 `tui/` 整个目录（3.4 MB） | `tui/` |
+| TUI-02 | 从 CLI 入口删除 `tui` 子命令 | `flocks/cli/main.py` 中对 `tui` 的注册与 help |
+| TUI-03 | 删除 CLI 服务管理器中与 TUI 启动/停止相关的逻辑 | `flocks/cli/service_manager.py` |
+| TUI-04 | 删除 README / README_zh / AGENTS.md 中关于 TUI 的章节 | `README.md`、`README_zh.md`、`AGENTS.md` |
+| TUI-05 | 检查并删除 TUI 相关的测试 | `tests/` 下以 `tui_` 开头或 `test_tui_*` 的文件 |
+| TUI-06 | CI workflow 中如有 TUI 构建步骤，删除 | `.github/workflows/*.yml` |
+| TUI-07 | 安装脚本中如有 bun/TUI 安装逻辑，删除 | `scripts/install*.sh`、`scripts/install*.ps1` |
+| TUI-08 | Windows 打包清单中如有 TUI 组件，删除 | `packaging/windows/staging-layout.json` 等 |
+| TUI-09 | 将 `tui/` 写入 `.upstream-sync/exclude-paths.txt` 黑名单 | 防止上游同步回来 |
+| TUI-10 | `pyproject.toml` / `docker/Dockerfile` 中如有 TUI 相关依赖/构建步骤，删除 | 包括 `bun` 相关安装 |
+
+### 18.4 WebUI 最小化改造的具体动作清单
+
+| # | 动作 | 路径 |
+|---|---|---|
+| WEB-01 | 替换 `<title>` | `webui/index.html` |
+| WEB-02 | 替换顶部 Header 的品牌字样（logo 文案 + 可能的版权行） | `webui/src/components/layout/Layout.tsx` |
+| WEB-03 | 替换 favicon | `webui/public/favicon.svg` |
+| WEB-04 | **不在 SHRINK 范围**：保留所有 import 路径、i18n 字典、页面文案中的 flocks 字样；等上游同步时靠 shim 与 keep-ours 保护 | 多文件 |
+| WEB-05 | 删除对应已 DEL 的 IM 渠道的图标（v1.1 已列） | `webui/public/channel-weixin.png`、`channel-telegram.png` |
+| WEB-06 | `webui/src/locales/*/common.json` 只改 **页眉/应用名称** 字段，其它品牌字段不动 | 最多 2-4 行 JSON |
+
+### 18.5 上游同步保护更新
+
+新增 `.upstream-sync/exclude-paths.txt` 条目：
+
+```
+# === v1.2 决策：整体删除 TUI ===
+tui/
+```
+
+新增 `.upstream-sync/keep-ours.txt` 条目（仅保护 W1-W3 改动点）：
+
+```
+# === v1.2 决策：WebUI 最小化改造 ===
+webui/index.html
+webui/src/components/layout/Layout.tsx
+webui/public/favicon.svg
+```
+
+**注意**：v1.1 十六章 16.4 节曾计划保护整个 `webui/src/locales/` 和更多 WebUI 文件，v1.2 将这些改动点从 `keep-ours.txt` 中移除，允许上游对 WebUI 的其他改动自然合入（因为我们不维护 WebUI 的品牌一致性）。
+
+### 18.6 工作量重估
+
+| 阶段 | v1.1 计划工作量 | v1.2 调整后工作量 | 节省 |
+|---|---|---|---|
+| 第 1 步（删减） | +1 天（TUI 待决策） | -0.5 天（TUI 一刀切删除） | 1.5 天 |
+| 第 2 步（去 flocks 化） | 2 套前端的 import/品牌替换 | 仅 3 处 WebUI 品牌替换 | ~2 天 |
+| 第 3 步（Sentry 改名） | TUI 里也要改 Rex 引用 | 不涉及 | ~0.5 天 |
+| 第 4 步（中文化） | TUI 的命令/消息需翻译，WebUI i18n 需补齐 | 仅后端 prompt + CLI + description | ~2 天 |
+| **合计节省** | | | **~6 天** |
+
+### 18.7 更新后的删除/搬迁总量
+
+| 分类 | 数量 | 备注 |
+|---|---|---|
+| v1.0 原始清单 | DEL ~299 / MOVE ~42 | 不变 |
+| v1.1 新增 DEL | +2 图标 + 9 失效测试 | 不变 |
+| **v1.2 新增 DEL** | **+1 大目录 `tui/`（3.4 MB）** | **最终 TUI 删除** |
+| **v1.2 新增 SHRINK** | +3 处 WebUI 最小改造 | **最终 WebUI 改造范围** |
+| **合计** | **DEL ~311 项** / **MOVE ~42 项** / **节省约 44 MB + 6 人天** | |
+
+---
+
+## 十九、所有决策汇总（v1.2 终版）
+
+至此，所有待定决策均已确认。开工前的决策状态：
+
+| 编号 | 决策项 | 结果 | 定版于 |
+|---|---|---|---|
+| 1 | 产品定位 | 选项 C：通用核心 + SecOps 可选插件包 | v1.0 |
+| 2 | weixin / telegram IM 渠道 | DEL（直接删除） | v1.0 |
+| 3 | npm-wrapper | DEL | v1.0 |
+| 4 | TUI 去留 | **DEL** | **v1.2** |
+| 5 | WebUI 改造范围 | **SHRINK 最小化（只改 3 处品牌可见点）** | **v1.2** |
+
+**设计阶段结束**。
+
+下一步进入执行阶段 Step 1：建立 `.upstream-sync/` 机制 + `upstream-guard.yml` CI 守卫。
 
 ---
 
