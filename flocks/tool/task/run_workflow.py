@@ -20,6 +20,9 @@ from flocks.storage.storage import Storage
 from flocks.utils.log import Log
 from flocks.session.recorder import Recorder
 from flocks.workflow.execution_store import (
+    compact_history_for_storage,
+    compact_outputs_for_storage,
+    compact_step_for_storage,
     create_execution_record,
     normalize_execution_status,
     record_execution_result,
@@ -82,7 +85,7 @@ When to use:
 How to use:
 - Provide the workflow definition (dictionary, JSON string, or file path).
 - The workflow file path should be an absolute path. IMPORTANT: In JSON, file paths must be quoted strings (e.g. "workflow": "/path/to/workflow.json"). Unquoted paths will cause parse errors.
-- Optional: Provide input parameters, timeout settings, and whether to use LLM for logic node codegen.
+- Parameters: Provide input parameters, timeout settings. If inputs are not provided, ask user to provide them.
 
 Note:
 - This tool depends on an existing workflow file.
@@ -94,6 +97,32 @@ DESCRIPTION = _BASE_DESCRIPTION
 _DESCRIPTION_CACHE: Optional[str] = None
 _DESCRIPTION_CACHE_AT: float = 0.0
 _DESCRIPTION_CACHE_TTL: float = 60.0  # seconds
+
+
+def _create_nested_tool_context(ctx: ToolContext) -> ToolContext:
+    """Create an isolated child ToolContext for workflow node tools.
+
+    Workflow execution itself should surface workflow-level progress via
+    ``run_workflow`` metadata. Reusing the outer tool context inside workflow
+    nodes lets nested tools (notably ``task``) overwrite that metadata with
+    child-session progress, which makes the UI misclassify the outer workflow
+    card as a delegate/subagent card.
+
+    We therefore clone the context but intentionally omit the metadata
+    callback, while preserving permissions, event publishing, abort signal, and
+    sandbox/session identity.
+    """
+    return ToolContext(
+        session_id=ctx.session_id,
+        message_id=ctx.message_id,
+        agent=ctx.agent,
+        call_id=ctx.call_id,
+        extra=dict(ctx.extra),
+        abort_event=ctx.abort,
+        permission_callback=ctx._permission_callback,
+        metadata_callback=None,
+        event_publish_callback=ctx.event_publish_callback,
+    )
 
 
 async def _build_description() -> str:
@@ -330,7 +359,7 @@ async def run_workflow_tool(
     Returns:
         ToolResult with workflow execution results
     """
-    # Update tool description with available workflows on each call (like the skill tool)
+    # Update tool description with available workflows on each call (like the skill_load tool)
     tool = ToolRegistry.get("run_workflow")
     if tool:
         tool.info.description = await _build_description()
@@ -353,16 +382,39 @@ async def run_workflow_tool(
     workflow_source: Union[Dict[str, Any], Path]
     if isinstance(workflow, str):
         raw = workflow.strip()
-        # If it's a JSON string, try to parse it.
+        # Try to parse as JSON first (handles JSON-encoded dicts or strings).
+        parsed = None
         try:
-            workflow_source = json.loads(raw)
+            parsed = json.loads(raw)
         except json.JSONDecodeError:
+            pass
+
+        if isinstance(parsed, dict):
+            # Valid workflow JSON object.
+            workflow_source = parsed
+        elif isinstance(parsed, str):
+            # json.loads decoded a JSON-encoded string, e.g. the AI double-encoded the
+            # path: workflow='"/path/to/workflow.json"' → parsed='/path/to/workflow.json'.
+            # Use the decoded string (no surrounding quotes) as the file path.
+            p = Path(parsed).expanduser()
+            if p.exists() and p.is_file():
+                workflow_source = p
+            else:
+                return ToolResult(
+                    success=False,
+                    error=(
+                        f"Workflow file not found: {parsed!r}. "
+                        "Provide a valid workflow JSON file path or a workflow dict."
+                    )
+                )
+        elif parsed is None:
+            # json.loads raised JSONDecodeError — raw is not JSON.
+            # First try to resolve as a registered workflow ID, then fall back to file path.
             existing_workflow = read_workflow_from_fs(raw)
             if existing_workflow is not None:
                 workflow_source = existing_workflow["workflowJson"]
                 raw = existing_workflow["id"]
             else:
-            # Otherwise treat it as a file path.
                 p = Path(raw).expanduser()
                 if p.exists() and p.is_file():
                     workflow_source = p
@@ -374,6 +426,15 @@ async def run_workflow_tool(
                             "or a valid workflow JSON file path."
                         )
                     )
+        else:
+            # json.loads returned list / int / bool — not a valid workflow parameter.
+            return ToolResult(
+                success=False,
+                error=(
+                    f"Invalid workflow parameter: expected a workflow dict or a file path string, "
+                    f"got JSON-decoded {type(parsed).__name__} ({parsed!r})."
+                )
+            )
     elif isinstance(workflow, dict):
         workflow_source = workflow
     else:
@@ -382,12 +443,25 @@ async def run_workflow_tool(
             error=f"workflow must be a dictionary or string, got {type(workflow).__name__}"
         )
     
+    # Sanity-check dict workflows: must have at least a `start` field so we
+    # surface a clear error instead of a confusing Pydantic validation message.
+    if isinstance(workflow_source, dict) and "start" not in workflow_source:
+        return ToolResult(
+            success=False,
+            error=(
+                "Invalid workflow definition: the `start` field is required. "
+                "Make sure you pass the workflow JSON (with `start`, `nodes`, `edges`) "
+                "as the `workflow` parameter, not the execution inputs."
+            )
+        )
+
     # Request permission (workflow execution can run arbitrary code)
     if isinstance(workflow_source, dict):
         workflow_name = workflow_source.get("name", "unnamed workflow")
         # Use id if available, otherwise use name or generate a fallback
         workflow_id = workflow_source.get("id") or workflow_source.get("name") or "unknown"
     else:
+        # workflow_source is a Path object here; Path.name gives the filename.
         workflow_name = workflow_source.name
         workflow_id = str(workflow_source)
 
@@ -458,7 +532,7 @@ async def run_workflow_tool(
             step_dict = dict(step_result)
         else:
             step_dict = {"node_id": None, "outputs": {}, "error": str(step_result)}
-        tracked_history.append(step_dict)
+        tracked_history.append(compact_step_for_storage(step_dict))
         _update_execution_progress({
             "executionLog": list(tracked_history),
             "currentNodeId": step_dict.get("node_id"),
@@ -520,6 +594,7 @@ async def run_workflow_tool(
         })
         execution_started_at = time.time()
 
+        nested_tool_ctx = _create_nested_tool_context(ctx)
         call_kwargs: Dict[str, Any] = {
             "workflow": workflow_source,
             "inputs": workflow_inputs,
@@ -529,7 +604,7 @@ async def run_workflow_tool(
             ),
             "timeout_s": timeout_s,
             "trace": trace,
-            "tool_context": ctx,
+            "tool_context": nested_tool_ctx,
         }
 
         # Backward-compatibility: older runtimes may not accept `use_llm`.
@@ -605,11 +680,11 @@ async def run_workflow_tool(
                 )
             status_value, error_message = resolve_execution_outcome(outcome_result)  # type: ignore[arg-type]
             current_data.update({
-                "outputResults": result_dict.get("outputs"),
+                "outputResults": compact_outputs_for_storage(result_dict.get("outputs")),
                 "status": status_value,
                 "finishedAt": int(time.time() * 1000),
                 "duration": time.time() - execution_started_at,
-                "executionLog": result_dict.get("history") or list(tracked_history),
+                "executionLog": compact_history_for_storage(result_dict.get("history")) or list(tracked_history),
                 "errorMessage": error_message,
                 "currentNodeId": result_dict.get("last_node_id"),
                 "currentPhase": status_value,
@@ -633,6 +708,9 @@ async def run_workflow_tool(
                 },
             })
 
+        compacted_outputs = compact_outputs_for_storage(result_dict.get("outputs"))
+        compacted_history = compact_history_for_storage(result_dict.get("history"))
+
         # If workflow failed, include error in ToolResult
         if not success and error:
             return ToolResult(
@@ -647,8 +725,8 @@ async def run_workflow_tool(
                     "steps": result_dict.get("steps", 0),
                     "run_id": result_dict.get("run_id"),
                     "last_node_id": result_dict.get("last_node_id"),
-                    "outputs": result_dict.get("outputs", {}),
-                    "history": result_dict.get("history", []),
+                    "outputs": compacted_outputs,
+                    "history": compacted_history,
                 }
             )
         
@@ -663,8 +741,8 @@ async def run_workflow_tool(
                 "steps": result_dict.get("steps", 0),
                 "run_id": result_dict.get("run_id"),
                 "last_node_id": result_dict.get("last_node_id"),
-                "outputs": result_dict.get("outputs", {}),
-                "history": result_dict.get("history", []),
+                "outputs": compacted_outputs,
+                "history": compacted_history,
             }
         )
         
@@ -680,7 +758,7 @@ async def run_workflow_tool(
                 "status": "error",
                 "finishedAt": int(time.time() * 1000),
                 "errorMessage": error_msg,
-                "executionLog": list(tracked_history),
+                "executionLog": compact_history_for_storage(list(tracked_history)),
                 "currentPhase": "error",
                 "currentStepIndex": len(tracked_history),
             })

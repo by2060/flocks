@@ -145,6 +145,33 @@ export interface WorkflowService {
   status: 'publishing' | 'running' | 'stopped' | 'error';
   publishedAt: number;
   containerName?: string;
+  driver?: 'local' | 'docker';
+}
+
+export type WorkflowServiceDriver = 'local' | 'docker';
+
+/** Saved syslog listener config (per workflow). */
+export interface SyslogConfig {
+  workflowId?: string;
+  enabled?: boolean;
+  protocol?: string;
+  host?: string;
+  port?: number;
+  format?: string;
+  inputKey?: string;
+  updatedAt?: number;
+}
+
+/** Runtime state of the syslog listener (independent from saved config). */
+export interface SyslogListenerStatus {
+  state: 'binding' | 'listening' | 'failed' | 'stopped';
+  error?: string | null;
+  host?: string;
+  port?: number;
+  protocol?: string;
+  queueSize?: number;
+  queueCapacity?: number;
+  workerCount?: number;
 }
 
 export const workflowAPI = {
@@ -209,8 +236,8 @@ export const workflowAPI = {
   export: (id: string) =>
     client.get<WorkflowJSON>(`/api/workflow/${id}/export`),
 
-  publish: (id: string) =>
-    client.post<WorkflowService>(`/api/workflow/${id}/publish`, undefined, { timeout: 300000 }),
+  publish: (id: string, data?: { driver?: WorkflowServiceDriver }) =>
+    client.post<WorkflowService>(`/api/workflow/${id}/publish`, data, { timeout: 300000 }),
 
   unpublish: (id: string) =>
     client.post<{ ok: boolean }>(`/api/workflow/${id}/unpublish`),
@@ -238,6 +265,25 @@ export const workflowAPI = {
       outputBroker?: string;
       outputTopic?: string;
     } | null>(`/api/workflow/${id}/kafka-config`),
+
+  saveSyslogConfig: (id: string, config: {
+    enabled?: boolean;
+    protocol?: string;
+    host?: string;
+    port?: number;
+    format?: string;
+    inputKey?: string;
+  }) =>
+    client.post<{ ok: boolean; listener?: SyslogListenerStatus }>(
+      `/api/workflow/${id}/syslog-config`,
+      config,
+    ),
+
+  getSyslogConfig: (id: string) =>
+    client.get<SyslogConfig | null>(`/api/workflow/${id}/syslog-config`),
+
+  getSyslogStatus: (id: string) =>
+    client.get<SyslogListenerStatus>(`/api/workflow/${id}/syslog-status`),
 
   runNode: (id: string, data: { nodeId: string; inputs?: Record<string, any> }) =>
     client.post<WorkflowNodeExecution>(`/api/workflow/${id}/run-node`, { node_id: data.nodeId, inputs: data.inputs ?? {} }),

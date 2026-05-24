@@ -8,13 +8,12 @@ delegatable: false
 # Explicit tool allowlist for the focused executor.
 tools:
   - read
-  - list
   - glob
   - grep
   - edit
   - write
   - bash
-  - skill
+  - skill_load
   - delegate_task
   - task
   - todoread

@@ -28,6 +28,24 @@ def get_all_enabled_tool_names() -> List[str]:
     ]
 
 
+def get_all_enabled_builtin_tool_names() -> List[str]:
+    """Return enabled built-in tool names, excluding plugins and dynamic tools."""
+    from flocks.tool.registry import ToolRegistry
+
+    ToolRegistry.init()
+    builtin_tool_names: List[str] = []
+    for tool in ToolRegistry.list_tools():
+        if tool.name in {"invalid", "_noop"} or not getattr(tool, "enabled", True):
+            continue
+        if not getattr(tool, "native", False):
+            continue
+        source = getattr(tool, "source", None)
+        if source not in {None, "builtin"}:
+            continue
+        builtin_tool_names.append(tool.name)
+    return builtin_tool_names
+
+
 def normalize_declared_tool_names(
     tool_names: Iterable[str],
     available_tool_names: Optional[Iterable[str]] = None,
@@ -47,7 +65,11 @@ def normalize_declared_tool_names(
             matches = [raw_name] if raw_name in available else []
 
         if not matches:
-            log.warn("agent.toolset.tool_missing", {"tool": raw_name})
+            # Built-in agent definitions (librarian, metis, …) declare optional
+            # tools such as ``lsp_*`` / ``ast_grep_search`` that ship in separate
+            # binaries; they are gracefully skipped when not installed.  Treat
+            # this as informational only to avoid flooding operational logs.
+            log.debug("agent.toolset.tool_missing", {"tool": raw_name})
             continue
 
         for match in matches:
@@ -78,10 +100,13 @@ def expand_legacy_permission_to_tool_names(
 def resolve_agent_initial_tools(
     raw_tools: Optional[List[str]],
     legacy_permission_config: Any,
+    agent_name: Optional[str] = None,
     available_tool_names: Optional[Iterable[str]] = None,
 ) -> Tuple[List[str], Any]:
     available = list(available_tool_names or get_all_enabled_tool_names())
     if raw_tools is not None:
+        if agent_name == "rex" and not raw_tools:
+            return get_all_enabled_builtin_tool_names(), []
         return normalize_declared_tool_names(raw_tools, available), []
     if isinstance(legacy_permission_config, dict):
         return expand_legacy_permission_to_tool_names(legacy_permission_config, available)

@@ -6,7 +6,9 @@ prompt.md or marks agents for dynamic prompt injection via prompt_builder.py.
 Resolves each agent to a concrete ``tools`` list. If legacy ``permission`` is
 present, it is expanded against the current tool registry for compatibility.
 If neither ``tools`` nor ``permission`` is declared, the static tool list stays
-empty and runtime exposure falls back to always-load tools only.
+empty and runtime exposure falls back to always-load tools only. ``rex`` is the
+special case: an explicitly empty ``tools: []`` expands to all enabled built-in
+tools so the primary orchestrator keeps broad native capabilities by default.
 
 Extension point:
   Built-in agents:         flocks/agent/agents/<name>/          native=True
@@ -85,6 +87,8 @@ def load_agent(agent_dir: Path, native: bool = False) -> Optional[AgentInfo]:
     Permission is generated from the ``tools`` list in agent.yaml.
     If ``tools`` is absent, the agent keeps an empty static tool list and only
     runtime always-load tools remain available until the session expands them.
+    ``rex`` is the exception: an explicit ``tools: []`` expands to all enabled
+    built-in tools.
 
     Args:
         agent_dir: Path to the agent folder.
@@ -106,64 +110,84 @@ def load_agent(agent_dir: Path, native: bool = False) -> Optional[AgentInfo]:
         })
         return None
 
+    if not isinstance(raw, dict):
+        log.warn("agent.factory.yaml_invalid", {
+            "path": str(yaml_path),
+            "hint": "Expected a YAML mapping",
+        })
+        return None
+
     name = raw.get("name") or agent_dir.name
     if not name:
         log.warn("agent.factory.missing_name", {"path": str(yaml_path)})
         return None
 
-    # ── Prompt resolution ──────────────────────────────────────────────────
-    prompt: Optional[str] = None
-    prompt_builder: Optional[str] = None
+    try:
+        # ── Prompt resolution ──────────────────────────────────────────────
+        prompt: Optional[str] = None
+        prompt_builder: Optional[str] = None
 
-    prompt_md = agent_dir / "prompt.md"
-    prompt_builder_py = agent_dir / "prompt_builder.py"
+        prompt_md = agent_dir / "prompt.md"
+        prompt_builder_py = agent_dir / "prompt_builder.py"
 
-    if prompt_md.is_file():
-        prompt = prompt_md.read_text(encoding="utf-8").strip()
-    elif prompt_builder_py.is_file():
-        # Derive Python module path from file location, relative to flocks package root
-        try:
-            rel = prompt_builder_py.relative_to(Path(__file__).parent.parent.parent)
-            module_path = str(rel.with_suffix("")).replace("/", ".").replace("\\", ".")
-        except ValueError:
-            # Fallback: use absolute path notation
-            module_path = str(prompt_builder_py)
-        prompt_builder = f"{module_path}:inject"
+        if prompt_md.is_file():
+            prompt = prompt_md.read_text(encoding="utf-8").strip()
+        elif prompt_builder_py.is_file():
+            # Derive Python module path from file location, relative to flocks package root
+            try:
+                rel = prompt_builder_py.relative_to(Path(__file__).parent.parent.parent)
+                module_path = str(rel.with_suffix("")).replace("/", ".").replace("\\", ".")
+            except ValueError:
+                # Fallback: use absolute path notation
+                module_path = str(prompt_builder_py)
+            prompt_builder = f"{module_path}:inject"
 
-    # ── Tools / legacy permission compatibility ─────────────────────────────
-    tools_list_raw: Optional[List[str]] = raw.get("tools")
-    perm_raw = raw.get("permission")
-    tools_list, legacy_permission = resolve_agent_initial_tools(tools_list_raw, perm_raw)
+        # ── Tools / legacy permission compatibility ─────────────────────────
+        tools_list_raw: Optional[List[str]] = raw.get("tools")
+        perm_raw = raw.get("permission")
+        tools_list, legacy_permission = resolve_agent_initial_tools(
+            tools_list_raw,
+            perm_raw,
+            agent_name=name,
+        )
 
-    # ── Model ────────────────────────────────────────────────────────────────
-    model_raw = raw.get("model")
-    model = AgentModel(**model_raw) if isinstance(model_raw, dict) else None
+        # ── Model ───────────────────────────────────────────────────────────
+        model_raw = raw.get("model")
+        model = AgentModel(**model_raw) if isinstance(model_raw, dict) else None
 
-    desc_cn = raw.get("description_cn")
-    if desc_cn is None and isinstance(raw.get("descriptionCn"), str):
-        desc_cn = raw.get("descriptionCn")
+        desc_cn = raw.get("description_cn")
+        if desc_cn is None and isinstance(raw.get("descriptionCn"), str):
+            desc_cn = raw.get("descriptionCn")
 
-    return AgentInfo(
-        name=name,
-        description=raw.get("description"),
-        description_cn=desc_cn,
-        mode=raw.get("mode", "subagent"),
-        native=native,
-        hidden=raw.get("hidden", False),
-        color=raw.get("color"),
-        permission=legacy_permission,
-        model=model,
-        prompt=prompt,
-        prompt_builder=prompt_builder,
-        tools=tools_list,
-        options=raw.get("options", {}),
-        steps=raw.get("steps"),
-        delegatable=raw.get("delegatable"),
-        temperature=raw.get("temperature"),
-        top_p=raw.get("top_p"),
-        prompt_metadata=_parse_prompt_metadata(raw),
-        tags=raw.get("tags", []),
-    )
+        return AgentInfo(
+            name=name,
+            description=raw.get("description"),
+            description_cn=desc_cn,
+            mode=raw.get("mode", "subagent"),
+            native=native,
+            hidden=raw.get("hidden", False),
+            color=raw.get("color"),
+            permission=legacy_permission,
+            model=model,
+            prompt=prompt,
+            prompt_builder=prompt_builder,
+            tools=tools_list,
+            options=raw.get("options", {}),
+            steps=raw.get("steps"),
+            delegatable=raw.get("delegatable"),
+            temperature=raw.get("temperature"),
+            top_p=raw.get("top_p"),
+            prompt_metadata=_parse_prompt_metadata(raw),
+            tags=raw.get("tags", []),
+        )
+    except Exception as e:
+        log.error("agent.factory.load_failed", {
+            "name": name,
+            "path": str(yaml_path),
+            "error": str(e),
+            "type": type(e).__name__,
+        })
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -342,7 +366,11 @@ def yaml_to_agent_info(raw: dict, yaml_path: Path) -> AgentInfo:
     # Tools: prefer new tools list; fall back to old permission dict
     tools_list_raw: Optional[List[str]] = raw.get("tools")
     perm_raw = raw.get("permission")
-    tools_list, legacy_permission = resolve_agent_initial_tools(tools_list_raw, perm_raw)
+    tools_list, legacy_permission = resolve_agent_initial_tools(
+        tools_list_raw,
+        perm_raw,
+        agent_name=name,
+    )
 
     desc_cn = raw.get("description_cn")
     if desc_cn is None and isinstance(raw.get("descriptionCn"), str):

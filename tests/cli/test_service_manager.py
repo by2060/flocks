@@ -344,6 +344,23 @@ def test_parse_windows_netstat_output_extracts_unique_pids() -> None:
     assert service_manager._parse_windows_netstat_output(output) == [1234, 5678]
 
 
+def test_port_owner_pids_warns_when_no_tool_found(monkeypatch) -> None:
+    monkeypatch.setattr(service_manager.sys, "platform", "linux")
+    monkeypatch.setattr(service_manager, "which", lambda _name: None)
+
+    with pytest.warns(RuntimeWarning, match="apt/yum install lsof -y"):
+        assert service_manager.port_owner_pids(5173) == []
+
+
+def test_port_is_in_use_falls_back_to_bind_when_pid_lookup_unavailable(monkeypatch) -> None:
+    monkeypatch.setattr(service_manager.sys, "platform", "linux")
+    monkeypatch.setattr(service_manager, "which", lambda _name: None)
+    monkeypatch.setattr(service_manager, "_bind_port_available", lambda _port: False)
+
+    with pytest.warns(RuntimeWarning, match="退回到 bind 检查"):
+        assert service_manager.port_is_in_use(5173) is True
+
+
 def test_wait_for_http_rejects_unreachable_responses(monkeypatch) -> None:
     responses = iter([
         httpx.Response(503, json={"detail": "not found"}),
@@ -693,6 +710,7 @@ def test_start_all_stops_services_before_starting(monkeypatch) -> None:
     monkeypatch.setattr(service_manager, "ensure_runtime_dirs", lambda: (call_order.append("ensure_runtime_dirs"), paths)[1])
     monkeypatch.setattr(service_manager, "service_lock", lambda _paths: _record_call(call_order, "service_lock"))
     monkeypatch.setattr(service_manager, "stop_one", lambda port, _pid_file, _name, _console: call_order.append(f"stop_one:{port}"))
+    monkeypatch.setattr(service_manager, "stop_all_browser_daemons", lambda: call_order.append("stop_browser") or [])
     monkeypatch.setattr(service_manager, "_start_all_without_stop", lambda _config, _console: call_order.append("_start_all_without_stop"))
 
     service_manager.start_all(service_manager.ServiceConfig(), console=None)
@@ -702,6 +720,7 @@ def test_start_all_stops_services_before_starting(monkeypatch) -> None:
         "service_lock",
         "stop_one:5173",
         "stop_one:8000",
+        "stop_browser",
         "_start_all_without_stop",
     ]
 
@@ -721,6 +740,7 @@ def test_restart_all_stops_then_starts_under_lock(monkeypatch) -> None:
     monkeypatch.setattr(service_manager, "ensure_runtime_dirs", lambda: (call_order.append("ensure_runtime_dirs"), paths)[1])
     monkeypatch.setattr(service_manager, "service_lock", lambda _paths: _record_call(call_order, "service_lock"))
     monkeypatch.setattr(service_manager, "stop_one", lambda port, _pid_file, _name, _console: call_order.append(f"stop_one:{port}"))
+    monkeypatch.setattr(service_manager, "stop_all_browser_daemons", lambda: call_order.append("stop_browser") or [])
     monkeypatch.setattr(service_manager, "_start_all_without_stop", lambda _config, _console: call_order.append("_start_all_without_stop"))
 
     service_manager.restart_all(service_manager.ServiceConfig(), console=None)
@@ -730,6 +750,7 @@ def test_restart_all_stops_then_starts_under_lock(monkeypatch) -> None:
         "service_lock",
         "stop_one:5173",
         "stop_one:8000",
+        "stop_browser",
         "_start_all_without_stop",
     ]
 
@@ -1179,6 +1200,29 @@ def test_start_backend_raises_on_port_record_mismatch(monkeypatch, tmp_path: Pat
         service_manager.start_backend(service_manager.ServiceConfig(), DummyConsole())
 
 
+def test_start_backend_raises_when_port_in_use_without_pid_lookup(monkeypatch, tmp_path: Path) -> None:
+    paths = service_manager.RuntimePaths(
+        root=tmp_path,
+        run_dir=tmp_path / "run",
+        log_dir=tmp_path / "logs",
+        backend_pid=tmp_path / "run" / "backend.pid",
+        frontend_pid=tmp_path / "run" / "webui.pid",
+        backend_log=tmp_path / "logs" / "backend.log",
+        frontend_log=tmp_path / "logs" / "webui.log",
+    )
+    paths.run_dir.mkdir(parents=True)
+    paths.log_dir.mkdir(parents=True)
+
+    monkeypatch.setattr(service_manager, "ensure_install_layout", lambda: tmp_path)
+    monkeypatch.setattr(service_manager, "ensure_runtime_dirs", lambda: paths)
+    monkeypatch.setattr(service_manager, "cleanup_stale_pid_file", lambda _path: None)
+    monkeypatch.setattr(service_manager, "port_owner_pids", lambda _port: [])
+    monkeypatch.setattr(service_manager, "port_is_in_use", lambda _port, listeners=None: True)
+
+    with pytest.raises(service_manager.ServiceError, match="无法识别占用 PID"):
+        service_manager.start_backend(service_manager.ServiceConfig(), DummyConsole())
+
+
 def test_spawn_process_uses_hidden_window_flags_on_windows(monkeypatch, tmp_path: Path) -> None:
     captured = {}
     log_path = tmp_path / "logs" / "backend.log"
@@ -1471,6 +1515,7 @@ def test_stop_all_reads_port_from_runtime_record(monkeypatch, tmp_path: Path) ->
 
     monkeypatch.setattr(service_manager, "ensure_runtime_dirs", lambda: paths)
     monkeypatch.setattr(service_manager, "service_lock", lambda _paths: _record_call([], "service_lock"))
+    monkeypatch.setattr(service_manager, "stop_all_browser_daemons", lambda: [])
     monkeypatch.setattr(
         service_manager,
         "stop_one",
@@ -1500,6 +1545,7 @@ def test_stop_all_falls_back_to_default_port_when_record_missing(monkeypatch, tm
 
     monkeypatch.setattr(service_manager, "ensure_runtime_dirs", lambda: paths)
     monkeypatch.setattr(service_manager, "service_lock", lambda _paths: _record_call([], "service_lock"))
+    monkeypatch.setattr(service_manager, "stop_all_browser_daemons", lambda: [])
     monkeypatch.setattr(service_manager, "stop_one", lambda port, *_args: calls.append(port))
 
     service_manager.stop_all(console=None)
@@ -1524,11 +1570,52 @@ def test_stop_all_falls_back_to_default_port_when_record_has_no_port(monkeypatch
 
     monkeypatch.setattr(service_manager, "ensure_runtime_dirs", lambda: paths)
     monkeypatch.setattr(service_manager, "service_lock", lambda _paths: _record_call([], "service_lock"))
+    monkeypatch.setattr(service_manager, "stop_all_browser_daemons", lambda: [])
     monkeypatch.setattr(service_manager, "stop_one", lambda port, *_args: calls.append(port))
 
     service_manager.stop_all(console=None)
 
     assert calls == [5173, 8000]
+
+
+def test_stop_all_also_cleans_browser_daemons(monkeypatch, tmp_path: Path) -> None:
+    paths = service_manager.RuntimePaths(
+        root=tmp_path,
+        run_dir=tmp_path / "run",
+        log_dir=tmp_path / "logs",
+        backend_pid=tmp_path / "run" / "backend.pid",
+        frontend_pid=tmp_path / "run" / "webui.pid",
+        backend_log=tmp_path / "logs" / "backend.log",
+        frontend_log=tmp_path / "logs" / "webui.log",
+    )
+    paths.run_dir.mkdir(parents=True)
+    calls: list[str] = []
+
+    monkeypatch.setattr(service_manager, "ensure_runtime_dirs", lambda: paths)
+    monkeypatch.setattr(service_manager, "service_lock", lambda _paths: _record_call([], "service_lock"))
+    monkeypatch.setattr(
+        service_manager,
+        "stop_one",
+        lambda _port, _pid_file, name, _console: calls.append(name),
+    )
+    monkeypatch.setattr(
+        service_manager,
+        "stop_all_browser_daemons",
+        lambda: calls.append("browser") or ["default", "remote"],
+    )
+
+    class FakeConsole:
+        def __init__(self) -> None:
+            self.messages = []
+
+        def print(self, message) -> None:
+            self.messages.append(message)
+
+    console = FakeConsole()
+    service_manager.stop_all(console=console)
+
+    assert calls == ["WebUI", "后端", "browser"]
+    assert console.messages == []
 
 
 def test_build_status_lines_reads_port_from_runtime_record(monkeypatch, tmp_path: Path) -> None:
@@ -1585,6 +1672,33 @@ def test_build_status_lines_uses_recorded_host(monkeypatch, tmp_path: Path) -> N
 
     assert "http://10.0.0.8:9000" in lines[0]
     assert "http://127.0.0.1:5174" in lines[1]
+
+
+def test_build_status_lines_uses_unknown_pid_when_bind_fallback_detects_listener(
+    monkeypatch, tmp_path: Path
+) -> None:
+    paths = service_manager.RuntimePaths(
+        root=tmp_path,
+        run_dir=tmp_path / "run",
+        log_dir=tmp_path / "logs",
+        backend_pid=tmp_path / "run" / "backend.pid",
+        frontend_pid=tmp_path / "run" / "webui.pid",
+        backend_log=tmp_path / "logs" / "backend.log",
+        frontend_log=tmp_path / "logs" / "webui.log",
+    )
+    paths.run_dir.mkdir(parents=True)
+    paths.log_dir.mkdir(parents=True)
+
+    monkeypatch.setattr(service_manager, "cleanup_stale_pid_file", lambda _path: None)
+    monkeypatch.setattr(service_manager, "port_owner_pids", lambda _port: [])
+    monkeypatch.setattr(service_manager, "port_is_in_use", lambda _port, listeners=None: True)
+    monkeypatch.setattr(service_manager, "pid_is_running", lambda _pid: False)
+    monkeypatch.setattr(service_manager, "process_group_is_running", lambda _pgid: False)
+
+    lines = service_manager.build_status_lines(paths)
+
+    assert "PID=unknown" in lines[0]
+    assert "PID=unknown" in lines[1]
 
 
 def test_service_lock_prevents_concurrent_operations(monkeypatch, tmp_path: Path) -> None:

@@ -3,7 +3,6 @@ import { BashTool } from "./bash"
 import { EditTool } from "./edit"
 import { GlobTool } from "./glob"
 import { GrepTool } from "./grep"
-import { BatchTool } from "./batch"
 import { ReadTool } from "./read"
 import { TaskTool } from "./task"
 import { TodoWriteTool, TodoReadTool } from "./todo"
@@ -20,7 +19,6 @@ import { type ToolDefinition } from "@flocks-ai/plugin"
 import z from "zod"
 import { Plugin } from "../plugin"
 import { WebSearchTool } from "./websearch"
-import { CodeSearchTool } from "./codesearch"
 import { Flag } from "@/flag/flag"
 import { Log } from "@/util/log"
 import { LspTool } from "./lsp"
@@ -107,11 +105,9 @@ export namespace ToolRegistry {
       TodoWriteTool,
       TodoReadTool,
       WebSearchTool,
-      CodeSearchTool,
       SkillTool,
       ApplyPatchTool,
       ...(Flag.FLOCKS_EXPERIMENTAL_LSP_TOOL ? [LspTool] : []),
-      ...(config.experimental?.batch_tool === true ? [BatchTool] : []),
       ...(Flag.FLOCKS_EXPERIMENTAL_PLAN_MODE && Flag.FLOCKS_CLIENT === "cli" ? [PlanExitTool, PlanEnterTool] : []),
       ...custom,
     ]
@@ -132,8 +128,8 @@ export namespace ToolRegistry {
     const result = await Promise.all(
       tools
         .filter((t) => {
-          // Enable websearch/codesearch for zen users OR via enable flag
-          if (t.id === "codesearch" || t.id === "websearch") {
+          // Enable websearch for zen users OR via enable flag
+          if (t.id === "websearch") {
             return model.providerID === "opencode" || Flag.FLOCKS_ENABLE_EXA
           }
 

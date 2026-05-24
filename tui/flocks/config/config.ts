@@ -160,7 +160,7 @@ export namespace Config {
       const perms: Record<string, Config.PermissionAction> = {}
       for (const [tool, enabled] of Object.entries(result.tools)) {
         const action: Config.PermissionAction = enabled ? "allow" : "deny"
-        if (tool === "write" || tool === "edit" || tool === "patch" || tool === "multiedit") {
+        if (tool === "write" || tool === "edit" || tool === "patch") {
           perms.edit = action
           continue
         }
@@ -521,7 +521,6 @@ export namespace Config {
           edit: PermissionRule.optional(),
           glob: PermissionRule.optional(),
           grep: PermissionRule.optional(),
-          list: PermissionRule.optional(),
           bash: PermissionRule.optional(),
           task: PermissionRule.optional(),
           external_directory: PermissionRule.optional(),
@@ -530,7 +529,6 @@ export namespace Config {
           question: PermissionAction.optional(),
           webfetch: PermissionAction.optional(),
           websearch: PermissionAction.optional(),
-          codesearch: PermissionAction.optional(),
           lsp: PermissionRule.optional(),
           doom_loop: PermissionAction.optional(),
         })
@@ -611,8 +609,8 @@ export namespace Config {
       const permission: Permission = {}
       for (const [tool, enabled] of Object.entries(agent.tools ?? {})) {
         const action = enabled ? "allow" : "deny"
-        // write, edit, patch, multiedit all map to edit permission
-        if (tool === "write" || tool === "edit" || tool === "patch" || tool === "multiedit") {
+        // write, edit, patch all map to edit permission
+        if (tool === "write" || tool === "edit" || tool === "patch") {
           permission.edit = action
         } else {
           permission[tool] = action
@@ -1063,7 +1061,6 @@ export namespace Config {
             .optional(),
           chatMaxRetries: z.number().optional().describe("Number of retries for chat completions on failure"),
           disable_paste_summary: z.boolean().optional(),
-          batch_tool: z.boolean().optional().describe("Enable the batch tool"),
           openTelemetry: z
             .boolean()
             .optional()

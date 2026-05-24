@@ -226,6 +226,34 @@ class TestReasoningAccumulation:
         assert part.text == "Let me think about this"
 
     @pytest.mark.asyncio
+    async def test_reasoning_delta_accumulates_reasoning_content_metadata(self):
+        proc = _make_processor()
+        first_chunk = {
+            "reasoningContent": "Need ",
+            "reasoningSource": "reasoning_content",
+            "reasoningField": "reasoning_content",
+        }
+        second_chunk = {
+            "reasoningContent": "to think",
+            "reasoningSource": "reasoning_content",
+            "reasoningField": "reasoning_content",
+        }
+
+        await proc.process_event(ReasoningStartEvent(id="r2-meta", metadata=first_chunk))
+        await proc.process_event(
+            ReasoningDeltaEvent(id="r2-meta", text="Need ", metadata=first_chunk)
+        )
+        await proc.process_event(
+            ReasoningDeltaEvent(id="r2-meta", text="to think", metadata=second_chunk)
+        )
+
+        part = proc.reasoning_parts["r2-meta"]
+        assert part.text == "Need to think"
+        assert part.metadata["reasoningContent"] == "Need to think"
+        assert part.metadata["reasoningSource"] == "reasoning_content"
+        assert part.metadata["reasoningField"] == "reasoning_content"
+
+    @pytest.mark.asyncio
     async def test_reasoning_delta_callback_called(self):
         callback = AsyncMock()
         proc = _make_processor(reasoning_callback=callback)
@@ -241,6 +269,35 @@ class TestReasoningAccumulation:
             await proc.process_event(ReasoningDeltaEvent(id="r4", text="done"))
             await proc.process_event(ReasoningEndEvent(id="r4"))
         assert "r4" not in proc.reasoning_parts
+
+    @pytest.mark.asyncio
+    async def test_reasoning_end_keeps_accumulated_reasoning_content_metadata(self):
+        proc = _make_processor()
+        first_chunk = {
+            "reasoningContent": "Need ",
+            "reasoningSource": "reasoning_content",
+            "reasoningField": "reasoning_content",
+        }
+        second_chunk = {
+            "reasoningContent": "to think",
+            "reasoningSource": "reasoning_content",
+            "reasoningField": "reasoning_content",
+        }
+
+        with patch("flocks.session.streaming.stream_processor.Message.store_part", new=AsyncMock()) as mock_store:
+            await proc.process_event(ReasoningStartEvent(id="r4-meta", metadata=first_chunk))
+            await proc.process_event(
+                ReasoningDeltaEvent(id="r4-meta", text="Need ", metadata=first_chunk)
+            )
+            await proc.process_event(
+                ReasoningDeltaEvent(id="r4-meta", text="to think", metadata=second_chunk)
+            )
+            await proc.process_event(ReasoningEndEvent(id="r4-meta", metadata=second_chunk))
+
+        stored_part = mock_store.call_args.args[2]
+        assert stored_part.text == "Need to think"
+        assert stored_part.metadata["reasoningContent"] == "Need to think"
+        assert stored_part.metadata["reasoningSource"] == "reasoning_content"
 
     @pytest.mark.asyncio
     async def test_reasoning_delta_unknown_id_ignored(self):
@@ -322,6 +379,32 @@ class TestToolCallExecution:
             )
 
         assert "tc_exec" in proc.tool_calls
+
+    @pytest.mark.asyncio
+    async def test_tool_call_skips_tool_span_without_langfuse_generation(self):
+        proc = _make_processor()
+
+        mock_result = MagicMock()
+        mock_result.output = "ls output"
+        mock_result.title = "bash"
+        mock_result.metadata = {}
+        mock_result.attachments = None
+
+        with (
+            patch("flocks.session.streaming.stream_processor.Message.store_part", new=AsyncMock()),
+            patch("flocks.session.streaming.stream_processor.Message.update_part", new=AsyncMock()),
+            patch(
+                "flocks.session.streaming.stream_processor.ToolRegistry.execute",
+                new=AsyncMock(return_value=mock_result),
+            ),
+            patch("flocks.session.streaming.stream_processor.span_scope") as span_scope_mock,
+        ):
+            await proc.process_event(ToolInputStartEvent(id="tc_no_span", tool_name="bash"))
+            await proc.process_event(
+                ToolCallEvent(tool_call_id="tc_no_span", tool_name="bash", input={"command": "ls"})
+            )
+
+        span_scope_mock.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_unknown_tool_still_tracked(self):

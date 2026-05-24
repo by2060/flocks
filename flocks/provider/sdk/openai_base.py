@@ -86,29 +86,85 @@ def _summarise_block(block: Any) -> Dict[str, Any]:
     return {"type": type(block).__name__}
 
 
-def _summarise_messages(openai_messages: List[Any]) -> List[Dict[str, Any]]:
-    """Compute a redacted ``message_shapes`` for diagnostic logging.
+def _summarise_messages(openai_messages: List[Any]) -> Dict[str, Any]:
+    """Compute a compact diagnostic summary for request logging.
 
-    See :func:`_summarise_block`. Used by both streaming and non-streaming
-    request paths so multimodal regressions surface uniformly in the log.
+    The previous ``message_shapes`` payload logged every message in the request,
+    which became very large on long-running sessions because the full history
+    was repeated on every model call. Keep the useful signal, but collapse it
+    into aggregate counters plus a short tail of the most recent messages.
     """
-    out: List[Dict[str, Any]] = []
+    role_counts: Dict[str, int] = {}
+    block_type_counts: Dict[str, int] = {}
+    skipped_types: Dict[str, int] = {}
+    tail: List[Dict[str, Any]] = []
+    total_content_chars = 0
+    max_content_chars = 0
+    multimodal_messages = 0
+
     for m in openai_messages:
         if not isinstance(m, dict):
-            out.append({"type": type(m).__name__, "skipped": True})
+            skipped_type = type(m).__name__
+            skipped_types[skipped_type] = skipped_types.get(skipped_type, 0) + 1
             continue
+
+        role = str(m.get("role") or "unknown")
+        role_counts[role] = role_counts.get(role, 0) + 1
         content = m.get("content")
+        tail_entry: Dict[str, Any] = {"role": role}
+        content_chars: Optional[int] = None
+
         if isinstance(content, list):
-            out.append({
-                "role": m.get("role"),
-                "blocks": [_summarise_block(b) for b in content],
-            })
+            multimodal_messages += 1
+            block_summaries = [_summarise_block(block) for block in content]
+            message_block_types: Dict[str, int] = {}
+            text_chars = 0
+            image_url_chars = 0
+            for summary in block_summaries:
+                block_type = str(summary.get("type") or "unknown")
+                block_type_counts[block_type] = block_type_counts.get(block_type, 0) + 1
+                message_block_types[block_type] = message_block_types.get(block_type, 0) + 1
+                text_chars += int(summary.get("text_chars") or 0)
+                image_url_chars += int(summary.get("url_chars") or 0)
+
+            content_chars = text_chars + image_url_chars
+            tail_entry.update(
+                {
+                    "content_kind": "blocks",
+                    "block_count": len(content),
+                    "block_types": message_block_types,
+                }
+            )
+            if text_chars:
+                tail_entry["text_chars"] = text_chars
+            if image_url_chars:
+                tail_entry["image_url_chars"] = image_url_chars
         else:
-            out.append({
-                "role": m.get("role"),
-                "content_chars": len(content) if isinstance(content, str) else None,
-            })
-    return out
+            content_chars = len(content) if isinstance(content, str) else None
+            tail_entry["content_kind"] = "text"
+
+        if content_chars is not None:
+            tail_entry["content_chars"] = content_chars
+            total_content_chars += content_chars
+            max_content_chars = max(max_content_chars, content_chars)
+
+        tail.append(tail_entry)
+        if len(tail) > 6:
+            tail.pop(0)
+
+    summary: Dict[str, Any] = {
+        "message_count": len(openai_messages),
+        "role_counts": role_counts,
+        "multimodal_messages": multimodal_messages,
+        "total_content_chars": total_content_chars,
+        "max_content_chars": max_content_chars,
+        "tail": tail,
+    }
+    if block_type_counts:
+        summary["block_type_counts"] = block_type_counts
+    if skipped_types:
+        summary["skipped_types"] = skipped_types
+    return summary
 
 
 def format_openai_content(content: Any) -> Any:
@@ -164,7 +220,12 @@ def format_openai_content(content: Any) -> Any:
     return formatted
 
 
-def format_openai_messages(messages: List["ChatMessage"]) -> list:
+def format_openai_messages(
+    messages: List["ChatMessage"],
+    *,
+    include_reasoning: bool = False,
+    reasoning_field: str = "reasoning_content",
+) -> list:
     """Convert a ``ChatMessage`` list to the OpenAI chat-completions wire format.
 
     Shared by all three OpenAI-style providers (``OpenAIProvider``,
@@ -193,6 +254,13 @@ def format_openai_messages(messages: List["ChatMessage"]) -> list:
             d["content"] = content
         if m.tool_calls:
             d["tool_calls"] = m.tool_calls
+        if role == "assistant":
+            if m.reasoning_details:
+                d["reasoning_details"] = m.reasoning_details
+            elif m.reasoning_content is not None:
+                d["reasoning_content"] = m.reasoning_content
+            elif include_reasoning and m.reasoning:
+                d[reasoning_field] = m.reasoning
         if m.tool_call_id:
             d["tool_call_id"] = m.tool_call_id
         if m.name:
@@ -495,6 +563,105 @@ _REASONING_FIELDS = (
     "thinking",
     "reasoning",
 )
+_REASONING_DETAILS_FIELDS = (
+    "reasoning_details",
+)
+
+
+def _normalize_reasoning_details(value: Any) -> Optional[List[Dict[str, Any]]]:
+    """Normalize provider reasoning_details payloads to a list of dicts."""
+    if value is None:
+        return None
+
+    if isinstance(value, tuple):
+        value = list(value)
+    elif hasattr(value, "model_dump"):
+        dumped = value.model_dump()
+        if isinstance(dumped, list):
+            value = dumped
+        else:
+            value = [dumped]
+
+    if not isinstance(value, list):
+        return None
+
+    normalized: List[Dict[str, Any]] = []
+    for item in value:
+        if isinstance(item, dict):
+            normalized.append(item)
+        elif hasattr(item, "model_dump"):
+            dumped = item.model_dump()
+            if isinstance(dumped, dict):
+                normalized.append(dumped)
+        elif hasattr(item, "__dict__"):
+            normalized.append(dict(item.__dict__))
+    return normalized or None
+
+
+def extract_reasoning_content_with_source(delta) -> tuple[Optional[str], Optional[str]]:
+    """Extract reasoning text plus the field/source it came from."""
+    if delta is None:
+        return None, None
+    for field in _REASONING_FIELDS:
+        value = getattr(delta, field, None)
+        if value is not None:
+            return value, field
+    extra = getattr(delta, "model_extra", None)
+    if extra and isinstance(extra, dict):
+        for field in _REASONING_FIELDS:
+            value = extra.get(field)
+            if value is not None:
+                return value, field
+    return None, None
+
+
+def extract_reasoning_details(delta) -> Optional[List[Dict[str, Any]]]:
+    """Extract structured reasoning details from streaming delta objects."""
+    if delta is None:
+        return None
+    for field in _REASONING_DETAILS_FIELDS:
+        value = getattr(delta, field, None)
+        normalized = _normalize_reasoning_details(value)
+        if normalized:
+            return normalized
+    extra = getattr(delta, "model_extra", None)
+    if extra and isinstance(extra, dict):
+        for field in _REASONING_DETAILS_FIELDS:
+            normalized = _normalize_reasoning_details(extra.get(field))
+            if normalized:
+                return normalized
+    return None
+
+
+def build_reasoning_metadata(
+    *,
+    provider_id: str,
+    model_id: str,
+    reasoning_content: Optional[str] = None,
+    reasoning_source: Optional[str] = None,
+    reasoning_details: Optional[List[Dict[str, Any]]] = None,
+    reasoning_field: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Build normalized metadata for reasoning chunks."""
+    if not any((reasoning_content is not None, reasoning_source, reasoning_details, reasoning_field)):
+        return None
+
+    field = reasoning_field
+    if field is None:
+        field = "reasoning_details" if reasoning_details else "reasoning_content"
+
+    metadata: Dict[str, Any] = {
+        "providerID": provider_id,
+        "modelID": model_id,
+        "reasoningField": field,
+    }
+    if reasoning_source:
+        metadata["reasoningSource"] = reasoning_source
+    if reasoning_content is not None:
+        metadata["reasoningContent"] = reasoning_content
+    if reasoning_details:
+        metadata["reasoningDetails"] = reasoning_details
+    return metadata
 
 
 def extract_reasoning_content(delta) -> Optional[str]:
@@ -508,19 +675,8 @@ def extract_reasoning_content(delta) -> Optional[str]:
     This is a shared utility used by OpenAIBaseProvider, OpenAIProvider,
     and OpenAICompatibleProvider.
     """
-    if delta is None:
-        return None
-    for field in _REASONING_FIELDS:
-        value = getattr(delta, field, None)
-        if value is not None:
-            return value
-    extra = getattr(delta, "model_extra", None)
-    if extra and isinstance(extra, dict):
-        for field in _REASONING_FIELDS:
-            value = extra.get(field)
-            if value is not None:
-                return value
-    return None
+    reasoning, _source = extract_reasoning_content_with_source(delta)
+    return reasoning
 
 
 class OpenAIBaseProvider(BaseProvider):
@@ -687,8 +843,8 @@ class OpenAIBaseProvider(BaseProvider):
             params["tools"] = kwargs["tools"]
 
         # Mirror ``chat_stream``'s diagnostic log so non-streaming multimodal
-        # regressions are equally visible. Never logs raw base64 — see
-        # ``_summarise_block``.
+        # regressions are equally visible. Keep INFO payloads compact because
+        # these request logs are emitted for every model call in long sessions.
         log.info("openai_base.chat.request", {
             "model": model_id,
             "thinking_enabled": bool(thinking),
@@ -696,7 +852,7 @@ class OpenAIBaseProvider(BaseProvider):
             "has_tools": bool(kwargs.get("tools")),
             "max_tokens": kwargs.get("max_tokens"),
             "has_temperature": "temperature" in params,
-            "message_shapes": _summarise_messages(openai_messages),
+            "message_summary": _summarise_messages(openai_messages),
         })
 
         response = await client.chat.completions.create(**params)
@@ -761,8 +917,8 @@ class OpenAIBaseProvider(BaseProvider):
         if kwargs.get("tools"):
             params["tools"] = kwargs["tools"]
 
-        # Inspect content shape so multimodal regressions surface in the log.
-        # We *never* log full base64 payloads — see ``_summarise_block``.
+        # Inspect request shape so multimodal regressions surface in the log
+        # without repeating the full message history on every turn.
         log.info("openai_base.stream.request", {
             "model": model_id,
             "thinking_enabled": bool(thinking),
@@ -771,7 +927,7 @@ class OpenAIBaseProvider(BaseProvider):
             "max_tokens": kwargs.get("max_tokens"),
             "has_temperature": "temperature" in params,
             "include_usage": True,
-            "message_shapes": _summarise_messages(openai_messages),
+            "message_summary": _summarise_messages(openai_messages),
         })
 
         try:
@@ -824,13 +980,22 @@ class OpenAIBaseProvider(BaseProvider):
                     })
 
                 # 1) Native reasoning_content field (OpenAI o-series, DeepSeek R1, etc.)
-                reasoning = extract_reasoning_content(delta)
-                if reasoning:
+                reasoning, reasoning_source = extract_reasoning_content_with_source(delta)
+                reasoning_details = extract_reasoning_details(delta)
+                if reasoning is not None or reasoning_details:
                     emitted_substantive_chunk = True
+                    reasoning_metadata = build_reasoning_metadata(
+                        provider_id=self.id,
+                        model_id=model_id,
+                        reasoning_content=reasoning,
+                        reasoning_source=reasoning_source,
+                        reasoning_details=reasoning_details,
+                    )
                     yield StreamChunk(
                         event_type="reasoning",
-                        reasoning=reasoning,
+                        reasoning=reasoning or "",
                         finish_reason=None,
+                        metadata=reasoning_metadata,
                     )
 
                 # 2) Regular content – extract inline <think> tags if present
@@ -841,10 +1006,17 @@ class OpenAIBaseProvider(BaseProvider):
                         if seg_type == "reasoning":
                             if seg_text:
                                 emitted_substantive_chunk = True
+                            reasoning_metadata = build_reasoning_metadata(
+                                provider_id=self.id,
+                                model_id=model_id,
+                                reasoning_content=seg_text,
+                                reasoning_source="think_tag",
+                            )
                             yield StreamChunk(
                                 event_type="reasoning",
                                 reasoning=seg_text,
                                 finish_reason=None,
+                                metadata=reasoning_metadata,
                             )
                         else:
                             if seg_text:
@@ -878,10 +1050,17 @@ class OpenAIBaseProvider(BaseProvider):
                     if seg_type == "reasoning":
                         if seg_text:
                             emitted_substantive_chunk = True
+                        reasoning_metadata = build_reasoning_metadata(
+                            provider_id=self.id,
+                            model_id=model_id,
+                            reasoning_content=seg_text,
+                            reasoning_source="think_tag",
+                        )
                         yield StreamChunk(
                             event_type="reasoning",
                             reasoning=seg_text,
                             finish_reason=None,
+                            metadata=reasoning_metadata,
                         )
                     else:
                         if seg_text:

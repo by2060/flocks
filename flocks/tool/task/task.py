@@ -22,6 +22,7 @@ from flocks.task.background import get_background_manager, LaunchInput, ResumeIn
 from flocks.session.session import Session
 from flocks.session.message import Message, MessageRole
 from flocks.session.session_loop import SessionLoop
+from flocks.tool.subagent_result import format_sync_subagent_result
 from flocks.utils.log import Log
 
 
@@ -127,24 +128,10 @@ def _model_dict(provider: Optional[str], model: Optional[str]) -> Optional[Dict[
 
 DESCRIPTION = """Launch a new agent to handle complex, multi-step tasks autonomously.
 
-Use this tool when:
-- The task requires multiple steps or research
-- You need to explore code in parallel
-- The task can be delegated to a specialized agent
-
-Available subagent types:
-- hephaestus: Autonomous deep worker for goal-oriented, end-to-end task execution
-- explore: Fast code exploration agent for quick searches
-- librarian: Specialized codebase understanding, remote codebases, official documentation
-- hephaestus: Autonomous deep worker for goal-oriented execution
-- oracle: Read-only consultation, debugging hard problems, architecture design
-
-Usage notes:
-- Provide a clear description (3-5 words)
-- Provide detailed prompt with context
-- run_in_background=true: returns task_id immediately, collect results later with background_output
-- run_in_background=false: waits for completion and returns results inline
-- Pass session_id to continue a previous agent with full context"""
+Routing (important):
+- If the user did NOT explicitly request the `task` tool, prefer `delegate_task` for spawning sub-agents (category or subagent_type). 
+- Use `task` only when the user clearly asks to use the `task` tool.
+"""
 
 
 @ToolRegistry.register_function(
@@ -167,7 +154,7 @@ Usage notes:
         ToolParameter(
             name="subagent_type",
             type=ParameterType.STRING,
-            description="The type of specialized agent to use",
+            description="The type of specialized agent to use, must be a delegatable agent",
             required=True,
         ),
         ToolParameter(
@@ -284,12 +271,13 @@ async def task_tool(
             session.id,
             callbacks=_LoopCbs(event_publish_callback=ctx.event_publish_callback),
         )
-        output_text = ""
-        if result.last_message:
-            output_text = await Message.get_text_content(result.last_message)
-        output = f"{output_text}\n\n<task_metadata>\nsession_id: {session.id}\n</task_metadata>"
         ctx.metadata({"title": f"Continue: {description}", "metadata": {"sessionId": session.id}})
-        return ToolResult(success=True, output=output, title=description, metadata={"sessionId": session.id})
+        return await format_sync_subagent_result(
+            description=description,
+            session_id=session.id,
+            loop_result=result,
+            metadata={"sessionId": session.id},
+        )
 
     # --- Background launch (new session) ---
     if run_in_background:
@@ -361,12 +349,18 @@ async def task_tool(
                 event_publish_callback=ctx.event_publish_callback,
             ),
         )
-        output_text = ""
-        if result.last_message:
-            output_text = await Message.get_text_content(result.last_message)
-        output = f"{output_text}\n\n<task_metadata>\nsession_id: {created.id}\n</task_metadata>"
-        ctx.metadata({"title": description, "metadata": forwarder.final_metadata})
-        return ToolResult(success=True, output=output, title=description, metadata=forwarder.final_metadata)
+        tool_result = await format_sync_subagent_result(
+            description=description,
+            session_id=created.id,
+            loop_result=result,
+            metadata=forwarder.final_metadata,
+        )
+        result_status = "completed" if tool_result.success else "error"
+        ctx.metadata({
+            "title": description,
+            "metadata": {**forwarder.final_metadata, "status": result_status},
+        })
+        return tool_result
 
     except Exception as e:
         log.error("task.execute.error", {"error": str(e)})

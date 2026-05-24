@@ -186,8 +186,7 @@ class CompactionPolicy:
         clamped: Dict[str, int] = {}
         for key, value in raw.items():
             lo, hi = _BOUNDS[key]
-            effective_lo = min(lo, int(value)) if value > 0 else lo
-            clamped[key] = int(max(effective_lo, min(hi, value)))
+            clamped[key] = int(max(lo, min(hi, int(value))))
 
         overflow_ratio = ratios["overflow_ratio"]
         overflow_threshold = int(usable * overflow_ratio)
@@ -228,7 +227,7 @@ class CompactionPolicy:
             preserve_last=preserve_last,
         )
 
-        _policy_log.info("compaction_policy.created", {
+        _policy_log.debug("compaction_policy.created", {
             "context_window": context_window,
             "max_output_tokens": max_output_tokens,
             "usable_context": usable,

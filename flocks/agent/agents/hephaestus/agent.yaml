@@ -9,18 +9,15 @@ color: "#FF4500"
 delegatable: true
 tools:
   - read
-  - list
   - glob
   - grep
-  - codesearch
   - bash
   - edit
-  - multiedit
   - write
   - apply_patch
   - websearch
   - webfetch
-  - skill
+  - skill_load
   - delegate_task
   - task
   - todoread

@@ -34,8 +34,6 @@ from flocks.workflow.center import (
     stop_workflow_service,
 )
 from flocks.session.recorder import Recorder
-from flocks.session.message import Message, MessageRole
-from flocks.session.session import Session
 from flocks.workflow.workflow_lint import lint_workflow
 from flocks.workflow.compiler import compile_workflow
 from flocks.workflow.fs_store import (
@@ -44,7 +42,11 @@ from flocks.workflow.fs_store import (
     read_workflow_from_fs as shared_read_workflow_from_fs,
     workflow_scan_dirs as _all_scan_dirs,
 )
+from flocks.ingest.syslog.constants import WORKFLOW_SYSLOG_CONFIG_PREFIX
 from flocks.workflow.execution_store import (
+    compact_history_for_storage,
+    compact_outputs_for_storage,
+    compact_step_for_storage,
     create_execution_record,
     normalize_execution_status as _normalize_execution_status,
     record_execution_result as _record_execution_result,
@@ -52,6 +54,7 @@ from flocks.workflow.execution_store import (
     workflow_execution_key as _workflow_execution_key,
 )
 from flocks.workflow.io import load_workflow, dump_workflow
+from flocks.workflow.tool_context import build_workflow_tool_context
 from flocks.workflow.tools import get_tool_registry
 from flocks.config.config import Config
 from flocks.storage.storage import Storage
@@ -156,9 +159,13 @@ class WorkflowExecutionResponse(BaseModel):
 
 
 class WorkflowCenterPublishRequest(BaseModel):
-    """Request to publish a workflow as a Docker service."""
+    """Request to publish a workflow as an API service."""
 
     image: Optional[str] = Field(None, description="Docker image used to run service")
+    driver: Optional[Literal["local", "docker"]] = Field(
+        None,
+        description="Service driver. Defaults to FLOCKS_WORKFLOW_SERVICE_DRIVER or local.",
+    )
 
 
 class WorkflowCenterInvokeRequest(BaseModel):
@@ -217,76 +224,14 @@ async def _build_workflow_tool_context(
     message_id: Optional[str] = None,
     agent: Optional[str] = None,
 ) -> ToolContext:
-    """Build a real ToolContext for workflow execution.
-
-    Prefer the caller-provided session/message. When absent, create a temporary
-    parent session and synthetic user message so workflow-internal tools such as
-    `task` can resolve a valid parent session.
-    """
-    effective_session_id = str(session_id or "").strip()
-    effective_message_id = str(message_id or "").strip()
-    effective_agent = str(agent or "").strip()
-
-    workspace_dir = os.getcwd()
-    project_id = "default"
-    try:
-        from flocks.project.instance import Instance
-
-        workspace_dir = str(getattr(Instance, "directory", None) or workspace_dir)
-        project = getattr(Instance, "project", None)
-        if project is not None and getattr(project, "id", None):
-            project_id = str(project.id)
-    except Exception:
-        workspace_dir = str(_find_workspace_root())
-
-    parent_session = None
-    if effective_session_id:
-        parent_session = await Session.get_by_id(effective_session_id)
-        if not parent_session:
-            raise HTTPException(status_code=400, detail=f"Parent session not found: {effective_session_id}")
-        workspace_dir = str(getattr(parent_session, "directory", None) or workspace_dir)
-        if getattr(parent_session, "project_id", None):
-            project_id = str(parent_session.project_id)
-        if not effective_agent:
-            effective_agent = str(getattr(parent_session, "agent", None) or "rex")
-    else:
-        parent_session = await Session.create(
-            project_id=project_id,
-            directory=workspace_dir,
-            title=f"Workflow {action_name}: {workflow_id}",
-            agent=effective_agent or "rex",
-            category="task",
-            metadata={
-                "workflowTempParent": True,
-                "hideFromSessionManager": True,
-                "workflowId": workflow_id,
-                "workflowAction": action_name,
-            },
-        )
-        effective_session_id = parent_session.id
-        workspace_dir = str(getattr(parent_session, "directory", None) or workspace_dir)
-        if not effective_agent:
-            effective_agent = str(getattr(parent_session, "agent", None) or "rex")
-
-    if not effective_message_id:
-        message = await Message.create(
-            session_id=effective_session_id,
-            role=MessageRole.USER,
-            content=f"[Workflow {action_name}] {workflow_id}",
-            agent=effective_agent or "rex",
-            synthetic=True,
-        )
-        effective_message_id = message.id
-
-    return ToolContext(
-        session_id=effective_session_id,
-        message_id=effective_message_id,
-        agent=effective_agent or "rex",
+    """Build a real ToolContext for workflow execution."""
+    return await build_workflow_tool_context(
+        workflow_id=workflow_id,
+        action_name=action_name,
+        session_id=session_id,
+        message_id=message_id,
+        agent=agent,
         event_publish_callback=publish_event,
-        extra={
-            "workspace_dir": workspace_dir,
-            "main_session_key": effective_session_id,
-        },
     )
 
 
@@ -444,6 +389,10 @@ def _workflow_stats_key(workflow_id: str) -> str:
     return f"workflow/{workflow_id}/stats"
 
 
+def _syslog_config_key(workflow_id: str) -> str:
+    return f"{WORKFLOW_SYSLOG_CONFIG_PREFIX}{workflow_id}"
+
+
 async def _run_workflow_execution_task(
     *,
     workflow_id: str,
@@ -460,10 +409,24 @@ async def _run_workflow_execution_task(
     loop = asyncio.get_running_loop()
 
     def _write_progress(update_fields: Dict[str, Any]) -> None:
+        # Called from the workflow-engine worker thread on every step
+        # start/complete.  Step events for a single execution are issued
+        # serially by the engine, so no extra lock is needed beyond the
+        # caller's invariant — but we must still tolerate transient
+        # ``Storage.read`` failures (e.g. SQLite contention) without
+        # corrupting ``current`` with a non-dict result.
         try:
-            current = asyncio.run_coroutine_threadsafe(Storage.read(exec_key), loop).result(timeout=5)
+            current = asyncio.run_coroutine_threadsafe(
+                Storage.read(exec_key), loop
+            ).result(timeout=5)
+            if not isinstance(current, dict):
+                # Execution record was trimmed mid-run or never persisted;
+                # rebuild a minimal payload so the write still goes through.
+                current = {"id": exec_id, "workflowId": workflow_id}
             current.update(update_fields)
-            asyncio.run_coroutine_threadsafe(Storage.write(exec_key, current), loop).result(timeout=5)
+            asyncio.run_coroutine_threadsafe(
+                Storage.write(exec_key, current), loop
+            ).result(timeout=5)
         except Exception as exc:
             log.warning("workflow.step_progress.write_failed", {
                 "exec_id": exec_id,
@@ -480,7 +443,12 @@ async def _run_workflow_execution_task(
         return step_index
 
     def _on_step_complete(step_result) -> None:
-        step_dict = step_result.model_dump(mode="json")
+        # Compact each step's outputs *before* appending so the running
+        # ``step_history`` (and every subsequent ``_write_progress`` snapshot
+        # that ships it to SQLite) stays bounded, even when a workflow node
+        # returns tens of thousands of alerts that are already persisted to
+        # JSONL on disk.
+        step_dict = compact_step_for_storage(step_result.model_dump(mode="json"))
         step_history.append(step_dict)
         _write_progress({
             "executionLog": list(step_history),
@@ -505,24 +473,32 @@ async def _run_workflow_execution_task(
 
         duration = time.time() - start_time
         current_data = await Storage.read(exec_key)
+        if not isinstance(current_data, dict):
+            # Defensive: the execution record could be missing if it was
+            # trimmed/cleaned up mid-run.  Rebuild a baseline so the final
+            # status write still succeeds rather than blowing up.
+            current_data = {"id": exec_id, "workflowId": workflow_id}
         status_value, error_message = _resolve_execution_outcome(result)
+        if cancel_event.is_set() and status_value == "success":
+            status_value = "cancelled"
+            error_message = error_message or f"Run cancelled: run_id={result.run_id or exec_id}"
+        # ``result.history`` is the engine-side authoritative history (not
+        # yet compacted), while ``step_history`` was already compacted in
+        # ``_on_step_complete``.  Prefer the former when available, then
+        # run it through ``compact_history_for_storage`` so the persisted
+        # row stays small in either branch.
         current_data.update({
-            "outputResults": result.outputs,
+            "outputResults": compact_outputs_for_storage(result.outputs),
             "status": status_value,
             "finishedAt": int(time.time() * 1000),
             "duration": duration,
-            "executionLog": result.history or list(step_history),
+            "executionLog": compact_history_for_storage(result.history) or list(step_history),
             "errorMessage": error_message,
             "currentNodeId": result.last_node_id,
             "currentNodeType": current_data.get("currentNodeType"),
             "currentPhase": status_value,
             "currentStepIndex": result.steps,
         })
-
-        if status_value == "success":
-            await _update_workflow_stats(workflow_id, True, duration)
-        elif status_value in {"error", "timeout"}:
-            await _update_workflow_stats(workflow_id, False, duration)
 
         await _record_execution_result(workflow_id, exec_id, current_data)
         log.info("workflow.executed", {
@@ -534,6 +510,8 @@ async def _run_workflow_execution_task(
     except Exception as exc:
         duration = time.time() - start_time
         current_data = await Storage.read(exec_key)
+        if not isinstance(current_data, dict):
+            current_data = {"id": exec_id, "workflowId": workflow_id}
         current_data.update({
             "status": "cancelled" if cancel_event.is_set() else "error",
             "finishedAt": int(time.time() * 1000),
@@ -542,8 +520,6 @@ async def _run_workflow_execution_task(
             "executionLog": list(step_history),
             "currentPhase": "cancelled" if cancel_event.is_set() else "error",
         })
-        if current_data["status"] == "error":
-            await _update_workflow_stats(workflow_id, False, duration)
         await _record_execution_result(workflow_id, exec_id, current_data)
         log.error("workflow.execute.error", {
             "id": workflow_id,
@@ -582,18 +558,6 @@ async def _get_workflow_stats(workflow_id: str) -> Dict[str, Any]:
         return _compute_avg_runtime(data)
     except Exception:
         return dict(_DEFAULT_STATS)
-
-
-async def _update_workflow_stats(workflow_id: str, success: bool, duration: float) -> None:
-    """Update workflow statistics"""
-    stats = await _get_workflow_stats(workflow_id)
-    stats["callCount"] += 1
-    if success:
-        stats["successCount"] += 1
-    else:
-        stats["errorCount"] += 1
-    stats["totalRuntime"] += duration
-    await Storage.write(_workflow_stats_key(workflow_id), stats)
 
 
 # =============================================================================
@@ -808,6 +772,17 @@ async def delete_workflow(workflow_id: str):
         except Exception:
             pass
 
+        try:
+            from flocks.ingest.syslog.manager import default_manager as _syslog_default_manager
+
+            await _syslog_default_manager.stop_workflow(workflow_id)
+        except Exception:
+            pass
+        try:
+            await Storage.remove(_syslog_config_key(workflow_id))
+        except Storage.NotFoundError:
+            pass
+
         log.info("workflow.deleted", {"id": workflow_id})
         await publish_event("workflow.deleted", {"id": workflow_id})
         return None
@@ -858,13 +833,21 @@ async def run_workflow_endpoint(workflow_id: str, req: WorkflowRunRequest):
                 exec_id=exec_id,
                 cancel_event=cancel_event,
                 tool_context=tool_context,
-            )
+            ),
+            name=f"workflow-run-{exec_id}",
         )
         _active_workflow_executions[exec_id] = ActiveWorkflowExecution(
             workflow_id=workflow_id,
             task=task,
             cancel_event=cancel_event,
         )
+        # Guarantee cleanup of the registry entry even when the task is
+        # cancelled or fails before reaching its own ``finally`` block (e.g.
+        # if the event loop is shutting down).  This prevents the ``Active*``
+        # map from growing forever when tasks are abandoned.
+        def _cleanup_active(_t: asyncio.Task, _eid: str = exec_id) -> None:
+            _active_workflow_executions.pop(_eid, None)
+        task.add_done_callback(_cleanup_active)
 
         log.info("workflow.execution.started", {
             "id": workflow_id,
@@ -898,6 +881,11 @@ async def cancel_workflow_execution(workflow_id: str, exec_id: str):
             raise HTTPException(status_code=404, detail="Execution not found for this workflow")
 
         active.cancel_event.set()
+        exec_data.update({
+            "currentPhase": "cancelling",
+            "errorMessage": exec_data.get("errorMessage") or "Cancellation requested",
+        })
+        await Storage.write(_workflow_execution_key(exec_id), exec_data)
         log.info("workflow.execution.cancel_requested", {
             "id": workflow_id,
             "exec_id": exec_id,
@@ -992,10 +980,14 @@ async def workflow_center_list():
 
 
 @router.post("/workflow-center/{workflow_id}/publish")
-async def workflow_center_publish(workflow_id: str, req: WorkflowCenterPublishRequest):
-    """Publish workflow as dockerized service."""
+async def workflow_center_publish(workflow_id: str, req: Optional[WorkflowCenterPublishRequest] = None):
+    """Publish workflow as an API service."""
     try:
-        result = await publish_workflow(workflow_id, image=req.image)
+        result = await publish_workflow(
+            workflow_id,
+            image=req.image if req else None,
+            driver=req.driver if req else None,
+        )
         return result
     except WorkflowNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
@@ -1023,21 +1015,62 @@ async def workflow_center_stop(workflow_id: str):
 
 @router.post("/workflow-center/{workflow_id}/invoke")
 async def workflow_center_invoke(workflow_id: str, req: WorkflowCenterInvokeRequest):
-    """Proxy invoke request to active published workflow service."""
+    """Proxy invoke request to active published workflow service.
+
+    Also records execution stats (callCount / successCount / errorCount) so
+    that the UI invocation counter is updated for every published-service call,
+    not just agent-driven /run calls.
+    """
+    started = time.time()
+    exec_data = await create_execution_record(
+        workflow_id,
+        input_params=req.inputs or {},
+    )
+    exec_id = str(exec_data["id"])
     try:
-        return await invoke_published_workflow(
+        result = await invoke_published_workflow(
             workflow_id,
             inputs=req.inputs,
             timeout_s=req.timeout_s,
             request_id=req.request_id,
         )
-    except WorkflowNotFoundError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except WorkflowNotPublishedError as e:
+        duration = time.time() - started
+        raw_status = result.get("status", "SUCCEEDED") if isinstance(result, dict) else "SUCCEEDED"
+        status_value = _normalize_execution_status(raw_status)
+        success = status_value == "success"
+        # workflow_center_invoke proxies to an external published service; no
+        # step callbacks run locally so executionLog stays as the empty list
+        # set by create_execution_record.  We still run compact_history here
+        # as a forward-compatible guard in case a future code path populates it.
+        exec_data.update({
+            "outputResults": compact_outputs_for_storage(
+                result.get("outputs", {}) if isinstance(result, dict) else {}
+            ),
+            "executionLog": compact_history_for_storage(exec_data.get("executionLog")),
+            "status": status_value,
+            "finishedAt": int(time.time() * 1000),
+            "duration": duration,
+            "currentPhase": status_value,
+        })
+        await _record_execution_result(workflow_id, exec_id, exec_data)
+        return result
+    except (WorkflowNotFoundError, WorkflowNotPublishedError) as e:
+        duration = time.time() - started
+        exec_data.update({"status": "error", "finishedAt": int(time.time() * 1000),
+                          "duration": duration, "errorMessage": str(e)})
+        await _record_execution_result(workflow_id, exec_id, exec_data)
         raise HTTPException(status_code=404, detail=str(e))
     except WorkflowCenterError as e:
+        duration = time.time() - started
+        exec_data.update({"status": "error", "finishedAt": int(time.time() * 1000),
+                          "duration": duration, "errorMessage": str(e)})
+        await _record_execution_result(workflow_id, exec_id, exec_data)
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
+        duration = time.time() - started
+        exec_data.update({"status": "error", "finishedAt": int(time.time() * 1000),
+                          "duration": duration, "errorMessage": str(e)})
+        await _record_execution_result(workflow_id, exec_id, exec_data)
         log.error("workflow.center.invoke.error", {"workflow_id": workflow_id, "error": str(e)})
         raise HTTPException(status_code=500, detail=f"Failed to invoke workflow service: {str(e)}")
 
@@ -1082,29 +1115,31 @@ async def get_workflow_history(
 ):
     """
     Get workflow execution history
-    
+
     Returns list of recent executions for this workflow.
     """
     try:
         if not _read_workflow_from_fs(workflow_id):
             raise HTTPException(status_code=404, detail=f"Workflow not found: {workflow_id}")
 
-        all_exec_keys = await Storage.list("workflow_execution/")
+        # 单次查询批量读取所有 execution 记录，避免 N 次单独 read 导致超长耗时
+        all_entries = await Storage.list_entries("workflow_execution/")
         executions = []
-        
-        for key in all_exec_keys:
+        for _key, exec_data in all_entries:
             try:
-                exec_data = await Storage.read(key)
-                if exec_data.get("workflowId") == workflow_id:
-                    executions.append(WorkflowExecutionResponse(**exec_data))
+                if not isinstance(exec_data, dict):
+                    continue
+                if exec_data.get("workflowId") != workflow_id:
+                    continue
+                executions.append(WorkflowExecutionResponse(**exec_data))
             except Exception as e:
-                log.warning("workflow.history.skip", {"key": key, "error": str(e)})
+                log.warning("workflow.history.skip", {"key": _key, "error": str(e)})
                 continue
-        
+
         # Sort by start time (newest first) and limit
         executions.sort(key=lambda e: e.startedAt, reverse=True)
         executions = executions[:limit]
-        
+
         log.info("workflow.history", {"id": workflow_id, "count": len(executions)})
         return executions
     except HTTPException:
@@ -1334,6 +1369,7 @@ class WorkflowServiceResponse(BaseModel):
     status: str
     publishedAt: int
     containerName: Optional[str] = None
+    driver: Optional[Literal["local", "docker"]] = None
 
 
 class KafkaConfigRequest(BaseModel):
@@ -1344,13 +1380,29 @@ class KafkaConfigRequest(BaseModel):
     outputTopic: Optional[str] = None
 
 
+class SyslogConfigRequest(BaseModel):
+    """Per-workflow syslog listener configuration (experimental)."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    enabled: bool = False
+    protocol: str = "udp"
+    host: str = "0.0.0.0"
+    port: int = Field(5140, ge=1, le=65535, description="Listener port (1-65535)")
+    msg_format: str = Field("auto", alias="format")
+    input_key: str = Field("syslog_message", alias="inputKey")
+
+
 @router.post("/workflow/{workflow_id}/publish")
-async def publish_workflow_as_api(workflow_id: str):
+async def publish_workflow_as_api(
+    workflow_id: str,
+    req: Optional[WorkflowCenterPublishRequest] = None,
+):
     """
-    Publish workflow as Docker API service.
+    Publish workflow as an API service.
 
     Writes the workflow JSON to disk, registers it with the workflow center,
-    starts a Docker container, and returns the service URL and generated API key.
+    starts the selected runtime, and returns the service URL and generated API key.
     """
     try:
         data = _read_workflow_from_fs(workflow_id)
@@ -1381,8 +1433,12 @@ async def publish_workflow_as_api(workflow_id: str):
         }
         await Storage.write(f"{_REGISTRY_PREFIX_MAIN}{workflow_id}", registry_entry)
 
-        # Use center.py to publish the Docker container
-        active_record = await publish_workflow(workflow_id)
+        # Use center.py to publish the selected runtime.
+        active_record = await publish_workflow(
+            workflow_id,
+            image=req.image if req else None,
+            driver=req.driver if req else None,
+        )
 
         # Preserve existing API key across re-publishes so callers don't break
         existing_service = await Storage.read(_api_service_key(workflow_id)) or {}
@@ -1391,6 +1447,7 @@ async def publish_workflow_as_api(workflow_id: str):
         service_url = active_record.get("serviceUrl", "")
         invoke_url = f"{service_url}/invoke"
         container_name = active_record.get("containerName", "")
+        driver = active_record.get("driver") or (req.driver if req else None)
 
         service_info = {
             "workflowId": workflow_id,
@@ -1401,6 +1458,7 @@ async def publish_workflow_as_api(workflow_id: str):
             "status": "running",
             "publishedAt": now_ms,
             "containerName": container_name,
+            "driver": driver,
         }
         await Storage.write(_api_service_key(workflow_id), service_info)
 
@@ -1410,7 +1468,7 @@ async def publish_workflow_as_api(workflow_id: str):
         raise
     except WorkflowCenterError as e:
         log.error("workflow.publish.center_error", {"id": workflow_id, "error": str(e)})
-        raise HTTPException(status_code=500, detail=f"发布失败（Docker）: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"发布失败: {str(e)}")
     except Exception as e:
         log.error("workflow.publish.error", {"id": workflow_id, "error": str(e)})
         raise HTTPException(status_code=500, detail=f"Failed to publish workflow: {str(e)}")
@@ -1452,6 +1510,15 @@ async def get_workflow_service(workflow_id: str):
     """
     try:
         service = await Storage.read(_api_service_key(workflow_id))
+        if isinstance(service, dict) and service.get("status") == "running":
+            try:
+                health = await get_workflow_health(workflow_id)
+            except Exception:
+                health = {}
+            if health and not health.get("ok"):
+                service["status"] = "error" if health.get("published") else "stopped"
+                service["health"] = health
+                await Storage.write(_api_service_key(workflow_id), service)
         return service  # None / null if not found
     except Exception as e:
         log.error("workflow.service.get.error", {"id": workflow_id, "error": str(e)})
@@ -1516,6 +1583,81 @@ async def get_kafka_config(workflow_id: str):
     except Exception as e:
         log.error("workflow.kafka_config.get.error", {"id": workflow_id, "error": str(e)})
         raise HTTPException(status_code=500, detail=f"Failed to get Kafka config: {str(e)}")
+
+
+@router.post("/workflow/{workflow_id}/syslog-config")
+async def save_syslog_config(workflow_id: str, req: SyslogConfigRequest):
+    """
+    Save syslog listener configuration for a workflow.
+
+    When ``enabled`` is true, this also (re)starts the UDP/TCP listener and
+    blocks until the underlying socket has either bound successfully or the
+    bind has failed (e.g. ``EADDRINUSE``, invalid host).  Bind failures are
+    surfaced as ``409 Conflict`` so the UI can show an actionable error
+    instead of falsely claiming "Listening".
+    """
+    try:
+        if not _read_workflow_from_fs(workflow_id):
+            raise HTTPException(status_code=404, detail=f"Workflow not found: {workflow_id}")
+
+        config = {
+            "workflowId": workflow_id,
+            "enabled": req.enabled,
+            "protocol": req.protocol,
+            "host": req.host,
+            "port": req.port,
+            "format": req.msg_format,
+            "inputKey": req.input_key,
+            "updatedAt": int(time.time() * 1000),
+        }
+        await Storage.write(_syslog_config_key(workflow_id), config)
+
+        from flocks.ingest.syslog.manager import default_manager as _syslog_default_manager
+
+        status = await _syslog_default_manager.restart_workflow(workflow_id)
+        state = (status or {}).get("state")
+        if req.enabled and state == "failed":
+            err = (status or {}).get("error") or "listener_bind_failed"
+            raise HTTPException(
+                status_code=409,
+                detail=f"Syslog listener failed to bind: {err}",
+            )
+        return {"ok": True, "listener": status}
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error("workflow.syslog_config.save.error", {"id": workflow_id, "error": str(e)})
+        raise HTTPException(status_code=500, detail=f"Failed to save syslog config: {str(e)}")
+
+
+@router.get("/workflow/{workflow_id}/syslog-config")
+async def get_syslog_config(workflow_id: str):
+    """Get saved syslog configuration for a workflow."""
+    try:
+        config = await Storage.read(_syslog_config_key(workflow_id))
+        return config
+    except Exception as e:
+        log.error("workflow.syslog_config.get.error", {"id": workflow_id, "error": str(e)})
+        raise HTTPException(status_code=500, detail=f"Failed to get syslog config: {str(e)}")
+
+
+@router.get("/workflow/{workflow_id}/syslog-status")
+async def get_syslog_status(workflow_id: str):
+    """Return the *runtime* status of the syslog listener for a workflow.
+
+    This reflects the actual bind state (binding/listening/failed/stopped) and
+    queue depth, so the UI can show whether a saved-but-not-yet-bound listener
+    is actually running.  The persisted config (``/syslog-config``) only
+    captures *intent*, which is why the UI must consult this endpoint to
+    truthfully render "Listening".
+    """
+    try:
+        from flocks.ingest.syslog.manager import default_manager as _syslog_default_manager
+
+        return _syslog_default_manager.get_listener_status(workflow_id)
+    except Exception as e:
+        log.error("workflow.syslog_status.get.error", {"id": workflow_id, "error": str(e)})
+        raise HTTPException(status_code=500, detail=f"Failed to get syslog status: {str(e)}")
 
 
 # =============================================================================

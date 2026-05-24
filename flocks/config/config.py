@@ -37,7 +37,6 @@ class PermissionConfig(BaseModel):
     edit: Optional[PermissionRule] = None
     glob: Optional[PermissionRule] = None
     grep: Optional[PermissionRule] = None
-    list: Optional[PermissionRule] = None
     bash: Optional[PermissionRule] = None
     task: Optional[PermissionRule] = None
     external_directory: Optional[PermissionRule] = None
@@ -46,11 +45,9 @@ class PermissionConfig(BaseModel):
     question: Optional[PermissionAction] = None
     webfetch: Optional[PermissionAction] = None
     websearch: Optional[PermissionAction] = None
-    codesearch: Optional[PermissionAction] = None
     lsp: Optional[PermissionRule] = None
     doom_loop: Optional[PermissionAction] = None
     delegate_task: Optional[PermissionRule] = None
-    call_omo_agent: Optional[PermissionRule] = None
     background_output: Optional[PermissionRule] = None
     background_cancel: Optional[PermissionRule] = None
 
@@ -104,8 +101,8 @@ class AgentConfig(BaseModel):
             
             for tool, enabled in self.tools.items():
                 action = PermissionAction.ALLOW if enabled else PermissionAction.DENY
-                # Map write/edit/patch/multiedit to edit
-                if tool in ["write", "edit", "patch", "multiedit"]:
+                # Map write/edit/patch to edit
+                if tool in ["write", "edit", "patch"]:
                     permission_dict["edit"] = action
                 else:
                     permission_dict[tool] = action
@@ -278,7 +275,6 @@ class ExperimentalConfig(BaseModel):
     
     chat_max_retries: Optional[int] = Field(None, alias="chatMaxRetries")
     disable_paste_summary: Optional[bool] = None
-    batch_tool: Optional[bool] = None
     open_telemetry: Optional[bool] = Field(None, alias="openTelemetry")
     primary_tools: Optional[List[str]] = None
     continue_loop_on_deny: Optional[bool] = None
@@ -620,7 +616,7 @@ class ConfigInfo(BaseModel):
             
             for tool, enabled in self.tools.items():
                 action = PermissionAction.ALLOW if enabled else PermissionAction.DENY
-                if tool in ["write", "edit", "patch", "multiedit"]:
+                if tool in ["write", "edit", "patch"]:
                     permission_dict["edit"] = action
                 else:
                     permission_dict[tool] = action

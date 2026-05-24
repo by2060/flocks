@@ -176,6 +176,15 @@ class Command:
                 visible_surfaces=("webui", "tui", "acp", "cli"),
             ),
             CommandDef(
+                name="agents",
+                description="List available agents",
+                template="List all available agents that can be delegated to.",
+                agent="rex",
+                execution_kind="direct",
+                allow_attachments=False,
+                visible_surfaces=("webui", "tui", "acp", "cli"),
+            ),
+            CommandDef(
                 name="workflows",
                 description="List available workflows",
                 template="List all available workflows with their names, descriptions, and file paths.",
@@ -226,7 +235,7 @@ class Command:
             ),
             CommandDef(
                 name="compact",
-                description="Summarize the conversation (optionally /compact <focus>)",
+                description="Summarize the conversation (optionally /compact `focus`)",
                 template="Summarize this conversation while preserving key context and decisions.",
                 agent="rex",
                 execution_kind="session_control",
@@ -267,14 +276,14 @@ class Command:
             CommandDef(
                 name="tasks",
                 description="Show task center overview",
-                template="Use the task_list tool to show the current task center overview including running, queued, and recently completed tasks. Present the results clearly.",
+                template="Use the schedule_task_list tool to show the current task center overview including running, queued, and recently completed tasks. Present the results clearly.",
                 execution_kind="llm",
                 allow_attachments=True,
             ),
             CommandDef(
                 name="queue",
                 description="Show task queue status",
-                template="Use the task_list tool with status filter to show the current task queue status: running tasks, queued tasks, and queue configuration. Present the results clearly.",
+                template="Use the schedule_task_list tool with status filter to show the current task queue status: running tasks, queued tasks, and queue configuration. Present the results clearly.",
                 execution_kind="llm",
                 allow_attachments=True,
             ),

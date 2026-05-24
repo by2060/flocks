@@ -2,10 +2,9 @@
 tests/tool/test_slash_command_extended.py
 
 单元测试：run_slash_command 工具（flocks.tool.system.slash_command）
-- tools    命令：按 ToolCategory 分组显示
-- skills   命令：不再是 ui_only，返回完整技能列表
-- workflows命令：返回已发现的 workflow 列表
-- 错误情况：workflows scan 失败时返回 error
+- 仅暴露 Agent-safe 的 direct 命令
+- tools/skills/workflows/help/mcp 走共享 direct 逻辑
+- 非 Agent-safe 的命令不会进入 tool schema
 """
 
 from __future__ import annotations
@@ -15,8 +14,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from flocks.tool.registry import ToolContext
-from flocks.tool.system.slash_command import build_tools_catalog_summary, run_slash_command_tool
+from flocks.agent.agent import AgentPromptMetadata, AvailableAgent
+from flocks.command.help import format_help
+from flocks.tool.registry import ToolContext, ToolRegistry
+from flocks.tool.system.slash_command import (
+    build_run_slash_command_description,
+    build_tools_catalog_summary,
+    refresh_run_slash_command_metadata,
+    run_slash_command_tool,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -53,6 +59,53 @@ def _make_workflow_entry(name: str, description: str = "", path: str = "", sourc
     }
 
 
+def _make_available_agent(
+    name: str,
+    description: str,
+    *,
+    category: str = "exploration",
+    cost: str = "CHEAP",
+) -> AvailableAgent:
+    return AvailableAgent(
+        name=name,
+        description=description,
+        metadata=AgentPromptMetadata(category=category, cost=cost),
+    )
+
+
+# ===========================================================================
+# metadata / schema
+# ===========================================================================
+
+class TestAgentSafeCommandMetadata:
+    def test_tool_schema_only_contains_agent_safe_direct_commands(self):
+        refresh_run_slash_command_metadata()
+        tool = ToolRegistry.get("run_slash_command")
+
+        assert tool is not None
+        command_param = next(param for param in tool.info.parameters if param.name == "command")
+        assert command_param.enum == ["help", "tools", "skills", "agents", "workflows", "mcp"]
+
+    def test_tool_schema_excludes_non_direct_and_unsafe_commands(self):
+        refresh_run_slash_command_metadata()
+        tool = ToolRegistry.get("run_slash_command")
+
+        assert tool is not None
+        command_param = next(param for param in tool.info.parameters if param.name == "command")
+        for forbidden in ["plan", "ask", "tasks", "queue", "init", "bug", "compact", "model", "status", "new", "clear"]:
+            assert forbidden not in (command_param.enum or [])
+
+    def test_description_is_built_from_registry(self):
+        description = build_run_slash_command_description()
+
+        assert "- help: Show available commands" in description
+        assert "- tools: List available tools" in description
+        assert "- agents: List available agents" in description
+        assert "- mcp: Inspect or refresh MCP servers" in description
+        assert "plan" not in description
+        assert "compact" not in description
+
+
 # ===========================================================================
 # tools command
 # ===========================================================================
@@ -67,7 +120,7 @@ class TestToolsCommand:
             _make_tool_info("bash", "terminal"),
             _make_tool_info("grep", "search"),
             _make_tool_info("webfetch", "browser"),
-            _make_tool_info("skill", "system"),
+            _make_tool_info("skill_load", "system"),
         ]
 
     async def test_returns_success(self, mock_tools):
@@ -113,6 +166,11 @@ class TestToolsCommand:
              patch("flocks.tool.system.slash_command.ToolRegistry.init"):
             result = await run_slash_command_tool(_make_ctx(), "tools")
         assert result.success
+
+    async def test_tools_info_requires_name(self):
+        result = await run_slash_command_tool(_make_ctx(), "tools", arguments="info")
+        assert not result.success
+        assert "Usage: /tools [list|info `name`]" in result.error
 
 
 # ===========================================================================
@@ -160,6 +218,53 @@ class TestSkillsCommand:
             result = await run_slash_command_tool(_make_ctx(), "skills")
         for i in range(5):
             assert f"skill-{i}" in result.output
+
+    async def test_skills_refresh_is_not_agent_safe(self):
+        result = await run_slash_command_tool(_make_ctx(), "skills", arguments="refresh")
+        assert not result.success
+        assert "read-only direct variants" in result.error
+
+
+# ===========================================================================
+# agents command
+# ===========================================================================
+
+class TestAgentsCommand:
+    _LIST_AVAILABLE = "flocks.agent.registry.Agent.list_available_agents"
+
+    async def test_returns_success_with_agents(self):
+        agents = [_make_available_agent("explore", "Explore the codebase.")]
+        with patch(self._LIST_AVAILABLE, new_callable=AsyncMock, return_value=agents):
+            result = await run_slash_command_tool(_make_ctx(), "agents")
+        assert result.success
+
+    async def test_agent_names_in_output(self):
+        agents = [
+            _make_available_agent("explore", "Explore the codebase."),
+            _make_available_agent("oracle", "Answer deep questions.", category="advisor", cost="EXPENSIVE"),
+        ]
+        with patch(self._LIST_AVAILABLE, new_callable=AsyncMock, return_value=agents):
+            result = await run_slash_command_tool(_make_ctx(), "agents")
+        assert "`explore`" in result.output
+        assert "`oracle`" in result.output
+
+    async def test_agent_metadata_in_output(self):
+        agents = [_make_available_agent("oracle", "Answer deep questions.", category="advisor", cost="EXPENSIVE")]
+        with patch(self._LIST_AVAILABLE, new_callable=AsyncMock, return_value=agents):
+            result = await run_slash_command_tool(_make_ctx(), "agents")
+        assert "advisor" in result.output
+        assert "EXPENSIVE" in result.output
+
+    async def test_no_agents_returns_success_with_message(self):
+        with patch(self._LIST_AVAILABLE, new_callable=AsyncMock, return_value=[]):
+            result = await run_slash_command_tool(_make_ctx(), "agents")
+        assert result.success
+        assert "No available agents." in result.output
+
+    async def test_agents_reject_arguments(self):
+        result = await run_slash_command_tool(_make_ctx(), "agents", arguments="extra")
+        assert not result.success
+        assert "Usage: /agents" in result.error
 
 
 # ===========================================================================
@@ -230,16 +335,42 @@ class TestWorkflowsCommand:
 
 
 # ===========================================================================
-# ui_only commands still redirect
+# mcp command
 # ===========================================================================
 
-class TestUiOnlyCommandsUnchanged:
+class TestMcpCommand:
+    _MCP_STATUS = "flocks.mcp.MCP.status"
 
-    @pytest.mark.parametrize("cmd", ["tasks", "queue", "compact", "plan", "ask"])
-    async def test_ui_only_returns_success_with_hint(self, cmd):
-        result = await run_slash_command_tool(_make_ctx(), cmd)
+    async def test_mcp_status_is_available(self):
+        info = MagicMock()
+        info.status.value = "connected"
+        info.tools_count = 3
+        info.resources_count = 1
+        info.error = None
+
+        with patch(self._MCP_STATUS, new_callable=AsyncMock, return_value={"demo": info}):
+            result = await run_slash_command_tool(_make_ctx(), "mcp", arguments="status")
+
         assert result.success
-        assert "UI" in result.output or "in the UI" in result.output
+        assert "MCP Server Status:" in result.output
+        assert "demo" in result.output
+
+    async def test_mcp_refresh_is_not_agent_safe(self):
+        result = await run_slash_command_tool(_make_ctx(), "mcp", arguments="refresh demo")
+        assert not result.success
+        assert "read-only direct variants" in result.error
+
+
+# ===========================================================================
+# disallowed commands
+# ===========================================================================
+
+class TestDisallowedCommands:
+    @pytest.mark.parametrize("cmd", ["tasks", "queue", "compact", "plan", "ask", "init", "bug", "clear"])
+    async def test_non_agent_safe_commands_fail(self, cmd):
+        result = await run_slash_command_tool(_make_ctx(), cmd)
+        assert not result.success
+        assert "Unknown agent-safe slash command" in result.error
 
 
 # ===========================================================================
@@ -252,3 +383,21 @@ class TestHelpCommand:
         result = await run_slash_command_tool(_make_ctx(), "help")
         assert result.success
         assert "workflows" in result.output
+        assert "agents" in result.output
+
+    async def test_help_matches_shared_help_formatter(self):
+        expected = format_help(surface="webui")
+        result = await run_slash_command_tool(_make_ctx(), "help")
+
+        assert result.success
+        assert result.output == expected
+
+    async def test_help_shows_full_webui_help(self):
+        result = await run_slash_command_tool(_make_ctx(), "help")
+        assert result.success
+        assert "Direct commands:" in result.output
+        assert "Other commands (handled through the normal assistant/session flow):" in result.output
+        assert "/clear" in result.output
+        assert "/plan" in result.output
+        assert "/compact" in result.output
+        assert "/model" not in result.output

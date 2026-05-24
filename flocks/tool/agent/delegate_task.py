@@ -27,6 +27,7 @@ from flocks.session.session_loop import SessionLoop
 from flocks.agent.registry import is_delegatable
 from flocks.skill.skill import Skill
 from flocks.config.config import Config
+from flocks.tool.subagent_result import format_sync_subagent_result
 from flocks.utils.log import Log
 
 log = Log.create(service="tool.delegate_task")
@@ -114,7 +115,7 @@ async def _find_completed_delegate(
             for p in parts:
                 if not isinstance(p, ToolPart):
                     continue
-                if p.tool not in ("delegate_task", "call_omo_agent"):
+                if p.tool != "delegate_task":
                     continue
                 state = p.state
                 if getattr(state, "status", None) != "completed":
@@ -146,7 +147,10 @@ async def _resolve_skill_content(skill_names: List[str]) -> Dict[str, Any]:
     missing: List[str] = []
     for name in skill_names:
         skill = await Skill.get(name)
-        if not skill:
+        # Treat disabled skills the same as missing ones — do not reveal to the
+        # LLM that the skill exists but is toggled off, as that would invite it
+        # to retry via a different code path.
+        if not skill or Skill.is_disabled(skill.name):
             missing.append(name)
             continue
         try:
@@ -155,7 +159,9 @@ async def _resolve_skill_content(skill_names: List[str]) -> Dict[str, Any]:
         except Exception as exc:
             return {"content": None, "error": f"Failed to load skill {name}: {exc}"}
     if missing:
-        all_skills = await Skill.all()
+        # Only surface enabled skills to the LLM — listing disabled ones in
+        # an error message would invite the model to retry with them.
+        all_skills = await Skill.list_enabled()
         available = ", ".join(s.name for s in all_skills) or "none"
         return {"content": None, "error": f"Skills not found: {', '.join(missing)}. Available: {available}"}
     return {"content": "\n\n".join(resolved), "error": None}
@@ -184,16 +190,34 @@ def _derive_task_description(
         return f"continue task {session_id}"
     return "delegate task"
 
+# ------------------------------------------------------------------
+# Tool definition
+# ------------------------------------------------------------------
+
+DESCRIPTION = """Spawn agent task with category-based or direct agent selection. "
+
+Use this tool when:
+- The task requires multiple steps or research
+- You need to explore code in parallel
+- The task can be delegated to a specialized agent
+
+Usage notes:
+- Provide a clear description (3-5 words)
+- Provide detailed prompt with context
+- run_in_background=true: returns task_id immediately, collect results later with background_output
+- run_in_background=false: waits for completion and returns results inline
+- Pass session_id to continue a previous agent with full context
+
+REQUIRED: prompt.
+LOAD_SKILLS is optional and defaults to [].
+DESCRIPTION is optional and will be auto-derived when omitted.
+RUN_IN_BACKGROUND defaults to false (sync).
+USE EITHER subagent_type OR category — NEVER both simultaneously.
+"""
+
 @ToolRegistry.register_function(
     name="delegate_task",
-    description=(
-        "Spawn agent task with category-based or direct agent selection. "
-        "REQUIRED: prompt. "
-        "load_skills is optional and defaults to []. "
-        "description is optional and will be auto-derived when omitted. "
-        "run_in_background defaults to false (sync). "
-        "Use EITHER subagent_type OR category — NEVER both simultaneously."
-    ),
+    description=DESCRIPTION,
     category=ToolCategory.SYSTEM,
     parameters=[
         ToolParameter(
@@ -230,7 +254,7 @@ def _derive_task_description(
         ToolParameter(
             name="subagent_type",
             type=ParameterType.STRING,
-            description="Agent name. Mutually exclusive with category — use ONE or the other, never both.",
+            description="Agent name. Mutually exclusive with category — use ONE or the other, never both. Must be a delegatable agent",
             required=False,
         ),
         ToolParameter(
@@ -336,26 +360,13 @@ async def delegate_task_tool(
                 event_publish_callback=ctx.event_publish_callback,
             ),
         )
-        if result.action == "error":
-            error_detail = result.error or "Sub-agent execution failed"
-            log.error("delegate_task.continue_error", {
-                "session_id": session.id,
-                "error": error_detail,
-            })
-            return ToolResult(
-                success=False,
-                error=f"Sub-agent failed: {error_detail}",
-                title=description,
-                metadata={"sessionId": session.id},
-            )
-        output_text = ""
-        if result.last_message:
-            output_text = await Message.get_text_content(result.last_message)
-        output = (
-            f"{output_text}\n\n<task_metadata>\nsession_id: {session.id}\n</task_metadata>"
-        )
         ctx.metadata({"title": f"Continue: {description}", "metadata": {"sessionId": session.id}})
-        return ToolResult(success=True, output=output, title=description, metadata={"sessionId": session.id})
+        return await format_sync_subagent_result(
+            description=description,
+            session_id=session.id,
+            loop_result=result,
+            metadata={"sessionId": session.id},
+        )
 
     if category:
         agent_to_use = "rex-junior"
@@ -462,28 +473,12 @@ async def delegate_task_tool(
             event_publish_callback=ctx.event_publish_callback,
         ),
     )
-
-    if result.action == "error":
-        error_detail = result.error or "Sub-agent execution failed"
-        log.error("delegate_task.subagent_error", {
-            "session_id": created.id,
-            "agent": agent_to_use,
-            "category": category,
-            "error": error_detail,
-        })
-        ctx.metadata({"title": description, "metadata": {**forwarder.final_metadata, "status": "error"}})
-        return ToolResult(
-            success=False,
-            error=f"Sub-agent failed: {error_detail}",
-            title=description,
-            metadata=forwarder.final_metadata,
-        )
-
-    output_text = ""
-    if result.last_message:
-        output_text = await Message.get_text_content(result.last_message)
-    output = (
-        f"{output_text}\n\n<task_metadata>\nsession_id: {created.id}\n</task_metadata>"
+    tool_result = await format_sync_subagent_result(
+        description=description,
+        session_id=created.id,
+        loop_result=result,
+        metadata=forwarder.final_metadata,
     )
-    ctx.metadata({"title": description, "metadata": forwarder.final_metadata})
-    return ToolResult(success=True, output=output, title=description, metadata=forwarder.final_metadata)
+    result_status = "completed" if tool_result.success else "error"
+    ctx.metadata({"title": description, "metadata": {**forwarder.final_metadata, "status": result_status}})
+    return tool_result

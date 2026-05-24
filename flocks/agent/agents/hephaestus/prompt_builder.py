@@ -44,6 +44,7 @@ def build_hephaestus_prompt(
     use_task_system: bool = False,
 ) -> str:
     from flocks.agent.prompt_utils import (
+        build_agent_selection_table,
         build_key_triggers_section,
         build_tool_selection_table,
         build_explore_section,
@@ -56,7 +57,8 @@ def build_hephaestus_prompt(
     )
 
     key_triggers = build_key_triggers_section(available_agents, available_skills)
-    tool_selection = build_tool_selection_table(available_agents, available_tools, available_skills)
+    tool_selection = build_tool_selection_table([], available_tools, available_skills)
+    agent_selection = build_agent_selection_table(available_agents)
     explore_section = build_explore_section(available_agents)
     librarian_section = build_librarian_section(available_agents)
     category_skills_guide = build_category_skills_delegation_guide(available_categories, available_skills)
@@ -94,7 +96,7 @@ __ANTI_PATTERNS__
 
 A task is COMPLETE when ALL of the following are TRUE:
 1. All requested functionality implemented exactly as specified
-2. `lsp_diagnostics` returns zero errors on ALL modified files
+2. Symbol-aware checks using `lsp` pass on modified files when applicable
 3. Build command exits with code 0 (if applicable)
 4. Tests pass (or pre-existing failures documented)
 5. No temporary/debug code remains
@@ -184,6 +186,8 @@ Agent: *runs gh pr list, gh pr view, searches recent commits*
 
 __TOOL_SELECTION__
 
+__AGENT_SELECTION__
+
 __EXPLORE_SECTION__
 
 __LIBRARIAN_SECTION__
@@ -211,7 +215,7 @@ __TODO_DISCIPLINE__
 
 ### Verification
 
-1. `lsp_diagnostics` on changed files.
+1. `lsp` on changed files when symbol-aware checks are useful.
 2. Run related tests if present.
 3. Build commands if applicable.
 
@@ -235,6 +239,7 @@ Before final response:
     prompt = template
     prompt = prompt.replace("__KEY_TRIGGERS__", key_triggers)
     prompt = prompt.replace("__TOOL_SELECTION__", tool_selection)
+    prompt = prompt.replace("__AGENT_SELECTION__", agent_selection)
     prompt = prompt.replace("__EXPLORE_SECTION__", explore_section)
     prompt = prompt.replace("__LIBRARIAN_SECTION__", librarian_section)
     prompt = prompt.replace("__CATEGORY_SKILLS_GUIDE__", category_skills_guide)
@@ -303,6 +308,7 @@ def _todo_discipline_section(use_task_system: bool) -> str:
 2. **Before each step**: Mark `in_progress` (ONE at a time)
 3. **After each step**: Mark `completed` IMMEDIATELY (NEVER batch)
 4. **Scope changes**: Update todos BEFORE proceeding
+5. **Todo payload shape**: `todowrite` must receive structured objects with `id`, `content`, and `status`, never a string array
 
 ### Why This Matters
 

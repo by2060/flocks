@@ -4,8 +4,6 @@
 
 ## 命名约定
 
-生成阶段的文件名通常来自抓包名，例如 `<capture_name>_cli.py`。这个名字适合临时验证，不适合直接沉淀到 skill。
-
 落到 skill 时，统一改成**稳定的产品名**：
 
 - skill 目录：`$HOME/.flocks/plugins/skills/<name>-use/`
@@ -40,7 +38,7 @@ cp "$CAPTURE_ROOT/auth-state.json" \
 
 1. 在 `scripts/config.py` 中把认证状态默认值指向 `~/.flocks/browser/<name>/auth-state.json`
 2. 在 `references/cli-reference.md` 中写清楚 CLI 用法、环境变量和示例
-3. 在 `references/browser-workflow.md` 中写清楚浏览器登录与保存 state 的流程
+3. 在 `references/browser-workflow.md` 中写清楚浏览器登录、保存 state、页面入口、稳定操作方式、等待条件和认证恢复流程
 4. 在 `SKILL.md` 中说明什么时候优先走 CLI，什么时候退回浏览器
 
 推荐的配置写法：
@@ -122,10 +120,32 @@ description: 用于查询 Test 测试平台数据，支持通过 CLI 快速查�
 - `SKILL.md`：定义触发条件、模式判断、总入口说明
 - `scripts/<name>_cli.py`：承载生成并整理后的 CLI 能力
 - `scripts/config.py`：集中管理 `BASE_URL`、`AUTH_STATE_FILE`、超时、SSL 等默认配置
-- `references/browser-workflow.md`：写浏览器登录、保存 state、认证恢复流程
+- `references/browser-workflow.md`：统一写浏览器登录、保存 state、页面入口、具体操作经验、等待条件与认证恢复流程
 - `references/cli-reference.md`：写 CLI 参数、命令示例、常见查询
 
 新 skill 的原则也一样：先把生成的 CLI 改成稳定文件名，再把临时 `auth-state.json` 切换到全局默认位置 `~/.flocks/browser/<name>/auth-state.json`。
+
+## `browser-workflow.md` 写作指南
+
+`references/browser-workflow.md` 是产品 skill 里统一承载浏览器经验的单文件。凡是已经验证、后续还会复用的浏览器操作经验，都应该优先沉淀到这里，而不是散落在临时对话里。
+
+推荐写入以下内容：
+
+- 固定的登录入口、首页、详情页、导出页 URL
+- 已确认某产品的稳定登录的方法
+- 认证失效识别与恢复步骤
+- 已验证表格、筛选器、分页、弹窗、下载、上传、详情展开等操作的稳定路径
+- 已验证某站点特有的等待条件、重渲染行为、虚拟列表、iframe 或 SPA 交互特征
+- 默认 state 路径，例如 `~/.flocks/browser/<name>/auth-state.json`
+- CLI 与浏览器的分工边界，例如“列表查询优先 CLI，详情预览/导出/人工登录走浏览器”
+- 特定操作的成功经验，失败案例（特定操作失败 2 次以上，最终成功的经验）
+- web2cli 过程中的踩坑、注意事项
+
+不要写入：
+
+- cookie、token、密码、短信码、TOTP 等敏感信息
+- 一次性的 `@eN` ref、临时 tab id、临时 selector、像素坐标
+- 本次任务的操作流水账
 
 ## 认证失败怎么处理
 

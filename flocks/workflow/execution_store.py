@@ -2,13 +2,184 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 import uuid
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 from flocks.session.recorder import Recorder
 from flocks.storage.storage import Storage
+from flocks.utils.log import Log
 from flocks.workflow.runner import RunWorkflowResult
+
+log = Log.create(service="workflow.execution_store")
+
+# Keys whose values are expected to be large alert/event lists that have
+# already been persisted elsewhere (typically JSONL on disk).  When writing
+# the execution record to SQLite we replace them with a ``_<key>_count``
+# integer to keep row sizes bounded.  Callers may extend or override this
+# set via the ``keys`` argument of the compact helpers below.
+DEFAULT_LARGE_LIST_KEYS: frozenset[str] = frozenset(
+    {
+        "enriched_alerts",
+        "unique_alerts",
+        "raw_alerts",
+        "normalized_alerts",
+        "filtered_alerts",
+    }
+)
+
+# Lists smaller than this many items are passed through verbatim.  The cap
+# protects against accidentally stripping small metadata lists that happen
+# to share a name with a known large-list key.
+DEFAULT_COMPACT_SIZE_THRESHOLD: int = 100
+
+
+def compact_outputs_for_storage(
+    outputs: Any,
+    *,
+    keys: Iterable[str] = DEFAULT_LARGE_LIST_KEYS,
+    size_threshold: int = DEFAULT_COMPACT_SIZE_THRESHOLD,
+) -> Dict[str, Any]:
+    """Return a copy of *outputs* with large alert lists replaced by counts.
+
+    Only **list or tuple** values whose key is in *keys* AND whose length
+    exceeds *size_threshold* are compacted to ``_<key>_count``; everything
+    else is passed through unchanged.  This prevents megabytes of alert data
+    from being serialised into the ``workflow_execution`` SQLite row on every
+    invocation, while still keeping small sequences (e.g. error details, short
+    configuration arrays) fully inspectable in the execution-history UI.
+
+    **Keys that are compacted by default** (see ``DEFAULT_LARGE_LIST_KEYS``):
+    ``enriched_alerts``, ``unique_alerts``, ``raw_alerts``,
+    ``normalized_alerts``, ``filtered_alerts``.  Keys outside this set — such
+    as a generic ``alerts`` parameter — are *not* compacted unless the caller
+    passes a custom *keys* argument.  Callers who depend on inspecting the
+    full list contents of compacted keys must read the data from the JSONL
+    files written by the workflow itself.
+    """
+    if not isinstance(outputs, dict):
+        return {}
+    key_set = frozenset(keys)
+    compacted: Dict[str, Any] = {}
+    for k, v in outputs.items():
+        if (
+            k in key_set
+            and isinstance(v, (list, tuple))
+            and len(v) > size_threshold
+        ):
+            compacted[f"_{k}_count"] = len(v)
+        else:
+            compacted[k] = v
+    return compacted
+
+
+def compact_step_for_storage(
+    step: Any,
+    *,
+    keys: Iterable[str] = DEFAULT_LARGE_LIST_KEYS,
+    size_threshold: int = DEFAULT_COMPACT_SIZE_THRESHOLD,
+) -> Any:
+    """Return a copy of one history step with large ``inputs``/``outputs`` compacted."""
+    if not isinstance(step, dict):
+        return step
+    step_copy = dict(step)
+    for field in ("inputs", "outputs"):
+        raw_value = step_copy.get(field)
+        if isinstance(raw_value, dict):
+            step_copy[field] = compact_outputs_for_storage(
+                raw_value, keys=keys, size_threshold=size_threshold
+            )
+    return step_copy
+
+
+def compact_history_for_storage(
+    history: Any,
+    *,
+    keys: Iterable[str] = DEFAULT_LARGE_LIST_KEYS,
+    size_threshold: int = DEFAULT_COMPACT_SIZE_THRESHOLD,
+) -> List[Any]:
+    """Strip large alert lists from step inputs/outputs in workflow history.
+
+    Returns an empty list when *history* is falsy.  Non-dict step entries
+    (defensive: shouldn't happen with normal ``StepResult`` dumps) are
+    passed through unchanged so the caller sees no surprising drops.
+    """
+    if not history:
+        return []
+    return [
+        compact_step_for_storage(step, keys=keys, size_threshold=size_threshold)
+        for step in history
+    ]
+
+# Maximum number of execution history records retained per workflow.
+# Keep this intentionally small so high-frequency workflows do not keep
+# inflating the SQLite row set and matching JSONL audit files indefinitely.
+_MAX_EXECUTION_HISTORY_PER_WORKFLOW = 30
+# Trim is an O(N) scan over all workflow_execution rows; only run it every Nth
+# call per workflow to amortise the cost under high syslog throughput.
+_TRIM_CHECK_INTERVAL = 5
+_trim_counters: Dict[str, int] = {}
+
+# Per-workflow lock to serialize read-modify-write of stats. Concurrent
+# executions of the same workflow (e.g. syslog-triggered runs with
+# semaphore=8) would otherwise race on ``Storage.read → mutate → write``
+# and silently lose counter increments.
+_stats_locks: Dict[str, asyncio.Lock] = {}
+
+
+def _get_stats_lock(workflow_id: str) -> asyncio.Lock:
+    lock = _stats_locks.get(workflow_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _stats_locks[workflow_id] = lock
+    return lock
+
+
+def _workflow_stats_key(workflow_id: str) -> str:
+    return f"workflow/{workflow_id}/stats"
+
+
+_DEFAULT_STATS: Dict[str, Any] = {
+    "callCount": 0,
+    "successCount": 0,
+    "errorCount": 0,
+    "totalRuntime": 0.0,
+    "avgRuntime": 0.0,
+    "thumbsUp": 0,
+    "thumbsDown": 0,
+}
+
+
+async def _update_workflow_stats(workflow_id: str, success: bool, duration: float) -> None:
+    """Increment workflow call/success/error counters and update avgRuntime.
+
+    Serialised per workflow to keep concurrent updates from clobbering each
+    other (read → mutate → write race).
+    """
+    lock = _get_stats_lock(workflow_id)
+    async with lock:
+        try:
+            key = _workflow_stats_key(workflow_id)
+            try:
+                stats: Dict[str, Any] = await Storage.read(key) or dict(_DEFAULT_STATS)
+            except Exception:
+                stats = dict(_DEFAULT_STATS)
+            stats["callCount"] = stats.get("callCount", 0) + 1
+            if success:
+                stats["successCount"] = stats.get("successCount", 0) + 1
+            else:
+                stats["errorCount"] = stats.get("errorCount", 0) + 1
+            total = stats.get("totalRuntime", 0.0) + duration
+            stats["totalRuntime"] = total
+            call_count = stats["callCount"]
+            stats["avgRuntime"] = (total / call_count) if call_count > 0 else 0.0
+            await Storage.write(key, stats)
+        except Exception as exc:
+            log.warning("workflow.stats.update_failed", {
+                "workflow_id": workflow_id,
+                "error": str(exc),
+            })
 
 
 def workflow_execution_key(exec_id: str) -> str:
@@ -83,10 +254,19 @@ async def create_execution_record(
     input_params: Optional[Dict[str, Any]] = None,
     exec_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Create and persist a running workflow execution record."""
+    """Create and persist a running workflow execution record.
+
+    *input_params* is passed through ``compact_outputs_for_storage`` before
+    writing to SQLite so that batch HTTP calls whose inputs contain a key in
+    ``DEFAULT_LARGE_LIST_KEYS`` (e.g. ``{"raw_alerts": [...10k items...]}``
+    ) don't bloat the row.  Keys outside the default set — such as a generic
+    ``alerts`` parameter — are stored verbatim; pass a custom *keys* argument
+    to ``compact_outputs_for_storage`` directly if you need broader coverage.
+    """
+    compacted_params = compact_outputs_for_storage(input_params or {})
     exec_data = build_initial_execution_record(
         workflow_id,
-        input_params=input_params,
+        input_params=compacted_params,
         exec_id=exec_id,
     )
     await Storage.write(workflow_execution_key(exec_data["id"]), exec_data)
@@ -98,13 +278,87 @@ async def record_execution_result(
     exec_id: str,
     exec_data: Dict[str, Any],
 ) -> None:
-    """Persist the final execution record and audit trail."""
+    """Persist the final execution record, audit trail, and workflow stats."""
     await Storage.write(workflow_execution_key(exec_id), exec_data)
+
+    # Update call/success/error counters so all trigger paths (HTTP, syslog, etc.)
+    # are reflected in the UI stats panel.
+    status = exec_data.get("status", "error")
+    success = status == "success"
+    duration = exec_data.get("duration")
+    if not isinstance(duration, (int, float)):
+        started_at = exec_data.get("startedAt", 0)
+        finished_at = exec_data.get("finishedAt", int(time.time() * 1000))
+        duration = max(0.0, (finished_at - started_at) / 1000.0)
+    await _update_workflow_stats(workflow_id, success, float(duration))
+
+    # Recorder writes to its own SQLite tables and can be slow under load.
+    # Run it as a background task so the syslog/HTTP dispatcher can release the
+    # concurrency slot immediately instead of waiting on session-history I/O.
     try:
-        await Recorder.record_workflow_execution(
-            exec_id=exec_id,
-            workflow_id=workflow_id,
-            run_result=exec_data,
-        )
+        async def _record_audit() -> None:
+            try:
+                await Recorder.record_workflow_execution(
+                    exec_id=exec_id,
+                    workflow_id=workflow_id,
+                    run_result=exec_data,
+                )
+            except Exception as exc:
+                log.debug("workflow.audit.record_failed", {
+                    "exec_id": exec_id,
+                    "error": str(exc),
+                })
+
+        asyncio.create_task(_record_audit(), name=f"audit-{exec_id}")
+    except RuntimeError:
+        # No running loop (e.g. unit tests) — best-effort sync fallback.
+        try:
+            await Recorder.record_workflow_execution(
+                exec_id=exec_id,
+                workflow_id=workflow_id,
+                run_result=exec_data,
+            )
+        except Exception:
+            pass
+
+    # Prune old execution records when the per-workflow limit is exceeded.
+    # Throttled by a per-workflow counter to amortise the O(N) storage scan.
+    try:
+        counter = _trim_counters.get(workflow_id, 0) + 1
+        _trim_counters[workflow_id] = counter
+        if counter >= _TRIM_CHECK_INTERVAL:
+            _trim_counters[workflow_id] = 0
+            # Run trim in the background as well; it scans all execution rows
+            # and we don't want to delay the caller.
+            try:
+                asyncio.create_task(
+                    _trim_execution_history(workflow_id),
+                    name=f"trim-{workflow_id}",
+                )
+            except RuntimeError:
+                await _trim_execution_history(workflow_id)
     except Exception:
         pass
+
+
+async def _trim_execution_history(workflow_id: str) -> None:
+    """Delete the oldest execution records once the per-workflow cap is exceeded."""
+    all_entries = await Storage.list_entries("workflow_execution/")
+    wf_entries = [
+        (key, data)
+        for key, data in all_entries
+        if isinstance(data, dict) and data.get("workflowId") == workflow_id
+    ]
+    if len(wf_entries) <= _MAX_EXECUTION_HISTORY_PER_WORKFLOW:
+        return
+    # Sort ascending by startedAt and remove the oldest excess records
+    wf_entries.sort(key=lambda kd: kd[1].get("startedAt", 0))
+    excess = len(wf_entries) - _MAX_EXECUTION_HISTORY_PER_WORKFLOW
+    for key, _ in wf_entries[:excess]:
+        try:
+            exec_id = key.rsplit("/", 1)[-1]
+            await Storage.remove(key)
+            record_path = Recorder.paths().workflow_dir / f"{exec_id}.jsonl"
+            await asyncio.to_thread(record_path.unlink, missing_ok=True)
+        except Exception:
+            pass

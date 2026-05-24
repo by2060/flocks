@@ -12,15 +12,9 @@ tools:
   - bash
   - grep
   - glob
-  - list
   - webfetch
   - websearch
-  - codesearch
-  - lsp_diagnostics
-  - lsp_find_references
-  - lsp_hover
-  - lsp_goto_definition
-  - ast_grep_search
+  - lsp
 prompt_metadata:
   category: exploration
   cost: CHEAP

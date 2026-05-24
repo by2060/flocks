@@ -90,22 +90,30 @@ class TestDelegateTaskTolerance:
         }
         assert launch_input.model_pinned is False
 
-
-class TestBatchCompatibility:
-    def test_batch_schema_allows_legacy_commands_alias(self):
-        schema = ToolRegistry.get_schema("batch")
-        assert schema is not None
-        assert "tool_calls" not in schema.required
-        assert "commands" in schema.properties
-
     @pytest.mark.asyncio
-    async def test_batch_accepts_legacy_commands_args(self):
-        result = await ToolRegistry.execute(
-            "batch",
-            ctx=_make_ctx(),
-            commands=[{"tool": "echo", "args": {"message": "hello"}}],
+    async def test_delegate_task_sync_continue_fails_when_last_message_missing(self):
+        session = SimpleNamespace(
+            id="ses-child",
+            agent="asset-survey",
         )
 
+        with patch("flocks.tool.agent.delegate_task.Config.get", AsyncMock(return_value=SimpleNamespace(categories=None))), \
+             patch("flocks.tool.agent.delegate_task.Session.get_by_id", AsyncMock(return_value=session)), \
+             patch("flocks.tool.agent.delegate_task.Message.create", AsyncMock()), \
+             patch("flocks.tool.agent.delegate_task.SessionLoop.run", AsyncMock(return_value=SimpleNamespace(
+                 action="stop",
+                 error=None,
+                 last_message=None,
+             ))):
+            result = await ToolRegistry.execute(
+                "delegate_task",
+                ctx=_make_ctx(),
+                session_id="ses-child",
+                prompt="Continue investigating",
+            )
+
         assert result.success is True
-        assert result.metadata["tools"] == ["echo"]
-        assert result.metadata["successful"] == 1
+        assert result.metadata["sessionId"] == "ses-child"
+        assert result.metadata["emptyOutput"] is True
+        assert "without producing a final assistant message" in (result.output or "")
+

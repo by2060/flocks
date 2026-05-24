@@ -1342,7 +1342,6 @@ export type PermissionConfig =
       edit?: PermissionRuleConfig
       glob?: PermissionRuleConfig
       grep?: PermissionRuleConfig
-      list?: PermissionRuleConfig
       bash?: PermissionRuleConfig
       task?: PermissionRuleConfig
       external_directory?: PermissionRuleConfig
@@ -1351,7 +1350,6 @@ export type PermissionConfig =
       question?: PermissionActionConfig
       webfetch?: PermissionActionConfig
       websearch?: PermissionActionConfig
-      codesearch?: PermissionActionConfig
       lsp?: PermissionRuleConfig
       doom_loop?: PermissionActionConfig
       [key: string]: PermissionRuleConfig | Array<string> | PermissionActionConfig | undefined
@@ -1780,10 +1778,6 @@ export type Config = {
      */
     chatMaxRetries?: number
     disable_paste_summary?: boolean
-    /**
-     * Enable the batch tool
-     */
-    batch_tool?: boolean
     /**
      * Enable OpenTelemetry spans for AI SDK calls (using the 'experimental_telemetry' flag)
      */

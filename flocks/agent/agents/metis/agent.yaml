@@ -11,15 +11,9 @@ tools:
   - bash
   - grep
   - glob
-  - list
   - webfetch
   - websearch
-  - codesearch
-  - lsp_diagnostics
-  - lsp_find_references
-  - lsp_hover
-  - lsp_goto_definition
-  - ast_grep_search
+  - lsp
   - question
   - memory_search
 prompt_metadata:

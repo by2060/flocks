@@ -139,6 +139,66 @@ def _build_available_agents(agents: Dict[str, AgentInfo]) -> List[AvailableAgent
     return available
 
 
+def _sort_available_agents(agents: List[AvailableAgent]) -> List[AvailableAgent]:
+    return sorted(agents, key=lambda agent: agent.name.lower())
+
+
+def _storage_custom_agent_to_info(agent_data: Dict[str, Any]) -> Optional[AgentInfo]:
+    """Convert a Storage-backed custom agent record into AgentInfo."""
+    name = agent_data.get("name")
+    if not name:
+        return None
+
+    model_raw = agent_data.get("model")
+    model: Optional[AgentModel] = None
+    if isinstance(model_raw, dict):
+        model_id = model_raw.get("model_id") or model_raw.get("modelID")
+        provider_id = model_raw.get("provider_id") or model_raw.get("providerID")
+        if model_id and provider_id:
+            model = AgentModel(model_id=model_id, provider_id=provider_id)
+
+    return AgentInfo(
+        name=name,
+        description=agent_data.get("description"),
+        description_cn=agent_data.get("description_cn") or agent_data.get("descriptionCn"),
+        prompt=agent_data.get("prompt"),
+        temperature=agent_data.get("temperature"),
+        color=agent_data.get("color"),
+        mode=agent_data.get("mode", "primary"),
+        model=model,
+        native=False,
+        hidden=agent_data.get("hidden", False),
+        tools=agent_data.get("tools", []),
+        tags=agent_data.get("tags", []),
+    )
+
+
+async def _load_storage_custom_agents(existing_names: Set[str]) -> Dict[str, AgentInfo]:
+    """Load Storage-backed custom agents created by POST /api/agent."""
+    try:
+        from flocks.storage.storage import Storage
+        entries = await Storage.list_entries("agent/custom/")
+    except Exception as exc:
+        log.warn("agent.registry.storage_custom_load_error", {"error": str(exc)})
+        return {}
+
+    loaded: Dict[str, AgentInfo] = {}
+    for key, agent_data in entries:
+        if not isinstance(agent_data, dict) or not agent_data.get("name"):
+            continue
+        agent = _storage_custom_agent_to_info(agent_data)
+        if agent is None:
+            continue
+        if agent.name in existing_names or agent.name in loaded:
+            log.warn("agent.registry.storage_custom_name_conflict", {
+                "name": agent.name,
+                "key": key,
+            })
+            continue
+        loaded[agent.name] = agent
+    return loaded
+
+
 # ---------------------------------------------------------------------------
 # Agent registry
 # ---------------------------------------------------------------------------
@@ -186,7 +246,9 @@ class Agent:
         # ── ① Collect context ─────────────────────────────────────────────
         available_tools = [t.name for t in ToolRegistry.list_tools() if t.enabled]
         categorized_tools = categorize_tools(available_tools)
-        skills = await Skill.all()
+        # Use list_enabled() so user-disabled skills are excluded from the
+        # agent's system prompt context.  All() would include them.
+        skills = await Skill.list_enabled()
         available_skills = [
             AvailableSkill(name=s.name, description=s.description, location=s.source or "project")
             for s in skills
@@ -339,6 +401,9 @@ class Agent:
                     if isinstance(value.permission, dict):
                         item.tools = _permission_dict_to_tools(value.permission)
 
+        storage_custom_agents = await _load_storage_custom_agents(set(result.keys()))
+        result.update(storage_custom_agents)
+
         # enabled_agents whitelist filter
         if cfg.enabled_agents is not None:
             allowed = set(cfg.enabled_agents)
@@ -370,8 +435,43 @@ class Agent:
 
     _state_accessor = Instance.state(_create_task)
 
+    # Last observed mtime of skill_settings.json — used by each worker process
+    # to detect changes made by other workers.  Stored as a class variable so it
+    # persists across async calls in the same process.
+    _skill_settings_mtime: float = 0.0
+
+    @classmethod
+    def _sync_skill_settings_cache(cls) -> None:
+        """Invalidate in-process agent cache when skill settings change on disk.
+
+        ``PATCH /api/skills/{name}/toggle`` writes ``skill_settings.json`` and
+        then calls ``Agent.invalidate_cache()``, which only clears the cache for
+        the *current* uvicorn worker.  Other workers never receive the signal and
+        keep serving stale agent prompts that still include the now-disabled skill.
+
+        Each worker independently calls this method at the start of
+        :meth:`state`.  If the file's mtime is newer than what this worker last
+        saw, the local cache is dropped so the next :meth:`state` call rebuilds
+        the agent prompts from the current (post-toggle) skill list.
+        """
+        try:
+            sentinel = Skill.settings_path()
+            if not sentinel.exists():
+                return
+            current_mtime = sentinel.stat().st_mtime
+            if current_mtime > cls._skill_settings_mtime:
+                # Another worker (or the current one) updated the settings file.
+                # Record the new mtime first to avoid a redundant invalidation on
+                # the very next call in the same worker.
+                cls._skill_settings_mtime = current_mtime
+                cls._state_accessor.invalidate()  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
     @staticmethod
     async def state() -> Dict[str, AgentInfo]:
+        # Detect cross-worker skill-settings changes before serving cached state.
+        Agent._sync_skill_settings_cache()
         return await Agent._state_accessor()
 
     @classmethod
@@ -410,6 +510,11 @@ class Agent:
             return (not is_default, a.name)
 
         return sorted(agents.values(), key=sort_key)
+
+    @classmethod
+    async def list_available_agents(cls) -> List[AvailableAgent]:
+        agents = await cls.state()
+        return _sort_available_agents(_build_available_agents(agents))
 
     @classmethod
     async def default_agent(cls) -> str:
@@ -579,6 +684,27 @@ class Agent:
 # ---------------------------------------------------------------------------
 
 
+def _agent_event_should_reload(event: object) -> bool:
+    """Return True if a watchdog event should invalidate the agent cache.
+
+    Mirrors ``flocks.tool.registry._tool_event_should_reload``: atomic-save
+    editors surface the real target via ``dest_path``, so we inspect both
+    endpoints before deciding to skip.
+    """
+    candidates = []
+    src = getattr(event, "src_path", "") or ""
+    if src:
+        candidates.append(src)
+    dest = getattr(event, "dest_path", "") or ""
+    if dest:
+        candidates.append(dest)
+    for path in candidates:
+        fname = os.path.basename(path)
+        if fname == "agent.yaml" or path.endswith(".md"):
+            return True
+    return False
+
+
 class AgentFileWatcher:
     """Watch plugin agent directories and auto-invalidate the Agent cache on change.
 
@@ -621,13 +747,20 @@ class AgentFileWatcher:
 
         watcher = self
 
+        # Only react to actual content-mutation events.  Without this guard the
+        # ``opened``/``closed``/``closed_no_write`` events that watchdog emits
+        # whenever any code (including the agent loader itself) reads
+        # ``agent.yaml`` / ``*.md`` would re-trigger cache invalidation on every
+        # access, causing a self-sustaining reload loop.
+        _RELOAD_EVENT_TYPES = frozenset({"modified", "created", "deleted", "moved"})
+
         class _Handler(FileSystemEventHandler):
             def on_any_event(self, event: FileSystemEvent) -> None:
                 if event.is_directory:
                     return
-                src = getattr(event, "src_path", "") or ""
-                fname = os.path.basename(src)
-                if fname == "agent.yaml" or src.endswith(".md"):
+                if getattr(event, "event_type", "") not in _RELOAD_EVENT_TYPES:
+                    return
+                if _agent_event_should_reload(event):
                     watcher._schedule_invalidate()
 
         handler = _Handler()
