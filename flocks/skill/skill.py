@@ -6,6 +6,7 @@ access to skill information. Mirrors original Flocks Skill namespace.
 """
 
 import json
+import asyncio
 import os
 import glob
 import re
@@ -154,6 +155,8 @@ class SkillMetadata(BaseModel):
     os: Optional[List[str]] = None
     homepage: Optional[str] = None
     emoji: Optional[str] = None
+    ui_hidden: Optional[bool] = None
+    managed_by: Optional[str] = None
 
 
 class SkillInfo(BaseModel):
@@ -163,6 +166,7 @@ class SkillInfo(BaseModel):
     location: str = Field(..., description="Path to SKILL.md file")
     source: Optional[str] = Field(default=None, description="Discovery source")
     category: Optional[str] = Field(default=None, description="Skill category (e.g. 'system')")
+    ui_hidden: bool = Field(default=False, description="Whether the skill should be omitted from skill management UI")
     native: bool = Field(default=False, description=(
         "True only for project-installed skills (<cwd>/.flocks/plugins/skills/). "
         "All other locations (.flocks/skills/, ~/.flocks/plugins/skills/, .claude/) "
@@ -195,13 +199,74 @@ class Skill:
     Skill discovery and management.
 
     Discovers SKILL.md files from (lowest → highest priority):
-    - .flocks dirs   (global + project-level)
-    - .claude dirs     (global ~/.claude + project-level)
-    - ~/.flocks        (global user-level)
-    - <project>/.flocks (project-level, wins on collision)
+    - .claude dirs
+    - global built-in and project-bundled .flocks dirs
+    - ~/.flocks/plugins (user-level customizations, wins on collision)
     """
 
     _cache: Optional[Dict[str, SkillInfo]] = None
+    _cache_key: Optional[tuple[str, str]] = None
+    _cache_lock = threading.Lock()
+    _cache_generation = 0
+    _cache_loads: Dict[tuple[int, tuple[str, str]], threading.Event] = {}
+
+    @staticmethod
+    def _source_root() -> Path:
+        """Return the Flocks source installation root."""
+        return Path(__file__).resolve().parents[2]
+
+    @staticmethod
+    def _cache_context() -> tuple[str, str]:
+        """Return the normalized request context that scopes discovery."""
+        current_dir = Instance.get_directory() or os.getcwd()
+        worktree = Instance.get_worktree() or current_dir
+        return (
+            os.path.normcase(os.path.realpath(current_dir)),
+            os.path.normcase(os.path.realpath(worktree)),
+        )
+
+    @classmethod
+    def _all_sync(cls) -> List[SkillInfo]:
+        """Discover skills once per request context and cache generation."""
+        context_key = cls._cache_context()
+        while True:
+            with cls._cache_lock:
+                if cls._cache is not None and cls._cache_key == context_key:
+                    return list(cls._cache.values())
+                generation = cls._cache_generation
+                load_key = (generation, context_key)
+                completion = cls._cache_loads.get(load_key)
+                should_discover = completion is None
+                if completion is None:
+                    completion = threading.Event()
+                    cls._cache_loads[load_key] = completion
+
+            if not should_discover:
+                completion.wait()
+                continue
+
+            try:
+                discovered = cls._discover()
+            except BaseException:
+                with cls._cache_lock:
+                    cls._cache_loads.pop(load_key, None)
+                    completion.set()
+                raise
+
+            with cls._cache_lock:
+                if generation == cls._cache_generation:
+                    cls._cache = discovered
+                    cls._cache_key = context_key
+                cls._cache_loads.pop(load_key, None)
+                completion.set()
+                if (
+                    generation == cls._cache_generation
+                    and cls._cache is not None
+                    and cls._cache_key == context_key
+                ):
+                    return list(cls._cache.values())
+            # The cache was invalidated while discovery was running. Repeat
+            # against the new generation instead of publishing stale data.
 
     @classmethod
     def _parse_skill_md(cls, filepath: str, source: Optional[str] = None) -> Optional[SkillInfo]:
@@ -225,23 +290,39 @@ class Skill:
             name = (data.get("name") or "").strip()
             description = (data.get("description") or "").strip()
             category = (data.get("category") or "").strip().lower() or None
+            ui_hidden = cls._as_bool(data.get("ui_hidden"))
 
             if not cls._is_valid_name(name) or not cls._is_valid_description(description):
                 return None
 
-            # Parse extended metadata — try metadata.flocks first, then metadata.openclaw
+            # Parse extended metadata. Dependency fields remain compatible
+            # with metadata.flocks and metadata.openclaw, while ownership is
+            # declared directly as metadata.managed_by.
             skill_metadata: Optional[SkillMetadata] = None
             install_specs: Optional[List[SkillInstallSpec]] = None
             requires: Optional[SkillRequires] = None
 
             raw_meta = data.get("metadata")
             if isinstance(raw_meta, dict):
-                raw_flocks = raw_meta.get("flocks") or raw_meta.get("openclaw")
-                if isinstance(raw_flocks, dict):
+                nested_meta = (
+                    raw_meta.get("flocks")
+                    or raw_meta.get("openclaw")
+                )
+                parsed_meta = (
+                    dict(nested_meta)
+                    if isinstance(nested_meta, dict)
+                    else {}
+                )
+                if "managed_by" in raw_meta:
+                    parsed_meta["managed_by"] = raw_meta["managed_by"]
+                if parsed_meta:
                     try:
-                        skill_metadata = SkillMetadata.model_validate(raw_flocks)
+                        skill_metadata = SkillMetadata.model_validate(
+                            parsed_meta
+                        )
                         install_specs = skill_metadata.install or None
                         requires = skill_metadata.requires or None
+                        ui_hidden = ui_hidden or bool(skill_metadata.ui_hidden)
                     except Exception as exc:
                         log.warn("skill.metadata.parse.error", {
                             "filepath": filepath,
@@ -258,6 +339,7 @@ class Skill:
                 location=filepath,
                 source=source,
                 category=category,
+                ui_hidden=ui_hidden,
                 native=is_native,
                 metadata=skill_metadata,
                 install_specs=install_specs,
@@ -312,6 +394,14 @@ class Skill:
     def _is_valid_description(description: str) -> bool:
         return 1 <= len(description) <= 1024
 
+    @staticmethod
+    def _as_bool(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
+
     @classmethod
     def _scan_directory(
         cls,
@@ -339,11 +429,21 @@ class Skill:
                 skill_info = cls._parse_skill_md(match, source=source)
                 if skill_info:
                     if skill_info.name in skills:
-                        log.warn("skill.duplicate", {
-                            "name": skill_info.name,
-                            "existing": skills[skill_info.name].location,
-                            "duplicate": match,
-                        })
+                        existing = skills[skill_info.name]
+                        if existing.source != skill_info.source:
+                            log.info("skill.override", {
+                                "name": skill_info.name,
+                                "selected": match,
+                                "selected_source": skill_info.source,
+                                "replaced": existing.location,
+                                "replaced_source": existing.source,
+                            })
+                        else:
+                            log.warn("skill.duplicate", {
+                                "name": skill_info.name,
+                                "existing": existing.location,
+                                "duplicate": match,
+                            })
 
                     skills[skill_info.name] = skill_info
                     log.debug("skill.found", {
@@ -364,8 +464,10 @@ class Skill:
 
         Scan order (lowest → highest priority):
           1. .claude dirs       (global ~/.claude + project-level)
-          2. ~/.flocks          (global user-level, overrides .claude)
-          3. <project>/.flocks  (project-level, highest priority)
+          2. ~/.flocks/skill[s] (global built-ins)
+          3. <source>/.flocks   (bundled with the Flocks installation)
+          4. <project>/.flocks  (project-level)
+          5. ~/.flocks/plugins  (user customizations)
 
         Source labels:
           "flocks"   — built-in skills inside .flocks/skills/ directories
@@ -389,6 +491,7 @@ class Skill:
             "plugins/skills/**/SKILL.md",
         )
         global_flocks = os.path.join(home_dir, ".flocks")
+        source_flocks = str(cls._source_root() / ".flocks")
 
         # 1) .claude directories — lowest priority
         global_claude = os.path.join(home_dir, ".claude")
@@ -397,23 +500,37 @@ class Skill:
         for claude_dir in cls._find_dirs_up(".claude", current_dir, worktree):
             cls._scan_directory(claude_dir, "skills/**/SKILL.md", skills, source="claude")
 
-        # 2) Global ~/.flocks — overrides .claude
-        #    Built-in skills: source="flocks"; user-installed plugins: source="user"
+        # 2) Global built-in skills — overrides .claude
         if os.path.isdir(global_flocks):
             for pattern in builtin_patterns:
                 cls._scan_directory(global_flocks, pattern, skills, source="flocks")
-            for pattern in plugin_patterns:
-                cls._scan_directory(global_flocks, pattern, skills, source="user")
 
-        # 3) Project-level .flocks — highest priority
+        # 3) Source installation .flocks — available regardless of request cwd.
+        #    Keep plugin skills labelled "project" for the current Skill UI's
+        #    built-in/custom classification.
+        if os.path.normpath(source_flocks) != os.path.normpath(global_flocks):
+            for pattern in builtin_patterns:
+                cls._scan_directory(source_flocks, pattern, skills, source="flocks")
+            for pattern in plugin_patterns:
+                cls._scan_directory(source_flocks, pattern, skills, source="project")
+
+        # 4) Project-level .flocks — highest priority
         #    Built-in skills: source="flocks"; project-installed plugins: source="project"
         for flocks_dir in cls._find_dirs_up(".flocks", current_dir, worktree):
-            if os.path.normpath(flocks_dir) == os.path.normpath(global_flocks):
+            if os.path.normpath(flocks_dir) in {
+                os.path.normpath(global_flocks),
+                os.path.normpath(source_flocks),
+            }:
                 continue
             for pattern in builtin_patterns:
                 cls._scan_directory(flocks_dir, pattern, skills, source="flocks")
             for pattern in plugin_patterns:
                 cls._scan_directory(flocks_dir, pattern, skills, source="project")
+
+        # 5) User-installed plugins — explicit customizations win over project bundles
+        if os.path.isdir(global_flocks):
+            for pattern in plugin_patterns:
+                cls._scan_directory(global_flocks, pattern, skills, source="user")
 
         log.info("skill.discovery.complete", {"count": len(skills), "names": list(skills.keys())})
         return skills
@@ -447,10 +564,7 @@ class Skill:
         Returns:
             List of all discovered skills
         """
-        if cls._cache is None:
-            cls._cache = cls._discover()
-
-        return list(cls._cache.values())
+        return await asyncio.to_thread(cls._all_sync)
 
     @classmethod
     async def list_enabled(cls) -> List[SkillInfo]:
@@ -482,10 +596,8 @@ class Skill:
         Returns:
             SkillInfo or None if not found
         """
-        if cls._cache is None:
-            cls._cache = cls._discover()
-
-        skill = cls._cache.get(name)
+        skills = await cls.all()
+        skill = next((item for item in skills if item.name == name), None)
         if not skill:
             return None
         return skill
@@ -493,7 +605,10 @@ class Skill:
     @classmethod
     def clear_cache(cls) -> None:
         """Clear the skill cache (for testing or forced refresh)"""
-        cls._cache = None
+        with cls._cache_lock:
+            cls._cache = None
+            cls._cache_key = None
+            cls._cache_generation += 1
         log.info("skill.cache.cleared")
 
     @classmethod
@@ -732,6 +847,13 @@ class SkillFileWatcher:
     """
 
     _DEBOUNCE_SECONDS = 0.5
+    _FLOCKS_SKILL_DIRS = (
+        "skill",
+        "skills",
+        os.path.join("plugins", "skill"),
+        os.path.join("plugins", "skills"),
+    )
+    _CLAUDE_SKILL_DIRS = ("skills",)
 
     def __init__(self, skill_cls: type):
         self._skill_cls = skill_cls
@@ -818,7 +940,7 @@ class SkillFileWatcher:
         log.info("skill.watcher.cache_cleared", {"reason": "SKILL.md changed on disk"})
 
     def _collect_watch_dirs(self) -> Set[str]:
-        """Gather all directories that may contain skill files."""
+        """Gather concrete skill roots that may contain SKILL.md files."""
         dirs: Set[str] = set()
         home = os.path.expanduser("~")
 
@@ -831,11 +953,28 @@ class SkillFileWatcher:
         except Exception:
             worktree = current_dir
 
-        for target in (".flocks", ".claude"):
-            for d in Skill._find_dirs_up(target, current_dir, worktree):
-                dirs.add(d)
-            global_dir = os.path.join(home, target)
-            if os.path.isdir(global_dir):
-                dirs.add(global_dir)
+        flocks_roots = Skill._find_dirs_up(".flocks", current_dir, worktree)
+        global_flocks = os.path.join(home, ".flocks")
+        if os.path.isdir(global_flocks):
+            flocks_roots.append(global_flocks)
+        for root in flocks_roots:
+            dirs.update(self._existing_subdirs(root, self._FLOCKS_SKILL_DIRS))
 
-        return {d for d in dirs if os.path.isdir(d)}
+        claude_roots = Skill._find_dirs_up(".claude", current_dir, worktree)
+        global_claude = os.path.join(home, ".claude")
+        if os.path.isdir(global_claude):
+            claude_roots.append(global_claude)
+        for root in claude_roots:
+            dirs.update(self._existing_subdirs(root, self._CLAUDE_SKILL_DIRS))
+
+        return dirs
+
+    @staticmethod
+    def _existing_subdirs(root: str, relative_dirs: tuple[str, ...]) -> Set[str]:
+        """Return existing watch roots below a discovery root, with stable dedupe."""
+        dirs: Set[str] = set()
+        for rel in relative_dirs:
+            candidate = os.path.realpath(os.path.join(root, rel))
+            if os.path.isdir(candidate):
+                dirs.add(candidate)
+        return dirs

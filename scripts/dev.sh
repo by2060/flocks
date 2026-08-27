@@ -17,6 +17,7 @@ BACKEND_HOST="${BACKEND_HOST:-127.0.0.1}"
 BACKEND_PORT="${BACKEND_PORT:-8000}"
 FRONTEND_HOST="${FRONTEND_HOST:-127.0.0.1}"
 FRONTEND_PORT="${FRONTEND_PORT:-5173}"
+FLOCKS_CONSOLE_BASE_URL="${FLOCKS_CONSOLE_BASE_URL:-https://portalflocks.threatbook.cn}"
 
 BACKEND_ACCESS_HOST="${BACKEND_HOST}"
 if [ "${BACKEND_ACCESS_HOST}" = "0.0.0.0" ] || [ "${BACKEND_ACCESS_HOST}" = "::" ]; then
@@ -24,7 +25,6 @@ if [ "${BACKEND_ACCESS_HOST}" = "0.0.0.0" ] || [ "${BACKEND_ACCESS_HOST}" = "::"
 fi
 
 BACKEND_BASE_URL="http://${BACKEND_ACCESS_HOST}:${BACKEND_PORT}"
-BACKEND_WS_URL="ws://${BACKEND_ACCESS_HOST}:${BACKEND_PORT}"
 BACKEND_PID=""
 BACKEND_PGID=""
 CLEANUP_DONE=0
@@ -42,6 +42,7 @@ Environment variables:
   BACKEND_PORT   默认 8000
   FRONTEND_HOST  默认 127.0.0.1
   FRONTEND_PORT  默认 5173
+  FLOCKS_CONSOLE_BASE_URL  默认 https://portalflocks.threatbook.cn
 EOF
 }
 
@@ -204,8 +205,10 @@ cleanup() {
 start_backend() {
     echo -e "${GREEN}🔧 启动后端服务: http://${BACKEND_HOST}:${BACKEND_PORT}${NC}"
     cd "${PROJECT_ROOT}"
+    _FLOCKS_SERVER_PORT="${BACKEND_PORT}" \
     _FLOCKS_WEBUI_HOST="${FRONTEND_HOST}" \
     _FLOCKS_WEBUI_PORT="${FRONTEND_PORT}" \
+    FLOCKS_CONSOLE_BASE_URL="${FLOCKS_CONSOLE_BASE_URL}" \
     uv run uvicorn flocks.server.app:app \
         --host "${BACKEND_HOST}" \
         --port "${BACKEND_PORT}" \
@@ -214,18 +217,23 @@ start_backend() {
 }
 
 start_frontend() {
+    echo -e "${GREEN}🏗️  构建前端...${NC}"
+    cd "${PROJECT_ROOT}/webui"
+    npm run build
+
     echo -e "${GREEN}🎨 启动前端服务: http://${FRONTEND_HOST}:${FRONTEND_PORT}${NC}"
     cd "${PROJECT_ROOT}/webui"
-    VITE_API_BASE_URL="${BACKEND_BASE_URL}" \
-    VITE_WS_BASE_URL="${BACKEND_WS_URL}" \
+    FLOCKS_API_PROXY_TARGET="${BACKEND_BASE_URL}" \
     npm run dev -- --host "${FRONTEND_HOST}" --port "${FRONTEND_PORT}"
 }
 
 start_all() {
     echo -e "${BLUE}🚀 同时启动前后端开发环境...${NC}"
     cd "${PROJECT_ROOT}"
+    _FLOCKS_SERVER_PORT="${BACKEND_PORT}" \
     _FLOCKS_WEBUI_HOST="${FRONTEND_HOST}" \
     _FLOCKS_WEBUI_PORT="${FRONTEND_PORT}" \
+    FLOCKS_CONSOLE_BASE_URL="${FLOCKS_CONSOLE_BASE_URL}" \
     uv run uvicorn flocks.server.app:app \
         --host "${BACKEND_HOST}" \
         --port "${BACKEND_PORT}" \

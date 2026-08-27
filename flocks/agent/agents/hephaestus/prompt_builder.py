@@ -14,7 +14,6 @@ if TYPE_CHECKING:
         AvailableAgent,
         AvailableTool,
         AvailableSkill,
-        AvailableCategory,
     )
 
 
@@ -23,7 +22,6 @@ def inject(
     available_agents: List["AvailableAgent"],
     tools: List["AvailableTool"],
     skills: List["AvailableSkill"],
-    categories: List["AvailableCategory"],
     workflows: Optional[list] = None,
 ) -> None:
     """Build and inject Hephaestus's dynamic system prompt."""
@@ -31,7 +29,6 @@ def inject(
         available_agents=available_agents,
         available_tools=tools,
         available_skills=skills,
-        available_categories=categories,
         use_task_system=False,
     )
 
@@ -40,7 +37,6 @@ def build_hephaestus_prompt(
     available_agents: List["AvailableAgent"],
     available_tools: List["AvailableTool"],
     available_skills: List["AvailableSkill"],
-    available_categories: List["AvailableCategory"],
     use_task_system: bool = False,
 ) -> str:
     from flocks.agent.prompt_utils import (
@@ -49,7 +45,7 @@ def build_hephaestus_prompt(
         build_tool_selection_table,
         build_explore_section,
         build_librarian_section,
-        build_category_skills_delegation_guide,
+        build_skills_delegation_guide,
         build_delegation_table,
         build_oracle_section,
         build_hard_blocks_section,
@@ -61,7 +57,7 @@ def build_hephaestus_prompt(
     agent_selection = build_agent_selection_table(available_agents)
     explore_section = build_explore_section(available_agents)
     librarian_section = build_librarian_section(available_agents)
-    category_skills_guide = build_category_skills_delegation_guide(available_categories, available_skills)
+    skills_guide = build_skills_delegation_guide(available_skills)
     delegation_table = build_delegation_table(available_agents)
     oracle_section = build_oracle_section(available_agents)
     hard_blocks = build_hard_blocks_section()
@@ -115,7 +111,7 @@ __KEY_TRIGGERS__
 |------|--------|--------|
 | **Trivial** | Single file, known location, <10 lines | Direct tools only (UNLESS Key Trigger applies) |
 | **Explicit** | Specific file/line, clear command | Execute directly |
-| **Exploratory** | "How does X work?", "Find Y" | Fire explore (1-3) + tools in parallel |
+| **Exploratory** | "How does X work?", "Find Y" | Use direct search/read tools in parallel |
 | **Open-ended** | "Improve", "Refactor", "Add feature" | Full Execution Loop required |
 | **Ambiguous** | Unclear scope, multiple interpretations | Ask ONE clarifying question |
 
@@ -158,9 +154,7 @@ Agent: *runs gh pr list, gh pr view, searches recent commits*
 
 **Delegation Check (MANDATORY before acting directly):**
 1. Is there a specialized agent that perfectly matches this request?
-2. If not, is there a `delegate_task` category that best describes this task? What skills are available to equip the agent with?
-   - If delegating by `category=...`, evaluate relevant skills and pass them via `load_skills=[...]`.
-   - If delegating by `subagent_type=...`, `load_skills` may be omitted unless a specific skill is clearly needed.
+2. If so, delegate with `subagent_type=...` and evaluate which skills should be passed via `load_skills=[...]`.
 3. Can I do it myself for the best result, FOR SURE?
 
 **Default Bias: DELEGATE for complex tasks. Work yourself ONLY when trivial.**
@@ -177,9 +171,8 @@ Agent: *runs gh pr list, gh pr view, searches recent commits*
 
 **Exploration Hierarchy (MANDATORY before any question):**
 1. **Direct tools**: `gh pr list`, `git log`, `grep`, `rg`, file reads
-2. **Explore agents**: Fire 2-3 parallel background searches
-3. **Librarian agents**: Check docs, GitHub, external sources
-4. **Context inference**: Use surrounding context to make educated guess
+2. **Documentation/source checks**: Check docs, GitHub, external sources directly
+3. **Context inference**: Use surrounding context to make educated guess
 5. **LAST RESORT**: Ask ONE precise question (only if 1-4 all failed)
 
 ## Phase 1 - Systematic Exploration
@@ -198,7 +191,7 @@ Launch 3+ tool calls in your first action. Never sequential unless output depend
 
 ## Phase 2 - Implementation
 
-__CATEGORY_SKILLS_GUIDE__
+__SKILLS_GUIDE__
 
 __DELEGATION_TABLE__
 
@@ -233,7 +226,7 @@ A task is complete when:
 - User's request fully addressed
 
 Before final response:
-- Cancel background tasks: `background_cancel(all=true)`
+- Summarize verification and any remaining uncertainty.
 """
 
     prompt = template
@@ -242,7 +235,7 @@ Before final response:
     prompt = prompt.replace("__AGENT_SELECTION__", agent_selection)
     prompt = prompt.replace("__EXPLORE_SECTION__", explore_section)
     prompt = prompt.replace("__LIBRARIAN_SECTION__", librarian_section)
-    prompt = prompt.replace("__CATEGORY_SKILLS_GUIDE__", category_skills_guide)
+    prompt = prompt.replace("__SKILLS_GUIDE__", skills_guide)
     prompt = prompt.replace("__DELEGATION_TABLE__", delegation_table)
     prompt = prompt.replace("__HARD_BLOCKS__", hard_blocks)
     prompt = prompt.replace("__ANTI_PATTERNS__", anti_patterns)
@@ -298,17 +291,17 @@ def _todo_discipline_section(use_task_system: bool) -> str:
 
 | Trigger | Action |
 |---------|--------|
-| 2+ step task | `todowrite` FIRST, atomic breakdown |
-| Uncertain scope | `todowrite` to clarify thinking |
+| 2+ step task | `todo(action="write")` FIRST, atomic breakdown |
+| Uncertain scope | `todo(action="write")` to clarify thinking |
 | Complex single task | Break down into trackable steps |
 
 ### Workflow (STRICT)
 
-1. **On task start**: `todowrite` with atomic steps-no announcements, just create
+1. **On task start**: `todo(action="write")` with atomic steps-no announcements, just create
 2. **Before each step**: Mark `in_progress` (ONE at a time)
 3. **After each step**: Mark `completed` IMMEDIATELY (NEVER batch)
 4. **Scope changes**: Update todos BEFORE proceeding
-5. **Todo payload shape**: `todowrite` must receive structured objects with `id`, `content`, and `status`, never a string array
+5. **Todo payload shape**: `todo(action="write")` must receive structured objects with `id`, `content`, and `status`, never a string array
 
 ### Why This Matters
 

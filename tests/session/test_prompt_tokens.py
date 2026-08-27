@@ -2,7 +2,7 @@
 Tests for flocks/session/prompt.py
 
 Covers:
-- SessionPrompt.count_tokens(): token counting with/without tiktoken
+- SessionPrompt.count_tokens(): token counting via chars/4 heuristic
 - SessionPrompt.estimate_tokens(): quick character-based estimate
 - SessionPrompt.count_message_tokens(): multi-message counting
 - SessionPrompt.load_template() / render_template(): template processing
@@ -14,12 +14,15 @@ Covers:
 import os
 import tempfile
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from flocks.agent.agent import AgentInfo
 from flocks.session.prompt import (
     PROMPT_DEFAULT,
+    get_prompt_flocks_config_guard,
     PromptTemplate,
     SessionPrompt,
     SystemPrompt,
@@ -35,10 +38,6 @@ class TestCountTokens:
     def test_empty_string_returns_zero(self):
         assert SessionPrompt.count_tokens("") == 0
 
-    def test_none_equivalent_empty(self):
-        # Passing falsy value
-        assert SessionPrompt.count_tokens("") == 0
-
     def test_short_text_returns_positive(self):
         result = SessionPrompt.count_tokens("hello world")
         assert result > 0
@@ -48,20 +47,14 @@ class TestCountTokens:
         long_ = SessionPrompt.count_tokens("This is a much longer piece of text with many words")
         assert long_ > short
 
-    def test_fallback_estimate_without_tiktoken(self):
-        with patch.object(SessionPrompt, '_get_tokenizer', return_value=None):
-            # Should fall back to char//4 estimate
-            text = "a" * 400
-            result = SessionPrompt.count_tokens(text)
-            assert result == 100  # 400 // 4
+    def test_always_uses_chars_over_4(self):
+        # count_tokens now always uses chars/4 — no tiktoken path remains.
+        text = "a" * 400
+        assert SessionPrompt.count_tokens(text) == 100  # 400 // 4
 
-    def test_with_tiktoken_mock(self):
-        mock_tokenizer = MagicMock()
-        mock_tokenizer.encode.return_value = [1, 2, 3, 4, 5]  # 5 tokens
-        with patch.object(SessionPrompt, '_get_tokenizer', return_value=mock_tokenizer):
-            result = SessionPrompt.count_tokens("test text")
-        assert result == 5
-        mock_tokenizer.encode.assert_called_once_with("test text")
+    def test_short_text_chars_over_4(self):
+        text = "test text"  # 9 chars -> 9 // 4 = 2
+        assert SessionPrompt.count_tokens(text) == len(text) // 4
 
 
 # ---------------------------------------------------------------------------
@@ -200,7 +193,15 @@ class TestSystemPromptEnvironment:
     async def test_includes_working_directory(self):
         result = await SystemPrompt.environment("/my/work/dir")
         combined = "\n".join(result)
-        assert "/my/work/dir" in combined
+        assert "current working directory: /my/work/dir" in combined
+
+    def test_distinguishes_source_code_and_working_directories(self, monkeypatch):
+        monkeypatch.setenv("FLOCKS_REPO_ROOT", "/opt/flocks")
+
+        combined = "\n".join(SystemPrompt.environment_stable("/workspace/project"))
+
+        assert "flocks source code directory: /opt/flocks" in combined
+        assert "current working directory: /workspace/project" in combined
 
     @pytest.mark.asyncio
     async def test_includes_date_info(self):
@@ -239,6 +240,122 @@ class TestSystemPromptRuntimeMetadata:
         assert "Model:" not in block
         assert "Provider:" not in block
         assert "## Runtime Metadata" in block
+
+
+class TestBuildSystemPrompts:
+    @pytest.mark.asyncio
+    async def test_builtin_system_subagent_child_uses_minimal_prompt(self):
+        agent = AgentInfo(
+            name="rex-junior",
+            mode="subagent",
+            tags=["system"],
+            prompt="You are Rex Junior.",
+        )
+        with (
+            patch("flocks.agent.registry.Agent.get", AsyncMock(return_value=agent)),
+            patch(
+                "flocks.session.session.Session.get_by_id",
+                AsyncMock(return_value=SimpleNamespace(parent_id="ses-parent")),
+            ),
+        ):
+            prompts = await SessionPrompt.build_system_prompts(
+                session_id="ses-child",
+                session_directory="/tmp/project",
+                agent_name="rex-junior",
+                agent_prompt="You are Rex Junior.",
+                provider_id="anthropic",
+                model_id="claude-sonnet",
+                tool_catalog_prompt_factory=lambda: "SHOULD_NOT_APPEAR",
+            )
+
+        assert len(prompts) == 3
+        assert prompts[0] == get_prompt_flocks_config_guard().strip()
+        assert prompts[1] == "You are Rex Junior."
+        assert "## Environment" in prompts[2]
+        assert "Current working directory: /tmp/project" in prompts[2]
+        assert "Platform:" in prompts[2]
+        assert "Today's date:" in prompts[2]
+        assert "SHOULD_NOT_APPEAR" not in "\n".join(prompts)
+        assert PROMPT_DEFAULT.strip() not in "\n".join(prompts)
+
+    @pytest.mark.asyncio
+    async def test_builtin_system_subagent_root_uses_full_prompt(self):
+        agent = AgentInfo(
+            name="rex-junior",
+            mode="subagent",
+            tags=["system"],
+            prompt="You are Rex Junior.",
+        )
+        with (
+            patch("flocks.agent.registry.Agent.get", AsyncMock(return_value=agent)),
+            patch(
+                "flocks.session.session.Session.get_by_id",
+                AsyncMock(return_value=SimpleNamespace(parent_id=None)),
+            ),
+        ):
+            prompts = await SessionPrompt.build_system_prompts(
+                session_id="ses-root",
+                session_directory="/tmp/project",
+                agent_name="rex-junior",
+                agent_prompt="You are Rex Junior.",
+                provider_id="anthropic",
+                model_id="claude-sonnet",
+            )
+
+        assert len(prompts) > 2
+        assert any(PROMPT_DEFAULT.strip() in prompt for prompt in prompts)
+
+    @pytest.mark.asyncio
+    async def test_evolution_subagent_child_uses_full_prompt(self):
+        agent = AgentInfo(
+            name="self-improve",
+            mode="subagent",
+            tags=["system", "evolution"],
+            prompt="You are the self-improve Agent.",
+        )
+        with (
+            patch("flocks.agent.registry.Agent.get", AsyncMock(return_value=agent)),
+            patch(
+                "flocks.session.session.Session.get_by_id",
+                AsyncMock(
+                    return_value=SimpleNamespace(
+                        parent_id="ses-parent",
+                        metadata={"evolution": "self-improve"},
+                    )
+                ),
+            ),
+        ):
+            prompts = await SessionPrompt.build_system_prompts(
+                session_id="ses-self-improve",
+                session_directory="/tmp/project",
+                agent_name="self-improve",
+                agent_prompt=agent.prompt,
+                provider_id="anthropic",
+                model_id="claude-sonnet",
+            )
+
+        assert len(prompts) > 2
+        assert any(PROMPT_DEFAULT.strip() in prompt for prompt in prompts)
+        assert agent.prompt in prompts
+
+    @pytest.mark.asyncio
+    async def test_full_prompt_requires_question_approval_for_flocks_config_operations(self):
+        prompts = await SessionPrompt.build_system_prompts(
+            session_id="ses-config-guard",
+            session_directory="/tmp/project",
+            agent_name="rex",
+            agent_prompt="You are Rex.",
+            provider_id="anthropic",
+            model_id="claude-sonnet",
+        )
+
+        guard = get_prompt_flocks_config_guard().strip()
+        assert guard in prompts
+        assert "`flocks.json`" in guard
+        assert "`mcp_list.json`" in guard
+        assert "MUST call the `question` tool" in guard
+        assert "user's original request is not approval" in guard
+        assert "only inspect protected configuration with non-mutating operations" in guard
 
 
 # ---------------------------------------------------------------------------
@@ -288,6 +405,15 @@ class TestSystemPromptProvider:
         except (AttributeError, TypeError):
             pytest.skip("provider(None) not supported by this implementation")
 
+    def test_provider_prompts_do_not_reference_retired_todo_tools(self):
+        prompt_dir = Path(__file__).resolve().parents[2] / "flocks" / "session" / "prompt"
+        retired = ("TodoWrite", "TodoRead", "todowrite", "todoread")
+
+        for prompt_path in prompt_dir.glob("*.txt"):
+            content = prompt_path.read_text(encoding="utf-8")
+            for name in retired:
+                assert name not in content, f"{prompt_path.name} references retired tool {name}"
+
 
 class TestPromptToolInstructions:
     def test_tool_instructions_are_platform_agnostic(self):
@@ -320,3 +446,150 @@ class TestPromptTemplate:
     def test_empty_variables(self):
         t = PromptTemplate(name="test", content="no vars", variables=[])
         assert t.variables == []
+
+
+# ---------------------------------------------------------------------------
+# estimate_full_context_tokens — B2 overhead + safety margin
+# ---------------------------------------------------------------------------
+
+class TestEstimateFullContextTokens:
+    """estimate_full_context_tokens returns pure chars/4 message sum.
+
+    No overhead fields and no safety margin are applied — the fixed
+    85 % context_window overflow threshold makes them unnecessary.
+    policy and apply_safety_margin parameters are accepted but ignored.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _patch_message_parts(self, monkeypatch: pytest.MonkeyPatch):
+        # ``Message.parts`` requires DB lookup; stub it out so we only exercise
+        # the message-content arithmetic in this suite.
+        from flocks.session import message as message_mod
+
+        async def _fake_parts(message_id, session_id):  # noqa: ARG001
+            return []
+
+        monkeypatch.setattr(message_mod.Message, "parts", staticmethod(_fake_parts))
+        yield
+
+    @pytest.mark.asyncio
+    async def test_empty_messages_returns_zero(self):
+        """No messages → 0 tokens (no overhead added)."""
+        result = await SessionPrompt.estimate_full_context_tokens("ses_x", [])
+        assert result == 0
+
+    @pytest.mark.asyncio
+    async def test_policy_arg_ignored(self):
+        """policy argument is accepted but does not change the result."""
+        from flocks.session.lifecycle.compaction import CompactionPolicy
+
+        policy = CompactionPolicy.from_model(200_000, 8_192)
+        result_with = await SessionPrompt.estimate_full_context_tokens(
+            "ses_x", [], policy=policy,
+        )
+        result_without = await SessionPrompt.estimate_full_context_tokens(
+            "ses_x", [],
+        )
+        assert result_with == result_without == 0
+
+    @pytest.mark.asyncio
+    async def test_safety_margin_arg_ignored(self):
+        """apply_safety_margin=False has no effect (margin is never applied)."""
+        from flocks.session.lifecycle.compaction import CompactionPolicy
+
+        policy = CompactionPolicy.from_model(200_000, 8_192)
+        result = await SessionPrompt.estimate_full_context_tokens(
+            "ses_x", [], policy=policy, apply_safety_margin=False,
+        )
+        assert result == 0
+
+    @pytest.mark.asyncio
+    async def test_message_content_is_counted(self, monkeypatch: pytest.MonkeyPatch):
+        messages = [{"id": "m1", "content": "x" * 400}]  # 400 chars → 100 tokens
+        result = await SessionPrompt.estimate_full_context_tokens(
+            "ses_x", messages,
+        )
+        assert result == 100
+
+    @pytest.mark.asyncio
+    async def test_ignored_text_part_is_not_counted(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        from flocks.session import message as message_mod
+
+        async def _ignored_parts(message_id, session_id):  # noqa: ARG001
+            return [
+                SimpleNamespace(
+                    type="text",
+                    text="Available Tools\n" + ("x" * 400),
+                    ignored=True,
+                ),
+            ]
+
+        monkeypatch.setattr(
+            message_mod.Message,
+            "parts",
+            staticmethod(_ignored_parts),
+        )
+        messages = [{"id": "ignored-command-output", "content": ""}]
+
+        result = await SessionPrompt.estimate_full_context_tokens(
+            "ses_x",
+            messages,
+        )
+
+        assert result == 0
+
+
+class TestEstimateToolResultTokens:
+    @pytest.mark.asyncio
+    async def test_counts_only_results_added_after_model_call(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        from flocks.session import message as message_mod
+
+        parts = [
+            SimpleNamespace(
+                type="tool",
+                state=SimpleNamespace(
+                    status="completed",
+                    input={"query": "i" * 400},
+                    output="o" * 400,
+                    time={},
+                ),
+            ),
+            SimpleNamespace(
+                type="tool",
+                state=SimpleNamespace(
+                    status="completed",
+                    input={},
+                    output="ignored after compaction",
+                    time={"compacted": 1},
+                ),
+            ),
+            SimpleNamespace(
+                type="tool",
+                state=SimpleNamespace(status="error", error="boom", time={}),
+            ),
+            SimpleNamespace(
+                type="tool",
+                state=SimpleNamespace(status="running", time={}),
+            ),
+            SimpleNamespace(type="text", text="not a tool result"),
+        ]
+
+        async def _parts(message_id, session_id):  # noqa: ARG001
+            return parts
+
+        monkeypatch.setattr(message_mod.Message, "parts", staticmethod(_parts))
+
+        result = await SessionPrompt.estimate_tool_result_tokens("ses_x", "msg_x")
+
+        assert result == (
+            SessionPrompt.count_tokens("o" * 400)
+            + 10
+            + SessionPrompt.count_tokens("Error: boom")
+            + SessionPrompt.count_tokens("Error: Tool execution was interrupted")
+        )

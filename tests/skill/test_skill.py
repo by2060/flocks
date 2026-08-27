@@ -10,6 +10,7 @@ import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
+import flocks.skill.skill as skill_module
 from flocks.skill.skill import Skill, SkillInfo, SkillRequires, SkillInstallSpec
 
 
@@ -88,6 +89,26 @@ Additional content here.
         assert skill_info is not None
         assert skill_info.name == "frontmatter-skill"
         assert skill_info.description == "Skill with frontmatter"
+
+
+def test_parse_skill_md_with_ui_hidden_flag(tmp_path):
+    """SKILL.md can opt out of user-facing skill UI with ui_hidden: true."""
+    skill_dir = tmp_path / "ui-hidden-skill"
+    skill_dir.mkdir()
+    skill_file = skill_dir / "SKILL.md"
+    skill_file.write_text("""---
+name: ui-hidden-skill
+description: UI-hidden internal skill
+ui_hidden: true
+---
+
+# UI Hidden Skill
+""")
+
+    skill_info = Skill._parse_skill_md(str(skill_file))
+
+    assert skill_info is not None
+    assert skill_info.ui_hidden is True
 
 
 @pytest.mark.asyncio
@@ -268,6 +289,27 @@ def test_parse_skill_md_with_metadata(tmp_path):
     assert skill_info.install_specs[0].formula == "gh"
 
 
+def test_parse_skill_md_with_managed_by_metadata(tmp_path):
+    """SKILL.md exposes the direct metadata ownership marker."""
+    skill_dir = tmp_path / "managed-skill"
+    skill_dir.mkdir()
+    skill_file = skill_dir / "SKILL.md"
+    skill_file.write_text(
+        "---\n"
+        "name: managed-skill\n"
+        "description: Skill managed by Flocks self-improvement\n"
+        "metadata:\n"
+        "  managed_by: flocks\n"
+        "---\n"
+    )
+
+    skill_info = Skill._parse_skill_md(str(skill_file))
+
+    assert skill_info is not None
+    assert skill_info.metadata is not None
+    assert skill_info.metadata.managed_by == "flocks"
+
+
 def test_parse_skill_md_openclaw_metadata(tmp_path):
     """SKILL.md with metadata.openclaw → same fields populated via openclaw key."""
     skill_dir = tmp_path / "openclaw-skill"
@@ -348,6 +390,71 @@ async def test_discover_project_source_for_project_plugins(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_discover_source_root_plugins_from_unrelated_cwd(tmp_path):
+    """Bundled source-root skills remain visible outside the source checkout."""
+    source_root = tmp_path / "source"
+    ordinary_cwd = tmp_path / "ordinary-cwd"
+    ordinary_cwd.mkdir()
+    bundled_skill = source_root / ".flocks" / "plugins" / "skills" / "bundled-skill"
+    _write_skill_md(bundled_skill / "SKILL.md", "bundled-skill")
+
+    module_file = source_root / "flocks" / "skill" / "skill.py"
+    with (
+        patch("os.path.expanduser", return_value=str(tmp_path / "home")),
+        patch("flocks.skill.skill.__file__", str(module_file)),
+        patch(
+            "flocks.skill.skill.Instance.get_directory",
+            return_value=str(ordinary_cwd),
+        ),
+        patch(
+            "flocks.skill.skill.Instance.get_worktree",
+            return_value=str(ordinary_cwd),
+        ),
+    ):
+        skills = await Skill.all()
+
+    skill = next((item for item in skills if item.name == "bundled-skill"), None)
+    assert skill is not None, "source-root bundled skill not discovered"
+    assert skill.source == "project"
+
+
+@pytest.mark.asyncio
+async def test_skill_cache_does_not_leak_across_project_contexts(tmp_path):
+    """An ordinary-session discovery must not poison a project lookup."""
+    fake_home = tmp_path / "home"
+    ordinary_cwd = tmp_path / "ordinary-cwd"
+    project_dir = tmp_path / "project"
+    source_root = tmp_path / "source"
+    ordinary_cwd.mkdir()
+    project_dir.mkdir()
+    _write_skill_md(
+        project_dir / ".flocks" / "plugins" / "skills" / "project-only" / "SKILL.md",
+        "project-only",
+    )
+
+    context = {"directory": str(ordinary_cwd)}
+    module_file = source_root / "flocks" / "skill" / "skill.py"
+    with (
+        patch("os.path.expanduser", return_value=str(fake_home)),
+        patch("flocks.skill.skill.__file__", str(module_file)),
+        patch(
+            "flocks.skill.skill.Instance.get_directory",
+            side_effect=lambda: context["directory"],
+        ),
+        patch(
+            "flocks.skill.skill.Instance.get_worktree",
+            side_effect=lambda: context["directory"],
+        ),
+    ):
+        ordinary_skills = await Skill.all()
+        context["directory"] = str(project_dir)
+        project_skills = await Skill.all()
+
+    assert "project-only" not in {skill.name for skill in ordinary_skills}
+    assert "project-only" in {skill.name for skill in project_skills}
+
+
+@pytest.mark.asyncio
 async def test_discover_flocks_source_for_builtin_skills(tmp_path):
     """Skills under .flocks/skills/ (not plugins/) must get source='flocks'."""
     project_dir = tmp_path / "myproject"
@@ -372,8 +479,8 @@ async def test_discover_flocks_source_for_builtin_skills(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_discover_project_overrides_global(tmp_path):
-    """Project-level plugin skill must override global skill of the same name."""
+async def test_discover_user_plugin_overrides_project_bundle(tmp_path):
+    """User plugin skills must override project-bundled skills of the same name."""
     fake_home = tmp_path / "home"
     project_dir = tmp_path / "myproject"
     project_dir.mkdir()
@@ -389,14 +496,24 @@ async def test_discover_project_overrides_global(tmp_path):
         patch("os.path.expanduser", return_value=str(fake_home)),
         patch("flocks.skill.skill.Instance.get_directory", return_value=str(project_dir)),
         patch("flocks.skill.skill.Instance.get_worktree", return_value=str(project_dir)),
+        patch.object(skill_module.log, "info") as info_log,
+        patch.object(skill_module.log, "warn") as warn_log,
     ):
         Skill.clear_cache()
         skills = await Skill.all()
 
     skill = next((s for s in skills if s.name == "shared-skill"), None)
     assert skill is not None
-    assert skill.source == "project", "project-level skill should override global"
-    assert "Project version" in skill.description
+    assert skill.source == "user", "user-level skill should override project bundle"
+    assert "Global version" in skill.description
+    assert any(
+        call.args and call.args[0] == "skill.override"
+        for call in info_log.call_args_list
+    )
+    assert not any(
+        call.args and call.args[0] == "skill.duplicate"
+        for call in warn_log.call_args_list
+    )
 
 
 @pytest.mark.asyncio
@@ -430,8 +547,8 @@ def test_watcher_start_stop_no_crash(tmp_path):
     from flocks.skill.skill import SkillFileWatcher
 
     # Create a fake skill directory so the watcher has something to watch
-    skill_dir = tmp_path / ".flocks"
-    skill_dir.mkdir()
+    skill_dir = tmp_path / ".flocks" / "plugins" / "skills"
+    skill_dir.mkdir(parents=True)
 
     with (
         patch("flocks.skill.skill.Instance.get_directory", return_value=str(tmp_path)),
@@ -444,6 +561,96 @@ def test_watcher_start_stop_no_crash(tmp_path):
 
     # No exception → pass
     assert watcher._observer is None
+
+
+def test_watcher_collects_only_skill_discovery_roots(tmp_path):
+    """Skill watcher should not recursively watch the entire .flocks tree."""
+    from flocks.skill.skill import SkillFileWatcher
+
+    project_dir = tmp_path / "project"
+    current_dir = project_dir / "src"
+    current_dir.mkdir(parents=True)
+    project_flocks = project_dir / ".flocks"
+
+    expected_project_dirs = [
+        project_flocks / "skill",
+        project_flocks / "skills",
+        project_flocks / "plugins" / "skill",
+        project_flocks / "plugins" / "skills",
+    ]
+    for directory in expected_project_dirs:
+        directory.mkdir(parents=True)
+
+    # These trees can be large but are not part of Skill._discover().
+    (project_flocks / "flockshub" / "plugins" / "skills").mkdir(parents=True)
+    (project_flocks / "plugins" / "tools" / "api").mkdir(parents=True)
+
+    home_dir = tmp_path / "home"
+    user_skill_dir = home_dir / ".flocks" / "plugins" / "skills"
+    user_skill_dir.mkdir(parents=True)
+    user_claude_skill_dir = home_dir / ".claude" / "skills"
+    user_claude_skill_dir.mkdir(parents=True)
+
+    with (
+        patch("flocks.skill.skill.Instance.get_directory", return_value=str(current_dir)),
+        patch("flocks.skill.skill.Instance.get_worktree", return_value=str(project_dir)),
+        patch("os.path.expanduser", return_value=str(home_dir)),
+    ):
+        watch_dirs = SkillFileWatcher(Skill)._collect_watch_dirs()
+
+    expected = {
+        os.path.realpath(str(directory))
+        for directory in [*expected_project_dirs, user_skill_dir, user_claude_skill_dir]
+    }
+    assert watch_dirs == expected
+    assert os.path.realpath(str(project_flocks)) not in watch_dirs
+    assert os.path.realpath(str(project_flocks / "flockshub" / "plugins" / "skills")) not in watch_dirs
+    assert os.path.realpath(str(project_flocks / "plugins" / "tools" / "api")) not in watch_dirs
+
+
+def test_watcher_collects_project_claude_skills_only(tmp_path):
+    """Claude compatibility should watch .claude/skills, not the .claude root."""
+    from flocks.skill.skill import SkillFileWatcher
+
+    project_dir = tmp_path / "project"
+    project_claude = project_dir / ".claude"
+    project_claude_skill_dir = project_claude / "skills"
+    project_claude_skill_dir.mkdir(parents=True)
+    (project_claude / "commands").mkdir()
+
+    home_dir = tmp_path / "home"
+    home_dir.mkdir()
+
+    with (
+        patch("flocks.skill.skill.Instance.get_directory", return_value=str(project_dir)),
+        patch("flocks.skill.skill.Instance.get_worktree", return_value=str(project_dir)),
+        patch("os.path.expanduser", return_value=str(home_dir)),
+    ):
+        watch_dirs = SkillFileWatcher(Skill)._collect_watch_dirs()
+
+    assert watch_dirs == {os.path.realpath(str(project_claude_skill_dir))}
+    assert os.path.realpath(str(project_claude)) not in watch_dirs
+
+
+def test_watcher_collect_dirs_empty_without_skill_roots(tmp_path):
+    """A .flocks directory without skill roots should not be watched wholesale."""
+    from flocks.skill.skill import SkillFileWatcher
+
+    project_dir = tmp_path / "project"
+    (project_dir / ".flocks").mkdir(parents=True)
+    (project_dir / ".claude").mkdir()
+
+    home_dir = tmp_path / "home"
+    (home_dir / ".flocks").mkdir(parents=True)
+
+    with (
+        patch("flocks.skill.skill.Instance.get_directory", return_value=str(project_dir)),
+        patch("flocks.skill.skill.Instance.get_worktree", return_value=str(project_dir)),
+        patch("os.path.expanduser", return_value=str(home_dir)),
+    ):
+        watch_dirs = SkillFileWatcher(Skill)._collect_watch_dirs()
+
+    assert watch_dirs == set()
 
 
 def test_watcher_debounce_clears_cache():

@@ -24,14 +24,18 @@ from flocks.provider.provider import (
 from flocks.provider.sdk.openai_base import (
     DEFAULT_HTTP_TIMEOUT,
     ThinkTagExtractor,
+    apply_openai_token_limit,
     build_reasoning_metadata,
+    create_openai_http_client,
+    create_chat_completion_with_fallbacks,
     _coerce_bool,
+    _is_effective_thinking_enabled,
     _normalize_stream_usage,
-    _supports_include_usage_fallback,
     extract_reasoning_content_with_source,
     extract_reasoning_details,
     format_openai_content,
     format_openai_messages,
+    resolve_openai_token_limit,
     resolve_verify_ssl,
 )
 from flocks.utils.log import Log
@@ -42,10 +46,6 @@ log = Log.create(service="provider.openai_compatible")
 class OpenAICompatibleProvider(BaseProvider):
     """OpenAI Compatible API provider"""
 
-    _MINIMAX_EMPTY_RESPONSE_TARGETS = {
-        "minimax-m2.5",
-        "minimax-m2.7",
-    }
     _MINIMAX_EMPTY_RESPONSE_RETRY_DELAY_SECONDS = 3
     
     def __init__(self):
@@ -107,10 +107,11 @@ class OpenAICompatibleProvider(BaseProvider):
                 )
                 if isinstance(custom_settings, dict) and "trust_env" in custom_settings:
                     trust_env = _coerce_bool(custom_settings.get("trust_env"), trust_env)
-                http_client = httpx.AsyncClient(
+                http_client = create_openai_http_client(
                     trust_env=trust_env,
                     verify=verify_ssl,
                     timeout=DEFAULT_HTTP_TIMEOUT,
+                    custom_settings=custom_settings,
                 )
 
                 # Create client
@@ -118,6 +119,7 @@ class OpenAICompatibleProvider(BaseProvider):
                     api_key=api_key,
                     base_url=base_url,
                     http_client=http_client,
+                    max_retries=0,
                 )
                 self.log.info(
                     "openai_compatible.client.created",
@@ -143,7 +145,7 @@ class OpenAICompatibleProvider(BaseProvider):
     @classmethod
     def _is_minimax_empty_response_target(cls, model_id: str) -> bool:
         normalized = cls._normalize_model_id(model_id)
-        return any(target in normalized for target in cls._MINIMAX_EMPTY_RESPONSE_TARGETS)
+        return "minimax" in normalized
 
     @staticmethod
     def _has_non_empty_text_content(content: Any) -> bool:
@@ -183,25 +185,35 @@ class OpenAICompatibleProvider(BaseProvider):
         formatted_messages = self._format_messages(messages)
         
         # Extract parameters
-        max_tokens = kwargs.get("max_tokens")
+        max_tokens = resolve_openai_token_limit(kwargs)
+        max_completion_tokens_explicit = kwargs.get("max_completion_tokens") is not None
         tools = kwargs.get("tools")
         thinking = kwargs.get("thinking")
-        
+
         # Make request
         request_params = {
             "model": model_id,
             "messages": formatted_messages,
         }
 
+        # See the streaming chat_stream() counterpart for the rationale; the
+        # non-streaming path had the same extra_body-swallow bug.
+        extra_body = dict(kwargs.get("extra_body") or {})
         if thinking:
-            request_params["extra_body"] = {"thinking": thinking}
+            extra_body["thinking"] = thinking
         else:
             temperature = kwargs.get("temperature")
             if temperature is not None:
                 request_params["temperature"] = temperature
+        if extra_body:
+            request_params["extra_body"] = extra_body
         
-        if max_tokens:
-            request_params["max_tokens"] = max_tokens
+        apply_openai_token_limit(
+            request_params,
+            max_tokens,
+            prefer_completion_tokens=True,
+            completion_tokens_explicit=max_completion_tokens_explicit,
+        )
         if tools:
             # Some compatible APIs don't support tools
             try:
@@ -209,7 +221,13 @@ class OpenAICompatibleProvider(BaseProvider):
             except Exception:
                 self.log.warn("openai_compatible.tools.not_supported", {"model": model_id})
         
-        response = await client.chat.completions.create(**request_params)
+        response = await create_chat_completion_with_fallbacks(
+            client.chat.completions.create,
+            request_params,
+            max_tokens=max_tokens,
+            logger=self.log,
+            log_prefix="openai_compatible",
+        )
 
         # Format response
         choice = response.choices[0]
@@ -243,10 +261,11 @@ class OpenAICompatibleProvider(BaseProvider):
         formatted_messages = self._format_messages(messages)
         
         # Extract parameters
-        max_tokens = kwargs.get("max_tokens")
+        max_tokens = resolve_openai_token_limit(kwargs)
+        max_completion_tokens_explicit = kwargs.get("max_completion_tokens") is not None
         tools = kwargs.get("tools")
         thinking = kwargs.get("thinking")
-        
+
         # Make streaming request
         request_params = {
             "model": model_id,
@@ -255,15 +274,30 @@ class OpenAICompatibleProvider(BaseProvider):
             "stream_options": {"include_usage": True},
         }
 
+        # extra_body assembly: mirror openai_base.py:905-913.  Caller-supplied
+        # extra_body (e.g. ``enable_thinking`` produced by
+        # ``build_provider_options`` for DashScope-style endpoints) MUST be
+        # forwarded — the old code dropped it whenever ``thinking`` was None,
+        # silently disabling thinking for user-configured openai-compatible
+        # endpoints that set ``default_parameters.enable_thinking`` in
+        # flocks.json.  ``thinking`` is merged in last so it can override a
+        # caller-supplied extra_body.thinking if both are set.
+        extra_body = dict(kwargs.get("extra_body") or {})
         if thinking:
-            request_params["extra_body"] = {"thinking": thinking}
+            extra_body["thinking"] = thinking
         else:
             temperature = kwargs.get("temperature")
             if temperature is not None:
                 request_params["temperature"] = temperature
+        if extra_body:
+            request_params["extra_body"] = extra_body
         
-        if max_tokens:
-            request_params["max_tokens"] = max_tokens
+        apply_openai_token_limit(
+            request_params,
+            max_tokens,
+            prefer_completion_tokens=True,
+            completion_tokens_explicit=max_completion_tokens_explicit,
+        )
         if tools:
             # Some compatible APIs don't support tools
             try:
@@ -273,24 +307,23 @@ class OpenAICompatibleProvider(BaseProvider):
         
         self.log.info("openai_compatible.stream.request", {
             "model": model_id,
-            "thinking_enabled": bool(thinking),
+            "thinking_enabled": _is_effective_thinking_enabled(
+                model_id,
+                thinking,
+                extra_body,
+            ),
             "has_tools": bool(tools),
             "max_tokens": max_tokens,
             "include_usage": True,
         })
 
-        try:
-            stream = await client.chat.completions.create(**request_params)
-        except Exception as exc:
-            if not _supports_include_usage_fallback(exc):
-                raise
-            self.log.warn("openai_compatible.stream.include_usage_unsupported", {
-                "model": model_id,
-                "error": str(exc),
-            })
-            request_params = dict(request_params)
-            request_params.pop("stream_options", None)
-            stream = await client.chat.completions.create(**request_params)
+        stream = await create_chat_completion_with_fallbacks(
+            client.chat.completions.create,
+            request_params,
+            max_tokens=max_tokens,
+            logger=self.log,
+            log_prefix="openai_compatible",
+        )
 
         # Stateful extractor to separate <think>...</think> from content.
         think_extractor = ThinkTagExtractor()

@@ -1,0 +1,205 @@
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
+
+import pytest
+
+from flocks.channel.base import DeliveryResult
+from flocks.tool.channel.channel_message import (
+    _normalize_channel_type as _normalize_channel_message_type,
+    channel_message,
+)
+from flocks.tool.channel.im_send_message import (
+    _normalize_channel_type as _normalize_im_send_message_type,
+)
+from flocks.tool.registry import ToolContext, ToolRegistry, ToolResult
+
+
+@pytest.mark.parametrize(
+    "normalizer",
+    [_normalize_channel_message_type, _normalize_im_send_message_type],
+    ids=["channel_message", "im_send_message"],
+)
+def test_message_tools_normalize_channel_aliases(normalizer) -> None:
+    aliases = {
+        "weixin": ("weixin", "微信", "wechat", "wx"),
+        "wecom": ("wecom", "企业微信", "企微", "wechat_work", "wxwork"),
+        "slack": ("slack", "sl"),
+        "telegram": ("telegram", "tg", "tele"),
+        "whatsapp": ("whatsapp", "wa"),
+        "email": ("email", "mail", "邮件"),
+    }
+
+    for expected, values in aliases.items():
+        for value in values:
+            assert normalizer(value) == expected, value
+
+
+def test_channel_message_schema_includes_builtin_channels() -> None:
+    schema = ToolRegistry.get_schema("channel_message")
+
+    assert schema is not None
+    channel_enum = schema.properties["channel_type"]["enum"]
+    for value in (
+        "wecom",
+        "企业微信",
+        "weixin",
+        "微信",
+        "feishu",
+        "dingtalk",
+        "telegram",
+        "whatsapp",
+        "email",
+        "slack",
+        "邮件",
+    ):
+        assert value in channel_enum
+
+
+@pytest.mark.asyncio
+async def test_channel_message_uses_runtime_server_port(monkeypatch) -> None:
+    monkeypatch.setenv("_FLOCKS_SERVER_PORT", "5173")
+    http_send = AsyncMock(return_value=ToolResult(success=True, output="ok"))
+
+    with patch(
+        "flocks.tool.channel.channel_message._http_session_send",
+        http_send,
+    ):
+        result = await channel_message(
+            ToolContext(session_id="ses_current", message_id="msg_1"),
+            session_id="ses_target",
+            message="hello",
+        )
+
+    assert result.success is True
+    assert http_send.await_args.args[0] == 5173
+
+
+@pytest.mark.asyncio
+async def test_channel_message_exact_binding_filters_selected_chat_only() -> None:
+    bindings = [
+        SimpleNamespace(
+            session_id="ses_shared",
+            channel_id="feishu",
+            account_id="acct_1",
+            chat_id="chat_1",
+        ),
+        SimpleNamespace(
+            session_id="ses_shared",
+            channel_id="feishu",
+            account_id="acct_2",
+            chat_id="chat_2",
+        ),
+    ]
+    svc = SimpleNamespace(list_bindings=AsyncMock(return_value=bindings))
+    deliver_result = DeliveryResult(
+        channel_id="feishu",
+        message_id="msg_2",
+        chat_id="chat_2",
+    )
+
+    with patch(
+        "flocks.tool.channel.channel_message._http_session_send",
+        AsyncMock(return_value=None),
+    ), patch(
+        "flocks.channel.inbound.session_binding.SessionBindingService",
+        return_value=svc,
+    ), patch(
+        "flocks.channel.outbound.deliver.OutboundDelivery.deliver",
+        AsyncMock(return_value=[deliver_result]),
+    ) as deliver:
+        result = await channel_message(
+            ToolContext(session_id="ses_current", message_id="msg_1"),
+            session_id="ses_shared",
+            message="hello",
+            channel_type="feishu",
+            account_id="acct_2",
+            chat_id="chat_2",
+        )
+
+    assert result.success is True
+    deliver.assert_awaited_once()
+    out_ctx = deliver.await_args.args[0]
+    assert out_ctx.account_id == "acct_2"
+    assert out_ctx.to == "chat_2"
+
+
+@pytest.mark.asyncio
+async def test_channel_message_falls_back_to_latest_channel_binding() -> None:
+    latest_binding = SimpleNamespace(
+        session_id="ses_new",
+        channel_id="wecom",
+        account_id="default",
+        chat_id="room_1",
+    )
+    svc = SimpleNamespace(
+        list_bindings=AsyncMock(return_value=[latest_binding]),
+        latest_active_user_binding=AsyncMock(return_value=latest_binding),
+    )
+    deliver_result = DeliveryResult(
+        channel_id="wecom",
+        message_id="msg_new",
+        chat_id="room_1",
+    )
+
+    with patch(
+        "flocks.tool.channel.channel_message._http_session_send",
+        AsyncMock(return_value=None),
+    ), patch(
+        "flocks.channel.inbound.session_binding.SessionBindingService",
+        return_value=svc,
+    ), patch(
+        "flocks.channel.outbound.deliver.OutboundDelivery.deliver",
+        AsyncMock(return_value=[deliver_result]),
+    ) as deliver:
+        result = await channel_message(
+            ToolContext(session_id="ses_task", message_id="msg_1"),
+            session_id="ses_old",
+            message="hello",
+            channel_type="wecom",
+        )
+
+    assert result.success is True
+    svc.latest_active_user_binding.assert_awaited_once_with(
+        channel_id="wecom",
+        account_id=None,
+        chat_id=None,
+    )
+    deliver.assert_awaited_once()
+    assert deliver.await_args.kwargs["session_id"] == "ses_new"
+    out_ctx = deliver.await_args.args[0]
+    assert out_ctx.account_id == "default"
+    assert out_ctx.to == "room_1"
+
+
+@pytest.mark.asyncio
+async def test_channel_message_does_not_fallback_when_channel_binding_is_ambiguous() -> None:
+    svc = SimpleNamespace(
+        list_bindings=AsyncMock(return_value=[]),
+        latest_active_user_binding=AsyncMock(return_value=None),
+    )
+
+    with patch(
+        "flocks.tool.channel.channel_message._http_session_send",
+        AsyncMock(return_value=None),
+    ), patch(
+        "flocks.channel.inbound.session_binding.SessionBindingService",
+        return_value=svc,
+    ), patch(
+        "flocks.channel.outbound.deliver.OutboundDelivery.deliver",
+        AsyncMock(),
+    ) as deliver:
+        result = await channel_message(
+            ToolContext(session_id="ses_task", message_id="msg_1"),
+            session_id="ses_old",
+            message="hello",
+            channel_type="wecom",
+        )
+
+    assert result.success is False
+    assert "im_send_message(resolve_only=true)" in (result.error or "")
+    svc.latest_active_user_binding.assert_awaited_once_with(
+        channel_id="wecom",
+        account_id=None,
+        chat_id=None,
+    )
+    deliver.assert_not_awaited()

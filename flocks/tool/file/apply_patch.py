@@ -20,27 +20,30 @@ from flocks.utils.log import Log
 
 log = Log.create(service="tool.apply_patch")
 
-DESCRIPTION = """Apply a patch to modify files.
+DESCRIPTION = """Apply a patch to modify a single file.
 
-This tool is designed for advanced patch-based editing, supporting:
-- File creation (add)
-- File modification (update)
-- File deletion (delete)
-- File moves (update with move_path)
+Use this tool for a complex edit, creation, deletion, or move affecting one
+file. Submit a separate call for each file.
 
-Patch format:
+Do not use this tool when a dedicated tool is a better fit:
+- Change one existing file, including multiple disjoint replacements -> `edit`
+- Create one new file -> `write`
+
+`patchText` uses the Flocks patch format, not a standard git diff:
+
 *** Begin Patch
-*** Add File: path/to/new/file.py
-content of new file
-*** Update File: path/to/existing/file.py
-@@@ ... @@@
+*** Add File: path/to/new_file.py
+new file content
+*** Update File: path/to/existing_file.py
+@@ -10,3 +10,3 @@
+ context line
 -old line
 +new line
 *** Delete File: path/to/delete.py
 *** End Patch
 
 Use the edit tool for simple string replacements.
-Use apply_patch for complex multi-file changes."""
+Use apply_patch for complex single-file patch changes."""
 
 
 @dataclass
@@ -291,9 +294,22 @@ async def apply_patch_tool(
             success=False,
             error="No valid hunks found in patch"
         )
+    if len(hunks) != 1:
+        return ToolResult(
+            success=False,
+            error=(
+                "apply_patch currently supports exactly one file operation per call. "
+                "Split multi-file patches into separate apply_patch calls."
+            ),
+        )
     
     sandbox = ctx.extra.get("sandbox") if ctx.extra else None
-    if isinstance(sandbox, dict) and sandbox.get("workspace_access") == "ro":
+    sandbox_read_only = (
+        isinstance(sandbox, dict)
+        and sandbox.get("workspace_access") == "ro"
+    )
+    execution_mode = ctx.extra.get("execution_mode") if ctx.extra else None
+    if sandbox_read_only and execution_mode != "plan":
         return ToolResult(
             success=False,
             error=(
@@ -397,14 +413,25 @@ async def apply_patch_tool(
                 success=False,
                 error=f"Failed to process hunk for {hunk.path}: {str(e)}"
             )
-    
-    # Request permission
-    await ctx.ask(
-        permission="edit",
-        patterns=[c["permissionPattern"] for c in file_changes],
-        always=["*"],
-        metadata={"diff": total_diff}
-    )
+
+    if sandbox_read_only:
+        from flocks.session.execution_mode import is_plan_file_edit
+
+        if not all(
+            is_plan_file_edit(execution_mode, ctx, change["filePath"])
+            and (
+                not change.get("movePath")
+                or is_plan_file_edit(execution_mode, ctx, change["movePath"])
+            )
+            for change in file_changes
+        ):
+            return ToolResult(
+                success=False,
+                error=(
+                    "Patch is blocked in sandbox read-only workspace mode. "
+                    "Only the current session plan file may be changed in Plan mode."
+                ),
+            )
     
     # Apply changes
     changed_files = []

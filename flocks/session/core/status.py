@@ -42,8 +42,21 @@ class SessionStatusCompacting(BaseModel):
     message: str = Field(COMPACTING_DEFAULT_MESSAGE, description="Display message")
 
 
+class SessionStatusDreaming(BaseModel):
+    """Dreaming status - manual self-improvement is in progress."""
+
+    type: Literal["dreaming"] = "dreaming"
+    message: str = Field(..., description="Display message")
+
+
 # Union of all status types
-SessionStatusInfo = SessionStatusIdle | SessionStatusBusy | SessionStatusRetry | SessionStatusCompacting
+SessionStatusInfo = (
+    SessionStatusIdle
+    | SessionStatusBusy
+    | SessionStatusRetry
+    | SessionStatusCompacting
+    | SessionStatusDreaming
+)
 
 
 class SessionStatus:
@@ -139,8 +152,8 @@ class SessionStatus:
     def get_busy_session_ids(cls) -> List[str]:
         """Return IDs of all sessions that are busy or compacting (across all instances)."""
         result: List[str] = []
-        for _inst_id, statuses in cls._state.items():
-            for sid, info in statuses.items():
-                if info.type in ("busy", "compacting"):
+        for _inst_id, statuses in list(cls._state.items()):
+            for sid, info in list(statuses.items()):
+                if info.type in ("busy", "compacting", "dreaming"):
                     result.append(sid)
         return result

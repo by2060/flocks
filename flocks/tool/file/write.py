@@ -9,11 +9,13 @@ Writes files to the local filesystem with:
 
 import os
 from difflib import unified_diff
+from pathlib import Path
+from typing import Optional
 
 from flocks.tool.registry import (
     ToolRegistry, ToolCategory, ToolParameter, ParameterType, ToolResult, ToolContext
 )
-from flocks.tool.path_utils import resolve_tool_path, safe_relpath as _safe_relpath
+from flocks.tool.path_utils import resolve_tool_path
 from flocks.utils.log import Log
 
 
@@ -106,6 +108,125 @@ def trim_diff(diff: str) -> str:
     
     return "\n".join(trimmed_lines)
 
+def _looks_like_filename_only_intent(raw_path: str, resolved_path: str, base_dir: str) -> bool:
+    """
+    Best-effort detect "user gave only a filename (no directory)" intent.
+
+    Cases considered filename-only:
+    - Relative path without any directory separator (e.g. ``hello.txt``)
+    - Absolute path that points to the source root + basename
+      (common when model auto-expands a bare filename to cwd/source dir)
+    """
+    normalized = (raw_path or "").replace("\\", "/")
+    if not raw_path:
+        return False
+    if not os.path.isabs(raw_path):
+        return "/" not in normalized
+    try:
+        return os.path.realpath(os.path.dirname(resolved_path)) == os.path.realpath(base_dir)
+    except Exception:
+        return False
+
+
+async def _resolve_owner_username(ctx: ToolContext) -> Optional[str]:
+    """Resolve owner username from auth context, then session ownership."""
+    try:
+        from flocks.auth.context import get_current_auth_user
+        auth_user = get_current_auth_user()
+        if auth_user and getattr(auth_user, "username", None):
+            return str(auth_user.username)
+    except Exception:
+        pass
+
+    session_id = getattr(ctx, "session_id", None)
+    if not session_id or session_id == "default":
+        return None
+    try:
+        from flocks.session.session import Session
+
+        session = await Session.get_by_id(session_id)
+        if session and getattr(session, "owner_username", None):
+            return str(session.owner_username)
+    except Exception:
+        pass
+    return None
+
+
+async def _maybe_redirect_to_default_outputs(
+    ctx: ToolContext,
+    *,
+    original_path: str,
+    resolved_path: str,
+    base_dir: str,
+) -> str:
+    """
+    For filename-only writes, force stable default output location.
+
+    This prevents nondeterministic writes to source root when user did not
+    specify a directory and model expanded filename against cwd.
+    """
+    if not _looks_like_filename_only_intent(original_path, resolved_path, base_dir):
+        return resolved_path
+    if os.path.exists(resolved_path):
+        # Existing file writes should remain explicit and deterministic.
+        return resolved_path
+
+    filename = os.path.basename(original_path) or os.path.basename(resolved_path)
+    if not filename:
+        return resolved_path
+
+    try:
+        from flocks.workspace.manager import WorkspaceManager
+
+        owner_username = await _resolve_owner_username(ctx)
+        outputs_dir = WorkspaceManager.get_instance().get_default_outputs_dir(
+            username=owner_username
+        )
+        redirected = str((outputs_dir / filename).resolve())
+        if redirected != resolved_path:
+            log.info(
+                "write.default_output_redirect",
+                {"from": resolved_path, "to": redirected, "session_id": ctx.session_id},
+            )
+        return redirected
+    except Exception as exc:
+        log.debug("write.default_output_redirect.failed", {"error": str(exc)})
+        return resolved_path
+
+
+def _existing_memory_write_error(filepath: str) -> Optional[str]:
+    """Prevent invalid whole-file replacement of Memory files."""
+    from flocks.config import Config
+    from flocks.memory.paths import (
+        DAILY_AGENT_WRITE_ERROR,
+        is_daily_memory_path,
+        is_registered_project_id,
+    )
+
+    path = Path(filepath).expanduser().resolve(strict=False)
+    memory_root = (
+        Config.get_data_path() / "memory"
+    ).expanduser().resolve(strict=False)
+    if is_daily_memory_path(memory_root, path):
+        return DAILY_AGENT_WRITE_ERROR
+
+    protected_files = {
+        memory_root / "MEMORY.md",
+        memory_root / "USER.md",
+    }
+    is_project_memory = (
+        path.name == "MEMORY.md"
+        and path.parent.parent == memory_root / "projects"
+        and is_registered_project_id(path.parent.name)
+    )
+    if path.exists() and (path in protected_files or is_project_memory):
+        return (
+            "Existing Memory files cannot be overwritten with write. "
+            "Read the current content and use edit for a precise change."
+        )
+    return None
+
+
 @ToolRegistry.register_function(
     name="write",
     description=DESCRIPTION,
@@ -161,7 +282,28 @@ async def write_tool(
             content = str(content)
 
     try:
-        resolution = await resolve_tool_path(ctx, filePath)
+        resolution = await resolve_tool_path(
+            ctx,
+            filePath,
+            allow_host_memory=True,
+            allow_host_skills=True,
+        )
+        if resolution.sandbox_root is None:
+            redirected_path = await _maybe_redirect_to_default_outputs(
+                ctx,
+                original_path=filePath,
+                resolved_path=resolution.resolved_path,
+                base_dir=resolution.base_dir,
+            )
+            if redirected_path != resolution.resolved_path:
+                resolution = await resolve_tool_path(
+                    ctx,
+                    redirected_path,
+                    base_dir=resolution.base_dir,
+                    worktree=resolution.worktree,
+                    allow_host_memory=True,
+                    allow_host_skills=True,
+                )
     except ValueError as exc:
         return ToolResult(
             success=False,
@@ -169,9 +311,30 @@ async def write_tool(
             title=filePath,
         )
     filepath = resolution.resolved_path
+    memory_error = _existing_memory_write_error(filepath)
+    if memory_error:
+        return ToolResult(
+            success=False,
+            error=memory_error,
+            title=filePath,
+        )
 
     sandbox = ctx.extra.get("sandbox") if ctx.extra else None
     if isinstance(sandbox, dict) and sandbox.get("workspace_access") == "ro":
+        from flocks.session.execution_mode import is_plan_file_edit
+
+        plan_file_edit = is_plan_file_edit(
+            ctx.extra.get("execution_mode"),
+            ctx,
+            filepath,
+        )
+    else:
+        plan_file_edit = False
+    if (
+        isinstance(sandbox, dict)
+        and sandbox.get("workspace_access") == "ro"
+        and not plan_file_edit
+    ):
         return ToolResult(
             success=False,
             error=(
@@ -198,20 +361,29 @@ async def write_tool(
                 error=f"Failed to read existing file: {str(e)}",
                 title=title
             )
-    
+
+    if (
+        ctx.agent == "self-improve"
+        and Path(filepath).name == "SKILL.md"
+    ):
+        from flocks.memory.evolution.skill_guard import (
+            validate_evolution_skill_write,
+        )
+
+        evolution_error = await validate_evolution_skill_write(
+            Path(filepath),
+            content,
+            exists=exists,
+        )
+        if evolution_error:
+            return ToolResult(
+                success=False,
+                error=evolution_error,
+                title=title,
+            )
+
     # Generate diff
     diff = trim_diff(generate_diff(filepath, old_content, content))
-    
-    # Request permission
-    await ctx.ask(
-        permission="edit",
-        patterns=[resolution.permission_pattern],
-        always=["*"],
-        metadata={
-            "filepath": filepath,
-            "diff": diff
-        }
-    )
     
     # Create parent directory if needed
     parent_dir = os.path.dirname(filepath)

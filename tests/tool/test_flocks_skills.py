@@ -8,7 +8,7 @@ Coverage:
 - Successful execution (mocked subprocess)
 - Failed execution (non-zero exit code)
 - Timeout handling and proc.kill()
-- args whitespace splitting
+- Structured subcommand arguments
 - Output truncation
 """
 
@@ -49,7 +49,13 @@ def test_tool_is_registered():
 def test_tool_has_expected_parameters():
     tool = next(t for t in ToolRegistry.list_tools() if t.name == "flocks_skills")
     param_names = {p.name for p in tool.parameters}
-    assert {"subcommand", "args"} == param_names
+    assert {
+        "subcommand",
+        "query",
+        "source",
+        "skill_name",
+        "scope",
+    } == param_names
 
 
 @pytest.mark.asyncio
@@ -57,7 +63,7 @@ async def test_unknown_subcommand_returns_error():
     from flocks.tool.skill.flocks_skills import flocks_skills
 
     ctx = make_ctx()
-    result = await flocks_skills(ctx, subcommand="hack", args="")
+    result = await flocks_skills(ctx, subcommand="hack")
     assert result.success is False
     assert "Unknown subcommand" in (result.error or "")
 
@@ -72,14 +78,33 @@ async def test_all_allowed_subcommands_accepted():
     )
 
     proc = make_proc(stdout=b"ok", returncode=0)
+    from flocks.skill.installer import SkillInstallResult
 
     with (
         patch("flocks.tool.skill.flocks_skills._flocks_executable", return_value="/usr/local/bin/flocks"),
         patch("flocks.tool.skill.flocks_skills.asyncio.create_subprocess_exec", return_value=proc),
+        patch(
+            "flocks.skill.installer.SkillInstaller.install_from_source",
+            AsyncMock(
+                return_value=SkillInstallResult(
+                    success=True,
+                    skill_name="demo",
+                    location="/tmp/demo/SKILL.md",
+                    message="installed",
+                )
+            ),
+        ),
     ):
         for sub in _ALLOWED_SUBCOMMANDS:
             ctx = make_ctx()
-            result = await flocks_skills(ctx, subcommand=sub, args="")
+            kwargs = {}
+            if sub == "find":
+                kwargs["query"] = "demo"
+            elif sub == "install":
+                kwargs["source"] = "github:owner/repo/demo"
+            elif sub in {"install-deps", "remove"}:
+                kwargs["skill_name"] = "demo"
+            result = await flocks_skills(ctx, subcommand=sub, **kwargs)
             assert result.success is True, f"subcommand {sub!r} should succeed"
             if sub in _READ_ONLY_SUBCOMMANDS:
                 ctx.ask.assert_not_called()
@@ -93,13 +118,13 @@ async def test_missing_flocks_executable():
     from flocks.tool.skill.flocks_skills import flocks_skills
 
     with patch("flocks.tool.skill.flocks_skills._flocks_executable", return_value=None):
-        result = await flocks_skills(ctx, subcommand="list")
+        result = await flocks_skills(ctx, subcommand="status")
     assert result.success is False
     assert "not found" in (result.error or "").lower()
 
 
 @pytest.mark.asyncio
-async def test_list_success():
+async def test_status_success():
     from flocks.tool.skill.flocks_skills import flocks_skills
 
     ctx = make_ctx()
@@ -108,18 +133,18 @@ async def test_list_success():
         patch("flocks.tool.skill.flocks_skills._flocks_executable", return_value="/usr/bin/flocks"),
         patch("flocks.tool.skill.flocks_skills.asyncio.create_subprocess_exec", return_value=proc) as mock_exec,
     ):
-        result = await flocks_skills(ctx, subcommand="list")
+        result = await flocks_skills(ctx, subcommand="status")
 
     assert result.success is True
     assert "find-ioc" in (result.output or "")
     cmd_args = mock_exec.call_args[0]
     assert "skills" in cmd_args
-    assert "list" in cmd_args
+    assert "status" in cmd_args
     ctx.ask.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_find_passes_args():
+async def test_find_passes_structured_query():
     from flocks.tool.skill.flocks_skills import flocks_skills
 
     ctx = make_ctx()
@@ -128,27 +153,55 @@ async def test_find_passes_args():
         patch("flocks.tool.skill.flocks_skills._flocks_executable", return_value="/usr/bin/flocks"),
         patch("flocks.tool.skill.flocks_skills.asyncio.create_subprocess_exec", return_value=proc) as mock_exec,
     ):
-        result = await flocks_skills(ctx, subcommand="find", args="phishing analysis")
+        result = await flocks_skills(
+            ctx,
+            subcommand="find",
+            query="phishing analysis",
+        )
 
     assert result.success is True
     cmd_args = mock_exec.call_args[0]
-    assert "find" in cmd_args
-    assert "phishing" in cmd_args
-    assert "analysis" in cmd_args
+    assert cmd_args == ("/usr/bin/flocks", "skills", "find", "phishing analysis")
     ctx.ask.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_remove_accepts_structured_skill_name_and_appends_yes():
+    from flocks.tool.skill.flocks_skills import flocks_skills
+
+    ctx = make_ctx()
+    proc = make_proc(stdout=b"removed\n", returncode=0)
+    with (
+        patch("flocks.tool.skill.flocks_skills._flocks_executable", return_value="/usr/bin/flocks"),
+        patch("flocks.tool.skill.flocks_skills.asyncio.create_subprocess_exec", return_value=proc) as mock_exec,
+    ):
+        result = await flocks_skills(
+            ctx,
+            subcommand="remove",
+            skill_name="old-skill",
+        )
+
+    assert result.success is True
+    cmd_args = mock_exec.call_args[0]
+    assert cmd_args == ("/usr/bin/flocks", "skills", "remove", "old-skill", "--yes")
+    ctx.ask.assert_called_once()
 
 
 @pytest.mark.asyncio
 async def test_nonzero_exit_returns_failure():
     from flocks.tool.skill.flocks_skills import flocks_skills
+    from flocks.skill.installer import SkillInstallResult
 
     ctx = make_ctx()
-    proc = make_proc(stderr=b"skill not found\n", returncode=1)
-    with (
-        patch("flocks.tool.skill.flocks_skills._flocks_executable", return_value="/usr/bin/flocks"),
-        patch("flocks.tool.skill.flocks_skills.asyncio.create_subprocess_exec", return_value=proc),
+    with patch(
+        "flocks.skill.installer.SkillInstaller.install_from_source",
+        AsyncMock(return_value=SkillInstallResult(success=False, error="skill not found")),
     ):
-        result = await flocks_skills(ctx, subcommand="install", args="github:bad/source")
+        result = await flocks_skills(
+            ctx,
+            subcommand="install",
+            source="github:bad/source",
+        )
 
     assert result.success is False
     assert "skill not found" in (result.error or "")
@@ -156,7 +209,65 @@ async def test_nonzero_exit_returns_failure():
 
 
 @pytest.mark.asyncio
-async def test_timeout_kills_process():
+async def test_install_forwards_safeskill_source():
+    from flocks.tool.skill.flocks_skills import flocks_skills
+    from flocks.skill.installer import SkillInstallResult
+
+    source = "safeskill://tbx/6ef3925b1f6245bcbd7da39f23c28652/onesig-use@1.0.0"
+    ctx = make_ctx()
+    installer = AsyncMock(
+        return_value=SkillInstallResult(
+            success=True,
+            skill_name="onesig-use",
+            location="/tmp/onesig-use/SKILL.md",
+            message="installed",
+        )
+    )
+
+    with patch("flocks.skill.installer.SkillInstaller.install_from_source", installer):
+        result = await flocks_skills(
+            ctx,
+            subcommand="install",
+            source=source,
+            scope="global",
+        )
+
+    assert result.success is True
+    installer.assert_awaited_once_with(source, scope="global", yes=True)
+    ctx.ask.assert_called_once()
+    assert ctx.ask.call_args.kwargs["patterns"] == [
+        f"flocks skills install {source} --scope global --yes"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_install_timeout_returns_failure():
+    from flocks.tool.skill.flocks_skills import flocks_skills
+    from flocks.skill.installer import SkillInstallResult
+
+    ctx = make_ctx()
+    with patch(
+        "flocks.skill.installer.SkillInstaller.install_from_source",
+        AsyncMock(
+            return_value=SkillInstallResult(
+                success=False,
+                error="Command timed out after 45s",
+            )
+        ),
+    ):
+        result = await flocks_skills(
+            ctx,
+            subcommand="install",
+            source="clawhub:slow-skill",
+        )
+
+    assert result.success is False
+    assert "timed out" in (result.error or "").lower()
+    ctx.ask.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_remove_timeout_kills_process():
     from flocks.tool.skill.flocks_skills import flocks_skills
 
     ctx = make_ctx()
@@ -169,7 +280,11 @@ async def test_timeout_kills_process():
         patch("flocks.tool.skill.flocks_skills._flocks_executable", return_value="/usr/bin/flocks"),
         patch("flocks.tool.skill.flocks_skills.asyncio.create_subprocess_exec", return_value=proc),
     ):
-        result = await flocks_skills(ctx, subcommand="install", args="clawhub:slow-skill")
+        result = await flocks_skills(
+            ctx,
+            subcommand="remove",
+            skill_name="old-skill",
+        )
 
     assert result.success is False
     assert "timed out" in (result.error or "").lower()
@@ -178,8 +293,7 @@ async def test_timeout_kills_process():
 
 
 @pytest.mark.asyncio
-async def test_empty_args_not_appended_to_cmd():
-    """Empty args string must not add any extra tokens to the command."""
+async def test_status_does_not_append_arguments_to_cmd():
     from flocks.tool.skill.flocks_skills import flocks_skills
 
     ctx = make_ctx()
@@ -189,7 +303,7 @@ async def test_empty_args_not_appended_to_cmd():
         patch("flocks.tool.skill.flocks_skills._flocks_executable", return_value="/usr/bin/flocks"),
         patch("flocks.tool.skill.flocks_skills.asyncio.create_subprocess_exec", return_value=proc) as mock_exec,
     ):
-        await flocks_skills(ctx, subcommand="status", args="")
+        await flocks_skills(ctx, subcommand="status")
 
     cmd_args = mock_exec.call_args[0]
     # Exactly: flocks, skills, status — nothing more
@@ -225,7 +339,7 @@ async def test_long_output_is_truncated():
         patch("flocks.tool.skill.flocks_skills._flocks_executable", return_value="/usr/bin/flocks"),
         patch("flocks.tool.skill.flocks_skills.asyncio.create_subprocess_exec", return_value=proc),
     ):
-        result = await flocks_skills(ctx, subcommand="list")
+        result = await flocks_skills(ctx, subcommand="status")
 
     assert result.success is True
     assert len(result.output or "") <= _MAX_OUTPUT + 100  # allow for truncation notice

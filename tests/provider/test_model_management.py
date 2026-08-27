@@ -237,6 +237,7 @@ class TestBaseProviderExtensions:
                             supports_streaming=True,
                             supports_tools=True,
                             supports_vision=True,
+                            thinking_level_map={"high": "provider-high"},
                             context_window=100000,
                             max_tokens=8000,
                         ),
@@ -249,8 +250,105 @@ class TestBaseProviderExtensions:
         assert len(defs) == 1
         assert defs[0].id == "dummy-model"
         assert defs[0].capabilities.supports_vision is True
+        assert defs[0].capabilities.thinking_level_map == {
+            "high": "provider-high"
+        }
         assert defs[0].limits.context_window == 100000
         assert defs[0].limits.max_output_tokens == 8000
+
+    def test_config_override_false_removes_reasoning_feature(self):
+        from flocks.provider.provider import BaseProvider, ModelInfo, ModelCapabilities
+
+        catalog_def = ModelDefinition(
+            id="dummy-model",
+            name="Dummy Model",
+            provider_id="dummy",
+            fetch_from=FetchFrom.PREDEFINED,
+            capabilities=ModelCapabilitiesV2(
+                features=[ModelFeature.REASONING],
+                supports_reasoning=True,
+            ),
+        )
+        model = ModelInfo(
+            id="dummy-model",
+            name="Dummy Model",
+            provider_id="dummy",
+            capabilities=ModelCapabilities(supports_reasoning=False),
+        )
+        model._explicit_keys = {"supports_reasoning"}
+
+        p = BaseProvider("dummy", "Dummy")
+        overridden = p._apply_config_overrides(catalog_def, model)
+
+        assert overridden.capabilities.supports_reasoning is False
+        assert ModelFeature.REASONING not in overridden.capabilities.features
+
+    def test_config_override_replaces_catalog_thinking_level_map(self):
+        from flocks.provider.provider import BaseProvider, ModelCapabilities, ModelInfo
+
+        catalog_def = ModelDefinition(
+            id="dummy-model",
+            name="Dummy Model",
+            provider_id="dummy",
+            capabilities=ModelCapabilitiesV2(
+                thinking_level_map={"high": "catalog-high"},
+            ),
+        )
+        model = ModelInfo(
+            id="dummy-model",
+            name="Dummy Model",
+            provider_id="dummy",
+            capabilities=ModelCapabilities(
+                thinking_level_map={"low": "custom-low"},
+            ),
+        )
+        model._explicit_keys = {"thinking_level_map"}
+
+        overridden = BaseProvider("dummy", "Dummy")._apply_config_overrides(
+            catalog_def,
+            model,
+        )
+
+        assert overridden.capabilities.thinking_level_map == {
+            "low": "custom-low"
+        }
+
+    def test_config_override_preserves_cache_read_pricing(self):
+        from flocks.provider.provider import BaseProvider, ModelCapabilities, ModelInfo
+
+        catalog_def = ModelDefinition(
+            id="dummy-model",
+            name="Dummy Model",
+            provider_id="dummy",
+            pricing=PriceConfig(input=1.0, output=2.0),
+        )
+        model = ModelInfo(
+            id="dummy-model",
+            name="Dummy Model",
+            provider_id="dummy",
+            capabilities=ModelCapabilities(),
+            pricing={
+                "input": 1.0,
+                "output": 2.0,
+                "cache_read": 0.2,
+                "currency": "CNY",
+            },
+        )
+        model._explicit_keys = {
+            "input_price",
+            "output_price",
+            "cache_read_price",
+            "currency",
+        }
+
+        overridden = BaseProvider("dummy", "Dummy")._apply_config_overrides(
+            catalog_def,
+            model,
+        )
+
+        assert overridden.pricing is not None
+        assert overridden.pricing.cache_read == 0.2
+        assert overridden.pricing.currency == "CNY"
 
     def test_configure_from_credential(self):
         from flocks.provider.provider import BaseProvider

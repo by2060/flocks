@@ -20,6 +20,7 @@ from flocks.provider.provider import (
     ModelInfo,
     StreamChunk,
 )
+from flocks.provider.interleaved import is_kimi_k27_code_model, is_kimi_k3_model
 from flocks.utils.log import Log
 
 log = Log.create(service="provider.openai_base")
@@ -29,7 +30,142 @@ log = Log.create(service="provider.openai_base")
 # change covers all three providers. Granular values (instead of a flat
 # timeout) let small control-plane requests fail fast while multimodal
 # (image) uploads get the headroom they need on slow links.
-DEFAULT_HTTP_TIMEOUT = httpx.Timeout(connect=30.0, read=600.0, write=600.0, pool=60.0)
+DEFAULT_HTTP_TIMEOUT = httpx.Timeout(connect=30.0, read=180.0, write=1800.0, pool=60.0)
+DEFAULT_MAX_RESPONSE_BYTES = 16 * 1024 * 1024
+
+
+class ResponseBodySafetyError(httpx.TransportError):
+    """Raised when an LLM response cannot be safely consumed."""
+
+
+class ResponseBodyTooLargeError(ResponseBodySafetyError):
+    """Raised before an OpenAI-style response can be fully buffered."""
+
+    def __init__(self, max_bytes: int, received_bytes: int) -> None:
+        self.max_bytes = max_bytes
+        self.received_bytes = received_bytes
+        super().__init__(
+            "LLM response body exceeded the configured limit: "
+            f"{received_bytes} bytes received (limit {max_bytes} bytes)"
+        )
+
+
+class ResponseBodyUnsupportedEncodingError(ResponseBodySafetyError):
+    """Raised before compressed response content can bypass the byte cap."""
+
+    def __init__(self, content_encoding: str) -> None:
+        self.content_encoding = content_encoding
+        super().__init__(
+            "LLM response uses unsupported content encoding "
+            f"{content_encoding!r}; expected identity"
+        )
+
+
+class LLMResponseSafetyError(RuntimeError):
+    """Provider-facing error for a response rejected by the memory guard."""
+
+
+class LLMResponseTooLargeError(LLMResponseSafetyError):
+    """Provider-facing error that preserves an HTTP response-size failure."""
+
+
+class LLMResponseUnsupportedEncodingError(LLMResponseSafetyError):
+    """Provider-facing error for a compressed response body."""
+
+
+class _ResponseSizeLimitedStream(httpx.AsyncByteStream):
+    def __init__(self, stream: httpx.AsyncByteStream, max_bytes: int) -> None:
+        self._stream = stream
+        self._max_bytes = max_bytes
+        self._received_bytes = 0
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        async for chunk in self._stream:
+            self._received_bytes += len(chunk)
+            if self._received_bytes > self._max_bytes:
+                await self.aclose()
+                raise ResponseBodyTooLargeError(
+                    self._max_bytes,
+                    self._received_bytes,
+                )
+            yield chunk
+
+    async def aclose(self) -> None:
+        await self._stream.aclose()
+
+
+def resolve_max_response_bytes(custom_settings: Any = None) -> int:
+    """Resolve the hard byte cap before model responses are buffered."""
+    configured = None
+    if isinstance(custom_settings, dict):
+        configured = custom_settings.get("max_response_bytes")
+    if configured is None:
+        configured = os.getenv("FLOCKS_LLM_MAX_RESPONSE_BYTES")
+    try:
+        value = int(configured)
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_RESPONSE_BYTES
+    return value if value > 0 else DEFAULT_MAX_RESPONSE_BYTES
+
+
+def response_size_limit_hook(max_bytes: int):
+    """Create an httpx response hook that rejects oversized bodies early."""
+    async def _limit(response: httpx.Response) -> None:
+        content_encoding = response.headers.get("content-encoding", "").strip().lower()
+        if content_encoding not in ("", "identity"):
+            await response.aclose()
+            raise ResponseBodyUnsupportedEncodingError(content_encoding)
+        content_length = response.headers.get("content-length")
+        try:
+            declared_bytes = int(content_length) if content_length is not None else 0
+        except ValueError:
+            declared_bytes = 0
+        if declared_bytes > max_bytes:
+            await response.aclose()
+            raise ResponseBodyTooLargeError(max_bytes, declared_bytes)
+        response.stream = _ResponseSizeLimitedStream(response.stream, max_bytes)
+
+    return _limit
+
+
+def create_openai_http_client(
+    *,
+    trust_env: bool,
+    verify: bool,
+    timeout: httpx.Timeout = DEFAULT_HTTP_TIMEOUT,
+    custom_settings: Any = None,
+) -> httpx.AsyncClient:
+    """Build the shared OpenAI-compatible client with an ingress size cap."""
+    max_response_bytes = resolve_max_response_bytes(custom_settings)
+    return httpx.AsyncClient(
+        trust_env=trust_env,
+        verify=verify,
+        timeout=timeout,
+        headers={"Accept-Encoding": "identity"},
+        event_hooks={"response": [response_size_limit_hook(max_response_bytes)]},
+    )
+
+
+def _response_body_safety_error(exc: BaseException) -> Optional[ResponseBodySafetyError]:
+    """Find a transport response-safety error after the OpenAI SDK wraps it."""
+    seen = set()
+    current: Optional[BaseException] = exc
+    while current is not None and id(current) not in seen:
+        if isinstance(current, ResponseBodySafetyError):
+            return current
+        seen.add(id(current))
+        next_exc = current.__cause__ or current.__context__
+        current = next_exc if isinstance(next_exc, BaseException) else None
+    return None
+
+
+def raise_if_response_body_unsafe(exc: BaseException) -> None:
+    """Expose a useful error instead of the SDK's generic connection error."""
+    safety_error = _response_body_safety_error(exc)
+    if isinstance(safety_error, ResponseBodyTooLargeError):
+        raise LLMResponseTooLargeError(str(safety_error)) from exc
+    if isinstance(safety_error, ResponseBodyUnsupportedEncodingError):
+        raise LLMResponseUnsupportedEncodingError(str(safety_error)) from exc
 
 
 # Canonical OpenAI-style content translation, shared by every provider that
@@ -301,7 +437,26 @@ def _normalize_stream_usage(raw_usage: Any) -> Optional[Dict[str, int]]:
     prompt_tokens = (_pt if _pt is not None else getattr(raw_usage, "input_tokens", 0)) or 0
     _ct = getattr(raw_usage, "completion_tokens", None)
     completion_tokens = (_ct if _ct is not None else getattr(raw_usage, "output_tokens", 0)) or 0
-    reasoning_tokens = getattr(raw_usage, "reasoning_tokens", 0) or 0
+    completion_details = getattr(raw_usage, "completion_tokens_details", None)
+    output_details = getattr(raw_usage, "output_tokens_details", None)
+    nested_reasoning_tokens = (
+        getattr(completion_details, "reasoning_tokens", 0)
+        or getattr(output_details, "reasoning_tokens", 0)
+        or 0
+    )
+    reasoning_tokens = (
+        getattr(raw_usage, "reasoning_tokens", 0)
+        or nested_reasoning_tokens
+        or 0
+    )
+    if nested_reasoning_tokens:
+        # OpenAI reports reasoning_tokens as a breakdown already included in
+        # completion_tokens / output_tokens. Flocks stores visible output and
+        # reasoning separately, so remove that nested subset before persisting.
+        completion_tokens = max(
+            0,
+            completion_tokens - nested_reasoning_tokens,
+        )
     total_tokens = getattr(raw_usage, "total_tokens", 0) or (
         prompt_tokens + completion_tokens + reasoning_tokens
     )
@@ -348,6 +503,125 @@ def _supports_include_usage_fallback(exc: Exception) -> bool:
             "extra fields not permitted",
         )
     )
+
+
+def _supports_max_completion_tokens_fallback(exc: Exception) -> bool:
+    """Return True when the provider rejects ``max_completion_tokens``."""
+    message = str(exc).lower()
+    return "max_completion_tokens" in message and any(
+        marker in message
+        for marker in (
+            "unsupported parameter",
+            "unknown parameter",
+            "unrecognized parameter",
+            "extra inputs are not permitted",
+            "extra fields not permitted",
+            "not permitted",
+        )
+    )
+
+
+def resolve_openai_token_limit(kwargs: Dict[str, Any]) -> Optional[int]:
+    """Resolve output token limits from either OpenAI naming variant."""
+    max_completion_tokens = kwargs.get("max_completion_tokens")
+    if max_completion_tokens is not None:
+        return max_completion_tokens
+    return kwargs.get("max_tokens")
+
+
+def apply_openai_token_limit(
+    params: Dict[str, Any],
+    max_tokens: Optional[int],
+    *,
+    prefer_completion_tokens: bool = False,
+    completion_tokens_explicit: bool = False,
+) -> None:
+    """Apply the preferred token-limit field to an OpenAI-style payload."""
+    if max_tokens is None:
+        return
+    if completion_tokens_explicit or prefer_completion_tokens:
+        params["max_completion_tokens"] = max_tokens
+    else:
+        params["max_tokens"] = max_tokens
+
+
+def _is_effective_thinking_enabled(
+    model_id: str,
+    thinking: Any,
+    extra_body: Dict[str, Any],
+) -> bool:
+    """Return the effective reasoning state represented by a request."""
+    if is_kimi_k27_code_model(model_id) or is_kimi_k3_model(model_id):
+        return True
+
+    if isinstance(thinking, dict):
+        return thinking.get("type") != "disabled"
+    if thinking:
+        return True
+
+    extra_thinking = extra_body.get("thinking")
+    if isinstance(extra_thinking, dict):
+        return extra_thinking.get("type") != "disabled"
+    if extra_thinking:
+        return True
+
+    if extra_body.get("reasoning_effort") is not None:
+        return True
+    if extra_body.get("reasoning_split") is True:
+        return True
+    return extra_body.get("enable_thinking") is True
+
+
+async def create_chat_completion_with_fallbacks(
+    create_call,
+    params: Dict[str, Any],
+    *,
+    max_tokens: Optional[int],
+    logger: Any,
+    log_prefix: str,
+) -> Any:
+    """Execute a chat completion request with transport compatibility fallbacks."""
+    current_params = dict(params)
+    include_usage_retried = False
+    max_completion_tokens_retried = False
+
+    while True:
+        try:
+            return await create_call(**current_params)
+        except Exception as exc:
+            raise_if_response_body_unsafe(exc)
+            if (
+                not max_completion_tokens_retried
+                and max_tokens is not None
+                and "max_completion_tokens" in current_params
+                and "max_tokens" not in current_params
+                and _supports_max_completion_tokens_fallback(exc)
+            ):
+                max_completion_tokens_retried = True
+                logger.warn(f"{log_prefix}.max_completion_tokens_unsupported", {
+                    "model": current_params.get("model"),
+                    "error": str(exc),
+                })
+                current_params = dict(current_params)
+                current_params.pop("max_completion_tokens", None)
+                current_params["max_tokens"] = max_tokens
+                continue
+
+            if (
+                not include_usage_retried
+                and "stream_options" in current_params
+                and _supports_include_usage_fallback(exc)
+            ):
+                include_usage_retried = True
+                logger.warn(f"{log_prefix}.stream.include_usage_unsupported", {
+                    "model": current_params.get("model"),
+                    "error": str(exc),
+                })
+                current_params = dict(current_params)
+                current_params.pop("stream_options", None)
+                continue
+
+            raise
 
 
 class ThinkTagExtractor:
@@ -698,6 +972,7 @@ class OpenAIBaseProvider(BaseProvider):
     ENV_BASE_URL: str = ""
     CATALOG_ID: str = ""
     ALLOW_NO_API_KEY: bool = False
+    PREFER_MAX_COMPLETION_TOKENS: bool = False
     NO_API_KEY_PLACEHOLDER: str = "not-needed"
 
     def __init__(self, provider_id: str, name: str):
@@ -762,16 +1037,18 @@ class OpenAIBaseProvider(BaseProvider):
             if isinstance(custom_settings, dict) and "trust_env" in custom_settings:
                 trust_env = _coerce_bool(custom_settings.get("trust_env"), trust_env)
             timeout = DEFAULT_HTTP_TIMEOUT
-            http_client = httpx.AsyncClient(
+            http_client = create_openai_http_client(
                 trust_env=trust_env,
                 verify=verify_ssl,
                 timeout=timeout,
+                custom_settings=custom_settings,
             )
 
             self._client = AsyncOpenAI(
                 api_key=api_key,
                 base_url=base_url,
                 http_client=http_client,
+                max_retries=0,
             )
             log.info("openai_base.client.created", {
                 "provider_id": getattr(self._config, "id", None),
@@ -821,6 +1098,8 @@ class OpenAIBaseProvider(BaseProvider):
         openai_messages = self._format_messages(messages)
 
         thinking = kwargs.get("thinking")
+        max_tokens = resolve_openai_token_limit(kwargs)
+        max_completion_tokens_explicit = kwargs.get("max_completion_tokens") is not None
 
         params: Dict[str, Any] = {
             "model": model_id,
@@ -837,8 +1116,14 @@ class OpenAIBaseProvider(BaseProvider):
         if extra_body:
             params["extra_body"] = extra_body
 
-        if kwargs.get("max_tokens"):
-            params["max_tokens"] = kwargs["max_tokens"]
+        apply_openai_token_limit(
+            params,
+            max_tokens,
+            prefer_completion_tokens=(
+                self.PREFER_MAX_COMPLETION_TOKENS or is_kimi_k3_model(model_id)
+            ),
+            completion_tokens_explicit=max_completion_tokens_explicit,
+        )
         if kwargs.get("tools"):
             params["tools"] = kwargs["tools"]
 
@@ -847,15 +1132,25 @@ class OpenAIBaseProvider(BaseProvider):
         # these request logs are emitted for every model call in long sessions.
         log.info("openai_base.chat.request", {
             "model": model_id,
-            "thinking_enabled": bool(thinking),
+            "thinking_enabled": _is_effective_thinking_enabled(
+                model_id,
+                thinking,
+                extra_body,
+            ),
             "has_extra_body": "extra_body" in params,
             "has_tools": bool(kwargs.get("tools")),
-            "max_tokens": kwargs.get("max_tokens"),
+            "max_tokens": max_tokens,
             "has_temperature": "temperature" in params,
             "message_summary": _summarise_messages(openai_messages),
         })
 
-        response = await client.chat.completions.create(**params)
+        response = await create_chat_completion_with_fallbacks(
+            client.chat.completions.create,
+            params,
+            max_tokens=max_tokens,
+            logger=log,
+            log_prefix="openai_base",
+        )
         if not response.choices:
             extra = getattr(response, "model_extra", {}) or {}
             err_detail = extra.get("error") or extra.get("message") or str(extra) or "no choices returned"
@@ -894,6 +1189,8 @@ class OpenAIBaseProvider(BaseProvider):
         openai_messages = self._format_messages(messages)
 
         thinking = kwargs.get("thinking")
+        max_tokens = resolve_openai_token_limit(kwargs)
+        max_completion_tokens_explicit = kwargs.get("max_completion_tokens") is not None
 
         params: Dict[str, Any] = {
             "model": model_id,
@@ -912,8 +1209,14 @@ class OpenAIBaseProvider(BaseProvider):
         if extra_body:
             params["extra_body"] = extra_body
 
-        if kwargs.get("max_tokens"):
-            params["max_tokens"] = kwargs["max_tokens"]
+        apply_openai_token_limit(
+            params,
+            max_tokens,
+            prefer_completion_tokens=(
+                self.PREFER_MAX_COMPLETION_TOKENS or is_kimi_k3_model(model_id)
+            ),
+            completion_tokens_explicit=max_completion_tokens_explicit,
+        )
         if kwargs.get("tools"):
             params["tools"] = kwargs["tools"]
 
@@ -921,28 +1224,28 @@ class OpenAIBaseProvider(BaseProvider):
         # without repeating the full message history on every turn.
         log.info("openai_base.stream.request", {
             "model": model_id,
-            "thinking_enabled": bool(thinking),
+            "thinking_enabled": _is_effective_thinking_enabled(
+                model_id,
+                thinking,
+                extra_body,
+            ),
             "has_extra_body": "extra_body" in params,
             "has_tools": bool(kwargs.get("tools")),
-            "max_tokens": kwargs.get("max_tokens"),
+            "max_tokens": max_tokens,
             "has_temperature": "temperature" in params,
             "include_usage": True,
             "message_summary": _summarise_messages(openai_messages),
         })
 
-        try:
-            stream = await client.chat.completions.create(**params)
-        except Exception as exc:
-            if not _supports_include_usage_fallback(exc):
-                raise
-            log.warn("openai_base.stream.include_usage_unsupported", {
-                "model": model_id,
-                "error": str(exc),
-            })
-            params_without_usage = dict(params)
-            params_without_usage.pop("stream_options", None)
-            stream = await client.chat.completions.create(**params_without_usage)
+        stream = await create_chat_completion_with_fallbacks(
+            client.chat.completions.create,
+            params,
+            max_tokens=max_tokens,
+            logger=log,
+            log_prefix="openai_base",
+        )
         tool_calls: Dict[int, Dict[str, Any]] = {}
+        started_tool_inputs: set[int] = set()
         emitted_substantive_chunk = False
         stream_usage: Optional[Dict[str, int]] = None
         usage_emitted = False
@@ -1026,6 +1329,7 @@ class OpenAIBaseProvider(BaseProvider):
                 delta_tcs = getattr(delta, "tool_calls", None)
                 if delta_tcs:
                     emitted_substantive_chunk = True
+                    tool_input_markers: List[Dict[str, Any]] = []
                     for tc in delta_tcs:
                         idx = tc.index
                         if idx not in tool_calls:
@@ -1043,6 +1347,28 @@ class OpenAIBaseProvider(BaseProvider):
                                 tool_calls[idx]["function"]["arguments"] += (
                                     tc.function.arguments
                                 )
+                        accumulated_name = tool_calls[idx]["function"]["name"]
+                        if accumulated_name and idx not in started_tool_inputs:
+                            tool_input_markers.append({
+                                "index": idx,
+                                "id": tool_calls[idx]["id"],
+                                "type": "function",
+                                "function": {
+                                    "name": accumulated_name,
+                                    "arguments": "",
+                                },
+                            })
+                            started_tool_inputs.add(idx)
+
+                    # Surface the tool as soon as its name is known, but keep
+                    # partial JSON private. The terminal chunk below publishes
+                    # the complete input once the model finishes generating it.
+                    if tool_input_markers:
+                        yield StreamChunk(
+                            delta="",
+                            finish_reason=None,
+                            tool_calls=tool_input_markers,
+                        )
 
             if choice.finish_reason:
                 # Flush any remaining buffered content from the think-tag extractor
@@ -1068,7 +1394,10 @@ class OpenAIBaseProvider(BaseProvider):
                         yield StreamChunk(delta=seg_text, finish_reason=None)
 
                 if tool_calls:
-                    sorted_calls = [tool_calls[i] for i in sorted(tool_calls.keys())]
+                    sorted_calls = [
+                        {"index": i, **tool_calls[i]}
+                        for i in sorted(tool_calls.keys())
+                    ]
                     tool_calls.clear()
                     # Preserve real finish_reason (e.g. "length" when max_tokens
                     # hit) so the runner can detect truncated tool arguments.

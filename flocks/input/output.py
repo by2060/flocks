@@ -10,6 +10,10 @@ from flocks.input.events import ParsedCommand, UserInputEvent
 DirectResponseCallback = Callable[[UserInputEvent, str], Awaitable[None]]
 RunLlmCallback = Callable[[UserInputEvent, str, Optional[str]], Awaitable[None]]
 SessionControlCallback = Callable[[UserInputEvent, ParsedCommand], Awaitable[bool]]
+CommandStatusCallback = Callable[
+    [UserInputEvent, str, Optional[str]],
+    Awaitable[None],
+]
 SideEffectCallback = Callable[[], Awaitable[None]]
 
 
@@ -39,7 +43,18 @@ class OutputSink(ABC):
     ) -> bool:
         return False
 
+    async def publish_command_status(
+        self,
+        event: UserInputEvent,
+        status: str,
+        message: Optional[str] = None,
+    ) -> None:
+        return None
+
     async def clear_screen(self) -> None:
+        return None
+
+    async def clear_history(self) -> None:
         return None
 
 
@@ -53,13 +68,17 @@ class CallbackOutputSink(OutputSink):
         direct_response: DirectResponseCallback,
         run_llm: RunLlmCallback,
         session_control: Optional[SessionControlCallback] = None,
+        command_status: Optional[CommandStatusCallback] = None,
         clear_screen: Optional[SideEffectCallback] = None,
+        clear_history: Optional[SideEffectCallback] = None,
     ) -> None:
         super().__init__(surface)
         self._direct_response = direct_response
         self._run_llm = run_llm
         self._session_control = session_control
+        self._command_status = command_status
         self._clear_screen = clear_screen
+        self._clear_history = clear_history
 
     async def publish_direct_response(self, event: UserInputEvent, text: str) -> None:
         await self._direct_response(event, text)
@@ -81,9 +100,22 @@ class CallbackOutputSink(OutputSink):
             return False
         return await self._session_control(event, parsed)
 
+    async def publish_command_status(
+        self,
+        event: UserInputEvent,
+        status: str,
+        message: Optional[str] = None,
+    ) -> None:
+        if self._command_status is not None:
+            await self._command_status(event, status, message)
+
     async def clear_screen(self) -> None:
         if self._clear_screen is not None:
             await self._clear_screen()
+
+    async def clear_history(self) -> None:
+        if self._clear_history is not None:
+            await self._clear_history()
 
 
 class SSEOutputSink(CallbackOutputSink):

@@ -11,6 +11,25 @@ def test_flocks_mcp_is_registered_as_builtin_tool() -> None:
     assert tool.info.source in {None, "builtin"}
 
 
+def test_flocks_mcp_schema_exposes_actions_and_config_shape() -> None:
+    ToolRegistry.init()
+
+    schema = ToolRegistry.get_schema("flocks_mcp")
+
+    assert schema is not None
+    assert schema.properties["subcommand"]["enum"] == [
+        "list",
+        "add",
+        "remove",
+        "connect",
+        "disconnect",
+    ]
+    config_schema = schema.properties["config"]
+    assert config_schema["type"] == "object"
+    assert config_schema["additionalProperties"] is False
+    assert config_schema["properties"]["command"]["items"] == {"type": "string"}
+
+
 def test_skill_load_remains_registered_as_builtin_tool() -> None:
     ToolRegistry.init()
 
@@ -28,3 +47,30 @@ def test_lsp_remains_non_native_by_default() -> None:
 
     assert tool is not None
     assert tool.info.native is False
+
+
+def test_task_remains_non_native_when_declared() -> None:
+    ToolRegistry.init()
+
+    tool = ToolRegistry.get("task")
+
+    assert tool is not None
+    assert tool.info.native is False
+
+
+def test_model_config_tools_remain_non_native_by_default() -> None:
+    ToolRegistry.init()
+
+    for name in ("list_providers", "add_provider", "add_model"):
+        tool = ToolRegistry.get(name)
+        assert tool is not None
+        assert tool.info.native is False
+
+
+def test_session_manage_remains_native_when_declared() -> None:
+    ToolRegistry.init()
+
+    tool = ToolRegistry.get("session_manage")
+
+    assert tool is not None
+    assert tool.info.native is True

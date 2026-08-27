@@ -5,6 +5,7 @@ Manages system prompts, context injection, and token counting.
 Based on Flocks' ported src/session/prompt.ts and src/session/system.ts
 """
 
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Dict, Any, Iterable, List, Optional, TYPE_CHECKING, Union
 from pydantic import BaseModel, Field
@@ -17,6 +18,11 @@ from datetime import datetime
 import platform
 
 from . import prompt_strings
+from flocks.memory.injection import (
+    CURATED_MEMORY_INJECTION_TOKENS,
+    USER_MEMORY_INJECTION_TOKENS,
+    render_memory_snapshot,
+)
 from flocks.utils.log import Log
 
 
@@ -28,8 +34,6 @@ if TYPE_CHECKING:
 
 # Output token maximum
 OUTPUT_TOKEN_MAX = int(os.getenv("FLOCKS_OUTPUT_TOKEN_MAX", "32000"))
-MEMORY_GUIDANCE_TOOL_NAMES = frozenset({"memory_get", "memory_search", "memory_write"})
-
 SystemPromptCache = Dict[str, Any]
 AsyncPromptFactory = Callable[[], Awaitable[Optional[str]]]
 StringPromptFactory = Callable[[], Optional[str]]
@@ -84,6 +88,10 @@ def get_prompt_codex() -> str:
     return _load_prompt_file("codex_header.txt")
 
 
+def get_prompt_flocks_config_guard() -> str:
+    return _load_prompt_file("flocks_config_guard.txt")
+
+
 PROMPT_DEFAULT = """You are Flocks, an AI-Native SecOps Platform.
 
 You specialize in cybersecurity operations including:
@@ -97,23 +105,12 @@ You specialize in cybersecurity operations including:
 
 IMPORTANT: Accuracy is your core principle. All outputs must be grounded in verifiable evidence, explicit context, or validated reasoning. Do not speculate, fabricate facts, or infer beyond the available information. When uncertainty exists, state it clearly and constrain conclusions accordingly.
 
-Best practices for security operations:
-Your work primarily covers threat detection and analysis, incident response, vulnerability assessment, security automation, malware and forensic analysis, and compliance or hardening reviews. 
-Using tools to solve tasks is a core part of your capabilities.
-
-Apply these principles consistently:
-- Preserve evidence with timestamps, file paths, line numbers, and relevant context.
-- Protect sensitive data in logs and outputs.
-- Keep all analysis, tooling, and automation strictly defensive.
-- Validate findings before declaring threats or vulnerabilities, and consider operational context to reduce false positives.
-
-For these cybersecurity tasks, follow these steps:
-1. **Gather:** Collect relevant security data with read, grep, and glob.
-2. **Analyze:** Look for indicators, patterns, and anomalies.
-3. **Correlate:** Link related events and build an attack narrative.
-4. **Document:** Record evidence, severity, and supporting context.
-5. **Recommend:** Provide actionable remediation or response steps.
-6. **Verify:** Validate findings and test detection logic when applicable.
+For cybersecurity investigations, assessments, and defensive automation, apply this workflow as relevant:
+1. Gather relevant evidence using the available tools.
+2. Analyze and correlate the evidence. Consider operational context and plausible benign explanations, and do not infer beyond what the evidence supports.
+3. Document findings with severity, confidence, and traceable evidence such as timestamps, source paths, and line numbers where applicable. Redact secrets and sensitive data.
+4. Recommend actionable defensive remediation or response steps.
+5. Verify findings before declaring threats or vulnerabilities and, when practical, test detection or remediation logic.
 
 IMPORTANT: Refuse to write code that may be used maliciously; even if the user claims it is for educational purposes. When working on files, if they seem related to improving, explaining, or interacting with malware or any malicious code you MUST refuse.
 IMPORTANT: Before you begin work, think about what the task you're working on is supposed to do. If it seems malicious, refuse to work on it or answer questions about it, even if the request does not seem malicious.
@@ -257,13 +254,31 @@ class SystemPrompt:
     ) -> List[str]:
         """Build stable workspace metadata that should stay cache-friendly."""
         working_dir = directory or os.getcwd()
+        source_code_dir = str(
+            Path(
+                os.getenv(
+                    "FLOCKS_REPO_ROOT",
+                    str(Path(__file__).resolve().parents[2]),
+                )
+            )
+            .expanduser()
+            .resolve()
+        )
         is_git = vcs == "git"
+
+        from flocks.workspace.manager import WorkspaceManager
+        ws = WorkspaceManager.get_instance()
+        outputs_dir = str(ws.get_default_outputs_dir())
+
         env_info = [
             "Here is some useful information about the environment you are running in:",
             "<env>",
-            f"  Source code directory: {working_dir}",
+            f"  flocks source code directory: {source_code_dir}",
+            f"  current working directory: {working_dir}",
             f"  Is directory a git repo: {'yes' if is_git else 'no'}",
             f"  Platform: {platform.system().lower()}",
+            "   Python executor: uv python",
+            "   Python package manager: uv pip",
             "</env>",
         ]
         return ["\n".join(env_info)]
@@ -429,39 +444,19 @@ class SessionPrompt:
     
     # Template cache
     _templates: Dict[str, PromptTemplate] = {}
-    _tokenizer = None
-    
-    @classmethod
-    def _get_tokenizer(cls):
-        """Get or create tiktoken tokenizer"""
-        if cls._tokenizer is None:
-            try:
-                from flocks.utils.tiktoken_cache import ensure as _ensure_tiktoken
-                _ensure_tiktoken()
-                import tiktoken
-                cls._tokenizer = tiktoken.encoding_for_model("gpt-4")
-            except ImportError:
-                log.warn("prompt.tokenizer", {"error": "tiktoken not installed"})
-                return None
-        return cls._tokenizer
-    
+
     @classmethod
     def count_tokens(cls, text: str) -> int:
-        """
-        Count tokens in text using tiktoken
-        
-        Args:
-            text: Text to count tokens for
-            
-        Returns:
-            Token count (or character estimate if tiktoken not available)
+        """Count tokens using fast chars/4 rough estimate.
+
+        Returns ``len(text) // 4`` directly — no tiktoken, no model call.
+        Fast enough for every-step overflow detection while staying within
+        the same order of magnitude as provider-side counts.  The fixed
+        85 % × context_window overflow threshold tolerates the slack from
+        this rough estimate without needing a safety margin.
         """
         if not text:
             return 0
-        tokenizer = cls._get_tokenizer()
-        if tokenizer:
-            return len(tokenizer.encode(text))
-        # Fallback: rough estimate (4 chars ≈ 1 token)
         return len(text) // 4
     
     @classmethod
@@ -488,88 +483,214 @@ class SessionPrompt:
     
     @classmethod
     def estimate_tokens(cls, text: str) -> int:
-        """Quick token estimate without tokenizer (4 chars ≈ 1 token)"""
-        if not text:
-            return 0
-        return len(text) // 4
+        """Alias for :meth:`count_tokens` — both return ``len(text) // 4``.
+
+        Kept for callers that still import ``estimate_tokens`` by name (pruning,
+        a handful of log statements, legacy tests).  ``count_tokens`` is the
+        canonical entry point; this thin wrapper forwards to it so the two
+        names cannot drift apart.
+        """
+        return cls.count_tokens(text)
     
+    # ------------------------------------------------------------------
+    # E6 — per-message token cache
+    # ------------------------------------------------------------------
+    # ``estimate_full_context_tokens`` is called once per agent step, and
+    # for long sessions the dominant cost is the message-level
+    # ``count_tokens`` invocations.  98%+ of the messages have not
+    # changed between turns, so we memoise the per-message token total
+    # keyed by message id.  Streaming / in-flight messages are excluded
+    # (they're identified by ``finish is None``) because their content
+    # is still mutating.
+    #
+    # The cache is bounded by ``_MESSAGE_CACHE_MAX``; eviction is FIFO
+    # via ``OrderedDict.popitem(last=False)``.  Callers that mutate a
+    # message in place (e.g. ``pruning.prune`` marks a tool part as
+    # compacted) MUST call :meth:`invalidate_message_cache` so the next
+    # estimate re-counts the message instead of returning the stale
+    # pre-compaction figure.
+    # ------------------------------------------------------------------
+    _MESSAGE_CACHE_MAX = 2_000
+    _message_token_cache: "OrderedDict[str, int]" = OrderedDict()
+
     @classmethod
     async def estimate_full_context_tokens(
         cls,
         session_id: str,
         messages: list,
+        *,
+        policy: Optional[Any] = None,
+        apply_safety_margin: Optional[bool] = None,
     ) -> int:
+        """Estimate total tokens in the context sent to the LLM.
+
+        Sums the message bodies and their parts (tool inputs/outputs,
+        reasoning) using the per-message LRU cache (E6).  Returns a pure
+        chars/4 figure with no overhead or safety multiplier — the fixed
+        85 % × context_window overflow threshold leaves enough headroom
+        for that slack.
+
+        ``policy`` and ``apply_safety_margin`` are accepted for backward
+        compatibility with callers built against the previous v2 contract,
+        but are unused in the current implementation.
         """
-        Estimate the total token count of the full context sent to the LLM.
-        
-        Unlike count_message_tokens() which only counts message content text,
-        this method also counts:
-        - Message text content
-        - Tool call inputs and outputs (from parts)
-        - Reasoning content (from parts)
-        - System prompt overhead estimate
-        
-        This provides a much more accurate estimate when the provider doesn't
-        report usage data.
-        
-        Args:
-            session_id: Session ID for parts lookup
-            messages: List of messages (MessageInfo objects or dicts)
-            
-        Returns:
-            Estimated total token count
+        del policy, apply_safety_margin  # legacy parameters, kept for ABI
+
+        total = 0
+        for msg in messages:
+            total += await cls._tokens_for_message(session_id, msg)
+        return total
+
+    @classmethod
+    async def estimate_tool_result_tokens(
+        cls,
+        session_id: str,
+        message_id: str,
+    ) -> int:
+        """Estimate tool-result tokens added after an assistant model call."""
+        from flocks.session.message import Message
+
+        try:
+            parts = await Message.parts(message_id, session_id)
+        except Exception as exc:
+            log.debug("prompt.tool_result_estimate.parts_failed", {
+                "message_id": message_id,
+                "error": str(exc),
+            })
+            return 0
+
+        total = 0
+        for part in parts:
+            if getattr(part, "type", None) != "tool":
+                continue
+            state = getattr(part, "state", None)
+            if state is None:
+                continue
+            time_info = getattr(state, "time", None)
+            if isinstance(time_info, dict) and time_info.get("compacted"):
+                total += 10
+                continue
+
+            status = getattr(state, "status", None)
+            if status == "completed":
+                output = getattr(state, "output", None)
+                if output:
+                    total += cls.count_tokens(
+                        output if isinstance(output, str) else str(output)
+                    )
+            elif status == "error":
+                error = getattr(state, "error", "Unknown error")
+                total += cls.count_tokens(f"Error: {error}")
+            elif status == "running":
+                total += cls.count_tokens("Error: Tool execution was interrupted")
+        return total
+
+    @classmethod
+    async def _tokens_for_message(cls, session_id: str, msg: Any) -> int:
+        """Return the token contribution of a single message (E6).
+
+        Cached by ``msg.id`` for messages that have finished streaming
+        (``finish`` is non-None and not ``"streaming"``).  In-flight
+        messages skip the cache because their content / parts are still
+        mutating.  Tool parts whose ``state.time.compacted`` flag has
+        flipped are NOT re-counted automatically; callers that flip the
+        flag (currently ``pruning.prune`` and
+        ``pruning.truncate_oversized_tool_outputs``) MUST invalidate the
+        affected ``msg.id`` via :meth:`invalidate_message_cache`.
         """
         from flocks.session.message import Message
-        
+
+        msg_id = getattr(msg, 'id', None) if not isinstance(msg, dict) else msg.get('id')
+        finish = getattr(msg, 'finish', None) if not isinstance(msg, dict) else msg.get('finish')
+        # ``finish is None`` means the message is still being streamed.
+        cacheable = bool(msg_id) and finish is not None and finish != "streaming"
+        if cacheable and msg_id in cls._message_token_cache:
+            # Refresh LRU ordering so hot messages stay near the tail.
+            cls._message_token_cache.move_to_end(msg_id)
+            return cls._message_token_cache[msg_id]
+
         total = 0
-        
-        for msg in messages:
-            # Count message text content
-            content = ""
-            if isinstance(msg, dict):
-                content = msg.get("content", "")
-            elif hasattr(msg, "content"):
-                content = msg.content or ""
-            
-            total += cls.count_tokens(content)
-            
-            # Count parts (tool inputs/outputs, text parts, reasoning)
-            try:
-                msg_id = msg.id if hasattr(msg, 'id') else ""
-                parts = await Message.parts(msg_id, session_id)
-                for part in parts:
-                    if part.type == "text":
-                        total += cls.count_tokens(getattr(part, 'text', ''))
-                    elif part.type == "tool":
-                        state = getattr(part, 'state', None)
-                        if state:
-                            # Count tool input
-                            tool_input = getattr(state, 'input', None)
-                            if tool_input:
-                                input_str = str(tool_input) if not isinstance(tool_input, str) else tool_input
-                                total += cls.count_tokens(input_str)
-                            # Count tool output (respect compacted flag)
-                            time_info = getattr(state, 'time', None)
-                            is_compacted = isinstance(time_info, dict) and time_info.get("compacted")
-                            if is_compacted:
-                                total += 10  # placeholder token count
-                            else:
-                                tool_output = getattr(state, 'output', None)
-                                if tool_output:
-                                    output_str = str(tool_output) if not isinstance(tool_output, str) else tool_output
-                                    total += cls.count_tokens(output_str)
-                    elif part.type == "reasoning":
-                        total += cls.count_tokens(getattr(part, 'text', ''))
-            except Exception as _e:
-                log.debug("prompt.token_estimate.parts_failed", {"message_id": getattr(msg, 'id', '?'), "error": str(_e)})
-                total += 50
-        
-        # Add estimated system prompt overhead (instructions, tool schemas, etc.)
-        # System prompts typically add 500-2000 tokens depending on agent/tools
-        total += 800
-        
+
+        # Message text content
+        content = ""
+        if isinstance(msg, dict):
+            content = msg.get("content", "")
+        elif hasattr(msg, "content"):
+            content = msg.content or ""
+        total += cls.count_tokens(content)
+
+        # Message parts (tool inputs/outputs, text parts, reasoning)
+        try:
+            parts = await Message.parts(msg_id or "", session_id)
+            for part in parts:
+                if part.type == "text":
+                    if getattr(part, "ignored", False):
+                        continue
+                    total += cls.count_tokens(getattr(part, 'text', ''))
+                elif part.type == "tool":
+                    state = getattr(part, 'state', None)
+                    if state:
+                        tool_input = getattr(state, 'input', None)
+                        if tool_input:
+                            input_str = (
+                                tool_input
+                                if isinstance(tool_input, str)
+                                else str(tool_input)
+                            )
+                            total += cls.count_tokens(input_str)
+                        time_info = getattr(state, 'time', None)
+                        is_compacted = (
+                            isinstance(time_info, dict)
+                            and time_info.get("compacted")
+                        )
+                        if is_compacted:
+                            total += 10  # post-compaction placeholder
+                        else:
+                            tool_output = getattr(state, 'output', None)
+                            if tool_output:
+                                output_str = (
+                                    tool_output
+                                    if isinstance(tool_output, str)
+                                    else str(tool_output)
+                                )
+                                total += cls.count_tokens(output_str)
+                elif part.type == "reasoning":
+                    total += cls.count_tokens(getattr(part, 'text', ''))
+        except Exception as _e:
+            log.debug("prompt.token_estimate.parts_failed", {
+                "message_id": msg_id or '?', "error": str(_e),
+            })
+            total += 50
+
+        if cacheable:
+            cls._message_token_cache[msg_id] = total
+            cls._message_token_cache.move_to_end(msg_id)
+            while len(cls._message_token_cache) > cls._MESSAGE_CACHE_MAX:
+                cls._message_token_cache.popitem(last=False)
+
         return total
-    
+
+    @classmethod
+    def invalidate_message_cache(
+        cls,
+        message_ids: Union[str, Iterable[str], None] = None,
+    ) -> None:
+        """Invalidate cached per-message token totals.
+
+        Pass a string for one message, an iterable for several, or
+        ``None`` to clear the whole cache.  Idempotent — silently
+        ignores keys that were never cached.
+        """
+        if message_ids is None:
+            cls._message_token_cache.clear()
+            return
+        if isinstance(message_ids, str):
+            cls._message_token_cache.pop(message_ids, None)
+            return
+        for mid in message_ids:
+            if mid:
+                cls._message_token_cache.pop(mid, None)
+
     @classmethod
     def load_template(cls, path: str) -> Optional[PromptTemplate]:
         """
@@ -836,10 +957,18 @@ class SessionPrompt:
         prompt_tool_names: Iterable[str],
         memory_bootstrap_data: Optional[Dict[str, Any]],
     ) -> Optional[str]:
-        """Build memory tool guidance separately from the frozen memory snapshot."""
+        """Build filesystem Memory guidance beside the frozen snapshot."""
         if not memory_bootstrap_data:
             return None
-        if not (set(prompt_tool_names) & MEMORY_GUIDANCE_TOOL_NAMES):
+        required_tools = {
+            "read",
+            "write",
+            "edit",
+            "glob",
+            "grep",
+            "memory_search",
+        }
+        if not required_tools.issubset(set(prompt_tool_names)):
             return None
         instructions = memory_bootstrap_data.get("instructions", "")
         return cls._normalize_prompt_text(instructions)
@@ -856,15 +985,50 @@ class SessionPrompt:
             return []
 
         prompts: List[str] = []
+        user_profile = memory_bootstrap_data.get("user_profile")
+        if user_profile and user_profile.get("inject"):
+            profile_content = user_profile.get("content", "")
+            if profile_content:
+                prompts.append(
+                    render_memory_snapshot(
+                        user_profile,
+                        session_id=session_id,
+                        token_budget=USER_MEMORY_INJECTION_TOKENS,
+                        count_tokens=cls.count_tokens,
+                    )
+                )
+
         main_memory = memory_bootstrap_data.get("main_memory")
         if main_memory and main_memory.get("inject"):
             memory_content = main_memory.get("content", "")
             if memory_content:
-                prompts.append(f"## {main_memory['path']}\n\n{memory_content}")
+                prompts.append(
+                    render_memory_snapshot(
+                        main_memory,
+                        session_id=session_id,
+                        token_budget=CURATED_MEMORY_INJECTION_TOKENS,
+                        count_tokens=cls.count_tokens,
+                    )
+                )
+
+        project_memory = memory_bootstrap_data.get("project_memory")
+        if project_memory and project_memory.get("inject"):
+            project_content = project_memory.get("content", "")
+            if project_content:
+                prompts.append(
+                    render_memory_snapshot(
+                        project_memory,
+                        session_id=session_id,
+                        token_budget=CURATED_MEMORY_INJECTION_TOKENS,
+                        count_tokens=cls.count_tokens,
+                    )
+                )
 
         log.debug("prompt.memory_injected", {
             "session_id": session_id,
+            "has_user_profile": user_profile is not None,
             "has_main": main_memory is not None,
+            "has_project": project_memory is not None,
         })
         return prompts
 
@@ -924,6 +1088,74 @@ class SessionPrompt:
         print("=== end system_prompt ===\n", file=sys.stderr)
 
     @classmethod
+    def _build_minimal_environment(cls, session_directory: Optional[str]) -> str:
+        """Build the small runtime environment block used by system subagents."""
+        working_dir = session_directory or os.getcwd()
+        today = datetime.now().strftime("%A %b %d, %Y")
+        return "\n".join([
+            "## Environment",
+            f"Current working directory: {working_dir}",
+            f"Platform: {platform.system().lower()}",
+            f"Today's date: {today}",
+        ])
+
+    @classmethod
+    async def _is_builtin_system_subagent_session(
+        cls,
+        *,
+        session_id: str,
+        agent_name: str,
+    ) -> bool:
+        """Return true when a built-in child uses the minimal prompt profile."""
+        try:
+            from flocks.agent.registry import Agent
+            from flocks.session.session import Session
+
+            agent = await Agent.get(agent_name)
+            if not agent:
+                return False
+            if agent.mode != "subagent" or "system" not in (agent.tags or []):
+                return False
+
+            builtin_agents_dir = Path(__file__).resolve().parents[1] / "agent" / "agents"
+            name_candidates = {
+                agent.name,
+                agent.name.replace("-", "_"),
+                agent_name,
+                agent_name.replace("-", "_"),
+            }
+            if not any((builtin_agents_dir / name / "agent.yaml").exists() for name in name_candidates):
+                return False
+
+            session = await Session.get_by_id(session_id)
+            metadata = getattr(session, "metadata", {}) if session else {}
+            if metadata.get("evolution"):
+                return False
+            return bool(session and session.parent_id)
+        except Exception as exc:
+            log.debug("prompt.subagent_minimal_check_failed", {
+                "session_id": session_id,
+                "agent_name": agent_name,
+                "error": str(exc),
+            })
+            return False
+
+    @classmethod
+    async def _build_subagent_minimal_prompts(
+        cls,
+        *,
+        session_directory: Optional[str],
+        agent_prompt: Optional[str],
+    ) -> List[str]:
+        """Build minimal system prompts for built-in system subagents."""
+        prompts = [
+            get_prompt_flocks_config_guard().strip(),
+            cls._normalize_prompt_text(agent_prompt),
+            cls._build_minimal_environment(session_directory),
+        ]
+        return [prompt for prompt in prompts if prompt]
+
+    @classmethod
     async def build_system_prompts(
         cls,
         *,
@@ -933,6 +1165,7 @@ class SessionPrompt:
         agent_prompt: Optional[str],
         provider_id: str,
         model_id: str,
+        execution_mode_prompt: Optional[str] = None,
         prompt_tool_names: Iterable[str] = (),
         tool_revision: Optional[int] = None,
         memory_bootstrap_data: Optional[Dict[str, Any]] = None,
@@ -940,6 +1173,8 @@ class SessionPrompt:
         sandbox_prompt_factory: Optional[AsyncPromptFactory] = None,
         channel_context_prompt_factory: Optional[AsyncPromptFactory] = None,
         tool_catalog_prompt_factory: Optional[StringPromptFactory] = None,
+        device_asset_prompt_factory: Optional[AsyncPromptFactory] = None,
+        device_revision: Optional[int] = None,
         use_text_tool_call_mode: bool = False,
     ) -> List[str]:
         """Build the runtime system prompt blocks for a session turn.
@@ -950,8 +1185,25 @@ class SessionPrompt:
         construction below so this method reads as an ordered list of prompt
         layers.
         """
-        normalized_tool_names = tuple(sorted(prompt_tool_names))
         vcs = "git" if session_directory else None
+        if await cls._is_builtin_system_subagent_session(
+            session_id=session_id,
+            agent_name=agent_name,
+        ):
+            prompts = await cls._build_subagent_minimal_prompts(
+                session_directory=session_directory,
+                agent_prompt=agent_prompt,
+            )
+            cls._print_system_prompts_for_debug(
+                session_id=session_id,
+                agent_name=agent_name,
+                provider_id=provider_id,
+                model_id=model_id,
+                prompts=prompts,
+            )
+            return prompts
+
+        normalized_tool_names = tuple(sorted(prompt_tool_names))
         runtime_day = datetime.now().strftime("%Y-%m-%d")
         custom_signature = SystemPrompt.custom_signature(directory=session_directory)
         memory_guidance = cls._build_memory_guidance_prompt(
@@ -975,6 +1227,13 @@ class SessionPrompt:
                 cache_scope="global",
                 digest_inputs={"model_id": model_id},
                 builder=lambda: cls._join_prompt_parts(SystemPrompt.provider(model_id)),
+            ),
+            cls._build_cached_prompt_block(
+                static_cache=static_cache,
+                name="flocks_config_guard",
+                cache_scope="global",
+                digest_inputs={"prompt": get_prompt_flocks_config_guard()},
+                builder=lambda: get_prompt_flocks_config_guard().strip(),
             ),
             cls._build_cached_prompt_block(
                 static_cache=static_cache,
@@ -1004,6 +1263,13 @@ class SessionPrompt:
             ),
             cls._build_cached_prompt_block(
                 static_cache=static_cache,
+                name="execution_mode",
+                cache_scope="runtime",
+                digest_inputs={"prompt": execution_mode_prompt or ""},
+                builder=lambda: cls._normalize_prompt_text(execution_mode_prompt),
+            ),
+            cls._build_cached_prompt_block(
+                static_cache=static_cache,
                 name="memory_snapshot",
                 cache_scope="session",
                 digest_inputs={"session_id": session_id, "snapshot": memory_snapshot},
@@ -1019,6 +1285,21 @@ class SessionPrompt:
                 },
                 builder=lambda: cls._build_optional_prompt(tool_catalog_prompt_factory) or "",
             ),
+        ]
+
+        if device_asset_prompt_factory:
+            blocks.append(await cls._build_cached_async_prompt_block(
+                static_cache=static_cache,
+                name="device_asset_hint",
+                cache_scope="runtime",
+                digest_inputs={
+                    "session_id": session_id,
+                    "device_revision": device_revision,
+                },
+                builder=device_asset_prompt_factory,
+            ))
+
+        blocks.append(
             cls._build_cached_prompt_block(
                 static_cache=static_cache,
                 name="environment_stable",
@@ -1031,8 +1312,8 @@ class SessionPrompt:
                 builder=lambda: cls._join_prompt_parts(
                     SystemPrompt.environment_stable(directory=session_directory, vcs=vcs),
                 ),
-            ),
-        ]
+            )
+        )
 
         custom_block = await cls._build_cached_async_prompt_block(
             static_cache=static_cache,

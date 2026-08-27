@@ -10,6 +10,10 @@ from pydantic import BaseModel, Field
 
 class MemoryEmbeddingConfig(BaseModel):
     """Embedding provider configuration"""
+    enabled: bool = Field(
+        False,
+        description="Enable vector embeddings for Memory search",
+    )
     provider: Literal["auto", "openai", "google", "local"] = Field(
         "auto",
         description="Embedding provider (auto=try openai then google)"
@@ -18,17 +22,18 @@ class MemoryEmbeddingConfig(BaseModel):
         "text-embedding-3-small",
         description="Embedding model name"
     )
-    api_key: Optional[str] = Field(
-        None,
-        description="API key (optional, can use env var)"
-    )
     local_model_path: Optional[str] = Field(
         None,
         description="Local model path for local provider"
     )
-    timeout_ms: int = Field(
-        60000,
-        description="Request timeout in milliseconds"
+
+
+class MemorySearchConfig(BaseModel):
+    """Memory search configuration."""
+
+    embedding: MemoryEmbeddingConfig = Field(
+        default_factory=MemoryEmbeddingConfig,
+        description="Embedding configuration",
     )
 
 
@@ -52,35 +57,7 @@ class MemorySyncSessionConfig(BaseModel):
     )
     delta_messages: int = Field(
         50,
-        description="Number of new messages to trigger sync"
-    )
-
-
-class MemoryHooksSessionMemoryConfig(BaseModel):
-    """Session memory hook configuration"""
-    enabled: bool = Field(
-        True,
-        description="Enable session memory hook"
-    )
-    message_count: int = Field(
-        15,
-        description="Number of recent messages to save"
-    )
-    use_llm_slug: bool = Field(
-        True,
-        description="Use LLM to generate slug"
-    )
-    slug_timeout: int = Field(
-        15,
-        description="Slug generation timeout (seconds)"
-    )
-
-
-class MemoryHooksConfig(BaseModel):
-    """Hooks configuration"""
-    session_memory: MemoryHooksSessionMemoryConfig = Field(
-        default_factory=MemoryHooksSessionMemoryConfig,
-        description="Session memory hook configuration"
+        description="Batch size for session transcript reconciliation"
     )
 
 
@@ -92,7 +69,7 @@ class MemorySyncConfig(BaseModel):
     )
     on_search: bool = Field(
         True,
-        description="Sync before search if dirty"
+        description="Run incremental filesystem reconciliation before every search"
     )
     watch: bool = Field(
         True,
@@ -198,13 +175,24 @@ class MemoryAutoFlushConfig(BaseModel):
         2000,
         description="Reserved tokens"
     )
-    system_prompt: str = Field(
-        "Session nearing context limit. Store important memories now.",
-        description="System prompt for memory flush"
+
+
+class MemoryDreamConfig(BaseModel):
+    """Scheduled and manual Dream self-improvement configuration."""
+
+    enabled: bool = Field(
+        True,
+        description="Enable scheduled and manual Dream self-improvement",
     )
-    user_prompt: str = Field(
-        "Write any lasting notes to memory/ directory; reply with NO_REPLY if nothing to store.",
-        description="User prompt for memory flush"
+    interval_hours: float = Field(
+        24,
+        gt=0,
+        description="Hours between successful background Dream bridging runs",
+    )
+    recent_daily_days: int = Field(
+        7,
+        ge=0,
+        description="Number of recent daily memory files included in extraction",
     )
 
 
@@ -285,10 +273,6 @@ class CompactionConfig(BaseModel):
 
 class MemoryConfig(BaseModel):
     """Complete memory system configuration"""
-    enabled: bool = Field(
-        True,
-        description="Enable memory system"
-    )
     sources: List[Literal["memory", "session"]] = Field(
         ["memory"],
         description="Memory sources to index"
@@ -303,13 +287,9 @@ class MemoryConfig(BaseModel):
     )
     
     # Sub-configurations
-    hooks: MemoryHooksConfig = Field(
-        default_factory=MemoryHooksConfig,
-        description="Hooks configuration"
-    )
-    embedding: MemoryEmbeddingConfig = Field(
-        default_factory=MemoryEmbeddingConfig,
-        description="Embedding configuration"
+    search: MemorySearchConfig = Field(
+        default_factory=MemorySearchConfig,
+        description="Memory search configuration",
     )
     chunking: MemoryChunkingConfig = Field(
         default_factory=MemoryChunkingConfig,
@@ -335,7 +315,29 @@ class MemoryConfig(BaseModel):
         default_factory=MemoryAutoFlushConfig,
         description="Auto flush configuration"
     )
+    dream: MemoryDreamConfig = Field(
+        default_factory=MemoryDreamConfig,
+        description="Scheduled and manual Dream self-improvement",
+    )
     compaction: CompactionConfig = Field(
         default_factory=CompactionConfig,
         description="Dynamic compaction configuration (auto-scales to model context)"
     )
+
+
+def resolve_memory_config(app_config: object) -> MemoryConfig:
+    """Resolve runtime Memory config, using defaults when absent.
+
+    Args:
+        app_config: Loaded application configuration.
+
+    Returns:
+        Configured Memory settings, or defaults when the application has no
+        Memory section.
+    """
+    memory_config = getattr(app_config, "memory", None)
+    if isinstance(memory_config, MemoryConfig):
+        return memory_config
+    if isinstance(memory_config, dict):
+        return MemoryConfig(**memory_config)
+    return MemoryConfig()

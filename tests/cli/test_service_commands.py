@@ -1,3 +1,4 @@
+import os
 import re
 import subprocess
 import time
@@ -31,7 +32,10 @@ def test_cli_help_lists_service_commands(monkeypatch, tmp_path) -> None:
     assert result.exit_code == 0
     for command in ("start", "stop", "restart", "status", "logs", "session", "mcp", "task", "skills"):
         assert _help_contains_command(result.stdout, command)
-    for command in ("agent", "acp", "debug", "run", "serve", "auth", "models"):
+    assert "Agents must use `flocks restart" in result.stdout
+    assert "--server-only`;" in result.stdout
+    assert "bare restart stops the supervisor and terminates the running agent" in result.stdout
+    for command in ("agent", "acp", "debug", "run", "serve", "service-watchdog", "service-daemon", "auth", "models"):
         assert not _help_contains_command(result.stdout, command)
 
 
@@ -98,6 +102,17 @@ def test_hidden_serve_command_is_not_listed_but_still_invocable(monkeypatch, tmp
     assert not _help_contains_command(result.stdout, "serve")
     assert hidden_help.exit_code == 0
     assert "Start the Flocks API server" in hidden_help.stdout
+
+
+def test_serve_exposes_runtime_server_port(monkeypatch) -> None:
+    import uvicorn
+
+    monkeypatch.delenv("_FLOCKS_SERVER_PORT", raising=False)
+    monkeypatch.setattr(uvicorn, "run", lambda *_args, **_kwargs: None)
+
+    cli_main.serve(host="127.0.0.1", port=5173, reload=False)
+
+    assert os.environ["_FLOCKS_SERVER_PORT"] == "5173"
 
 
 def test_tui_starts_hidden_serve_command(monkeypatch, tmp_path) -> None:

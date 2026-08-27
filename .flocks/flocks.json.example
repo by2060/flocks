@@ -1,5 +1,10 @@
 {
   "provider": {},
+  "default_models": {
+    "default_parameters": {
+      "reasoning_effort": "high"
+    }
+  },
   "mcp": {},
   "channels": {},
   "plugin": [],
@@ -33,6 +38,14 @@
     "urlscan": {
       "enabled": false
     }
+  },
+  "toolOutput": {
+    "readMaxLines": 2000,
+    "readMaxBytes": 51200,
+    "readMaxLineLength": 2000
+  },
+  "toolFailure": {
+    "disableOnRepeatedFailure": true
   },
   "sandbox": {
     "mode": "off",

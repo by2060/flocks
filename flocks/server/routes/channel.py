@@ -4,14 +4,17 @@ Channel HTTP routes: webhook callbacks, health/status, and outbound send APIs.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 
 from flocks.channel.gateway.manager import default_manager
 from flocks.channel.registry import default_registry
+from flocks.hooks.execution import ExecutionStopped, execute_with_hooks
 from flocks.utils.log import Log
 
 router = APIRouter()
@@ -33,6 +36,8 @@ class SessionSendRequest(BaseModel):
     text: str
     channel_type: Optional[str] = None
     media_url: Optional[str] = None
+    account_id: Optional[str] = None
+    chat_id: Optional[str] = None
 
 
 @router.post("/send")
@@ -69,11 +74,26 @@ async def channel_session_send(req: SessionSendRequest):
     svc = SessionBindingService()
     all_bindings = await svc.list_bindings()
     matched = [b for b in all_bindings if b.session_id == req.session_id]
+    resolved_session_id = req.session_id
+
+    if not matched and req.channel_type:
+        latest = await svc.latest_active_user_binding(
+            channel_id=req.channel_type,
+            account_id=req.account_id,
+            chat_id=req.chat_id,
+        )
+        if latest:
+            matched = [latest]
+            resolved_session_id = latest.session_id
 
     if not matched:
         raise HTTPException(
             status_code=404,
-            detail=f"未找到 session '{req.session_id}' 的渠道绑定",
+            detail=(
+                f"未找到 session '{req.session_id}' 的渠道绑定；"
+                "请使用 im_send_message(resolve_only=true) 重新解析当前 IM 目标，"
+                "或让用户确认目标 IM 会话。"
+            ),
         )
 
     if req.channel_type:
@@ -83,6 +103,19 @@ async def channel_session_send(req: SessionSendRequest):
                 status_code=404,
                 detail=f"session '{req.session_id}' 未绑定渠道 '{req.channel_type}'",
             )
+
+    if req.account_id:
+        matched = [b for b in matched if b.account_id == req.account_id]
+    if req.chat_id:
+        matched = [b for b in matched if b.chat_id == req.chat_id]
+    if (req.account_id or req.chat_id) and not matched:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"session '{req.session_id}' 未绑定 account_id='{req.account_id}' "
+                f"chat_id='{req.chat_id}'"
+            ),
+        )
 
     all_results = []
     errors = []
@@ -94,7 +127,10 @@ async def channel_session_send(req: SessionSendRequest):
             text=req.text,
             media_url=req.media_url,
         )
-        results = await OutboundDelivery.deliver(out_ctx, session_id=req.session_id)
+        results = await OutboundDelivery.deliver(
+            out_ctx,
+            session_id=resolved_session_id,
+        )
         all_results.extend(results)
         for r in results:
             if not r.success:
@@ -105,6 +141,7 @@ async def channel_session_send(req: SessionSendRequest):
 
     return {
         "ok": True,
+        "session_id": resolved_session_id,
         "message_ids": [r.message_id for r in all_results if r.message_id],
         "channels": list({b.channel_id for b in matched}),
     }
@@ -125,8 +162,27 @@ async def channel_webhook(channel_id: str, request: Request):
 
     body = await request.body()
     headers = dict(request.headers)
+    evidence_provider = getattr(plugin, "webhook_authentication_evidence", None)
+    authentication = {"plugin_authenticated": False}
+    if callable(evidence_provider):
+        supplied = await evidence_provider(body, headers)
+        if isinstance(supplied, dict):
+            authentication = dict(supplied)
 
-    result = await plugin.handle_webhook(body, headers)
+    payload = {
+        "operation": "channel.webhook.receive",
+        "entry": "channel_webhook",
+        "channel_id": channel_id,
+        "authentication": authentication,
+        "body_sha256": hashlib.sha256(body).hexdigest(),
+    }
+    try:
+        result = await execute_with_hooks(
+            payload,
+            lambda: plugin.handle_webhook(body, headers),
+        )
+    except ExecutionStopped as exc:
+        raise HTTPException(status_code=403, detail="Channel webhook stopped by extension") from exc
     if isinstance(result, dict) and isinstance(result.get("status_code"), int):
         status_code = int(result["status_code"])
         payload = {k: v for k, v in result.items() if k != "status_code"}
@@ -176,6 +232,27 @@ async def list_channels():
         }
         for ch in channels
     ]
+
+
+@router.get("/slack/manifest")
+async def slack_manifest():
+    """Return a Slack app manifest for creating the Flocks Slack app."""
+    from flocks.channel.builtin.slack.manifest import build_slack_app_manifest
+
+    return build_slack_app_manifest()
+
+
+@router.get("/slack/manifest/download")
+async def slack_manifest_download():
+    """Download a Slack app manifest for creating the Flocks Slack app."""
+    from flocks.channel.builtin.slack.manifest import build_slack_app_manifest
+
+    payload = json.dumps(build_slack_app_manifest(), indent=2, ensure_ascii=False)
+    return Response(
+        content=payload + "\n",
+        media_type="application/json",
+        headers={"Content-Disposition": 'attachment; filename="flocks-slack-manifest.json"'},
+    )
 
 
 @router.post("/{channel_id}/record-inbound")
@@ -344,6 +421,85 @@ async def weixin_qr_login_status(qrcode: str, baseUrl: Optional[str] = None):
     except Exception as exc:
         log.error("weixin.qr_login.poll_failed", {"error": str(exc)})
         raise HTTPException(status_code=502, detail=str(exc))
+
+
+# ---------------------------------------------------------------------------
+# WhatsApp QR pairing
+# ---------------------------------------------------------------------------
+
+class WhatsAppPairStartRequest(BaseModel):
+    sessionPath: Optional[str] = None
+    bridgeDir: Optional[str] = None
+    resetSession: bool = False
+
+
+@router.post("/whatsapp/pair/start")
+async def whatsapp_pair_start(req: WhatsAppPairStartRequest):
+    """Start a WhatsApp Web QR pairing process.
+
+    The helper starts the bundled Node bridge in pair-only mode and returns a
+    pairing_id. The frontend polls /whatsapp/pair/{pairing_id}/status until a
+    QR code is available or pairing completes.
+    """
+    from flocks.channel.builtin.whatsapp.pairing import start_pairing
+
+    try:
+        pairing = await start_pairing(
+            session_path=req.sessionPath,
+            bridge_dir=req.bridgeDir,
+            reset_session=req.resetSession,
+        )
+        return {
+            "ok": True,
+            "pairing_id": pairing.id,
+            "status": pairing.status,
+            "session_path": str(pairing.session_path),
+        }
+    except Exception as exc:
+        log.error("whatsapp.pair.start_failed", {"error": str(exc)})
+        raise HTTPException(status_code=502, detail=str(exc))
+
+
+@router.get("/whatsapp/session-status")
+async def whatsapp_session_status(sessionPath: Optional[str] = None):
+    """Return whether the configured WhatsApp session contains credentials."""
+    from pathlib import Path
+
+    from flocks.channel.builtin.whatsapp.config import default_session_path
+
+    path = Path(sessionPath).expanduser() if sessionPath else default_session_path()
+    return {
+        "session_path": str(path),
+        "paired": (path / "creds.json").exists(),
+    }
+
+
+@router.get("/whatsapp/pair/{pairing_id}/status")
+async def whatsapp_pair_status(pairing_id: str):
+    from flocks.channel.builtin.whatsapp.pairing import get_pairing
+
+    pairing = get_pairing(pairing_id)
+    if pairing is None:
+        raise HTTPException(status_code=404, detail="WhatsApp pairing session not found")
+    return {
+        "ok": True,
+        "pairing_id": pairing.id,
+        "status": pairing.status,
+        "qr": pairing.qr,
+        "error": pairing.error,
+        "user": pairing.user,
+        "session_path": str(pairing.session_path),
+    }
+
+
+@router.post("/whatsapp/pair/{pairing_id}/cancel")
+async def whatsapp_pair_cancel(pairing_id: str):
+    from flocks.channel.builtin.whatsapp.pairing import cancel_pairing
+
+    cancelled = await cancel_pairing(pairing_id)
+    if not cancelled:
+        raise HTTPException(status_code=404, detail="WhatsApp pairing session not found")
+    return {"ok": True, "pairing_id": pairing_id}
 
 
 # ---------------------------------------------------------------------------

@@ -20,8 +20,8 @@ from .utils import load_env_file
 
 
 AGENT_WORKSPACE = Path(os.environ.get("BH_AGENT_WORKSPACE", DEFAULT_AGENT_WORKSPACE)).expanduser()
-NAME = os.environ.get("BU_NAME", "default")
 INTERNAL = INTERNAL_URL_PREFIXES
+# Legacy compatibility for external imports; cookie export no longer uses site-root guessing.
 _COMMON_SECOND_LEVEL_SUFFIXES = {"ac", "co", "com", "edu", "gov", "mil", "net", "org"}
 _COOKIE_IMPORT_FIELDS = {
     "name",
@@ -47,20 +47,14 @@ def _load_env() -> None:
             continue
         load_env_file(path)
 
+
 _load_env()
+
+NAME = ipc.runtime_paths().name
 
 
 def _send(req: dict) -> dict:
-    sock = ipc.connect(NAME, timeout=5.0)
-    sock.sendall((json.dumps(req) + "\n").encode())
-    data = b""
-    while not data.endswith(b"\n"):
-        chunk = sock.recv(1 << 20)
-        if not chunk:
-            break
-        data += chunk
-    sock.close()
-    response = json.loads(data)
+    response = ipc.request(NAME, req, timeout=5.0)
     if "error" in response:
         raise RuntimeError(response["error"])
     return response
@@ -257,6 +251,41 @@ def _domain_matches_site(domain: str | None, site_root: str) -> bool:
     return bool(normalized) and (normalized == site_root or normalized.endswith(f".{site_root}"))
 
 
+def _domain_matches_host(domain: str | None, hostname: str) -> bool:
+    normalized_domain = str(domain or "").lower().lstrip(".")
+    normalized_host = str(hostname or "").lower().strip(".")
+    return bool(normalized_domain and normalized_host) and (
+        normalized_host == normalized_domain or normalized_host.endswith(f".{normalized_domain}")
+    )
+
+
+def _path_matches_url(cookie_path: str | None, request_path: str) -> bool:
+    normalized_cookie_path = str(cookie_path or "/") or "/"
+    normalized_request_path = request_path or "/"
+    if normalized_cookie_path == "/":
+        return True
+    prefix = normalized_cookie_path.rstrip("/") or "/"
+    return normalized_request_path == prefix or normalized_request_path.startswith(prefix + "/")
+
+
+def _cookie_matches_url(cookie: dict[str, Any], target_url: str) -> bool:
+    parsed = urlparse(target_url)
+    hostname = parsed.hostname or ""
+    request_path = parsed.path or "/"
+    is_https = parsed.scheme == "https"
+    if not isinstance(cookie, dict):
+        return False
+    if not cookie.get("name") or cookie.get("value") in (None, ""):
+        return False
+    if not _domain_matches_host(cookie.get("domain"), hostname):
+        return False
+    if not _path_matches_url(cookie.get("path"), request_path):
+        return False
+    if cookie.get("secure") and not is_https:
+        return False
+    return True
+
+
 def _current_page_state() -> tuple[dict[str, Any], str]:
     info = page_info()
     if info.get("dialog"):
@@ -290,24 +319,24 @@ def _collect_site_cookies(target_url: str) -> list[dict[str, Any]]:
     hostname = urlparse(target_url).hostname
     if not hostname:
         raise RuntimeError(f"could not determine hostname for {target_url!r}")
-    site_root = _site_root_from_hostname(hostname)
+
+    try:
+        cookies = cdp("Network.getCookies", urls=[target_url]).get("cookies", [])
+    except Exception:
+        cookies = []
+    if isinstance(cookies, list):
+        filtered = [cookie for cookie in cookies if _cookie_matches_url(cookie, target_url)]
+        if filtered:
+            return filtered
+
     try:
         cookies = cdp("Storage.getCookies").get("cookies", [])
     except Exception:
         cookies = []
     if not isinstance(cookies, list):
         cookies = []
-    filtered = [
-        cookie
-        for cookie in cookies
-        if isinstance(cookie, dict) and _domain_matches_site(cookie.get("domain"), site_root)
-    ]
-    if filtered:
-        return filtered
-    fallback = cdp("Network.getCookies", urls=[target_url]).get("cookies", [])
-    if not isinstance(fallback, list):
-        raise RuntimeError("cookie export did not return a list")
-    return fallback
+    filtered = [cookie for cookie in cookies if _cookie_matches_url(cookie, target_url)]
+    return filtered
 
 
 def _set_storage_entries(storage_name: str, entries: list[dict[str, Any]]) -> int:
@@ -473,7 +502,7 @@ def click_at_xy(x: int | float, y: int | float, button: str = "left", clicks: in
             from PIL import Image, ImageDraw
 
             dpr = js("window.devicePixelRatio") or 1
-            path = capture_screenshot(str(ipc._TMP / f"debug_click_{_debug_click_counter}.png"))
+            path = capture_screenshot(str(ipc.debug_screenshot_path(_debug_click_counter, NAME)))
             image = Image.open(path)
             draw = ImageDraw.Draw(image)
             px, py = int(x * dpr), int(y * dpr)
@@ -536,7 +565,8 @@ def scroll(x: int | float, y: int | float, dy: int | float = -300, dx: int | flo
 
 def capture_screenshot(path: str | None = None, full: bool = False, max_dim: int | None = None) -> str:
     """Save a PNG of the current viewport."""
-    path = path or str(ipc._TMP / "shot.png")
+    path = path or str(ipc.screenshot_path(NAME))
+    Path(path).parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     response = cdp("Page.captureScreenshot", format="png", captureBeyondViewport=full)
     Path(path).write_bytes(base64.b64decode(response["data"]))
     if max_dim:

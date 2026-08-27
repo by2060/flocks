@@ -5,8 +5,9 @@ Tests for configuration module
 import pytest
 import json
 from pathlib import Path
+from unittest.mock import patch
 
-from flocks.config.config import Config, GlobalConfig, ConfigInfo
+from flocks.config.config import Config, GlobalConfig, ConfigInfo, PermissionAction, PermissionConfig
 
 
 @pytest.fixture(autouse=True)
@@ -34,6 +35,26 @@ def test_global_config():
     assert config.server_port == 8000
 
 
+def test_delegate_categories_are_not_part_of_config_schema():
+    assert "categories" not in ConfigInfo.model_fields
+
+
+def test_removed_delegate_categories_are_not_silently_preserved():
+    with patch("flocks.utils.log.Log.create") as create_log:
+        config = ConfigInfo.model_validate(
+            {
+                "categories": {
+                    "quick": {
+                        "model": "anthropic/claude-haiku-4-5",
+                    }
+                }
+            }
+        )
+
+    assert "categories" not in config.model_dump(exclude_none=True)
+    create_log.return_value.warn.assert_called_once()
+
+
 @pytest.mark.asyncio
 async def test_config_loading():
     """Test configuration loading"""
@@ -45,6 +66,145 @@ async def test_config_loading():
     assert config.agent is not None
     assert config.plugin is not None
     assert config.keybinds is not None
+
+
+@pytest.mark.asyncio
+async def test_fallback_providers_use_effective_high_priority_config(
+    isolated_user_config,
+    monkeypatch,
+):
+    isolated_user_config.mkdir(parents=True, exist_ok=True)
+    (isolated_user_config / "flocks.json").write_text(
+        json.dumps({
+            "fallback_providers": [
+                {"provider_id": "global", "model_id": "global-model"},
+            ],
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(
+        "FLOCKS_CONFIG_CONTENT",
+        json.dumps({
+            "fallback_providers": [
+                {"provider_id": "inline", "model_id": "effective-model"},
+            ],
+        }),
+    )
+    Config._global_config = None
+    Config._cached_config = None
+
+    config = await Config.get()
+
+    assert [
+        fallback.model_dump()
+        for fallback in config.fallback_providers or []
+    ] == [
+        {"provider_id": "inline", "model_id": "effective-model"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_shared_jsonc_parser_preserves_comment_markers_in_strings(tmp_path):
+    config = await Config.load_text(
+        """{
+          // Actual comment.
+          "theme": "https://example.com/themes/*literal*/dark"
+        }""",
+        tmp_path / "flocks.jsonc",
+    )
+
+    assert config.theme == "https://example.com/themes/*literal*/dark"
+
+
+def test_local_mcp_config_accepts_legacy_env_alias():
+    """Legacy ``env`` should hydrate the canonical ``environment`` field."""
+    config = ConfigInfo.model_validate(
+        {
+            "mcp": {
+                "demo": {
+                    "type": "local",
+                    "command": ["python", "-m", "demo"],
+                    "env": {"DEMO_TOKEN": "secret"},
+                }
+            }
+        }
+    )
+
+    server = config.mcp["demo"]
+    assert server.environment == {"DEMO_TOKEN": "secret"}
+    assert server.model_dump(exclude_none=True) == {
+        "type": "local",
+        "command": ["python", "-m", "demo"],
+        "environment": {"DEMO_TOKEN": "secret"},
+    }
+
+
+def test_legacy_todo_permission_names_migrate_to_todo():
+    permission = PermissionConfig.model_validate({
+        "todowrite": "deny",
+        "todoread": "allow",
+        "bash": "ask",
+    })
+
+    dumped = permission.model_dump(exclude_none=True)
+    assert dumped["todo"] == PermissionAction.DENY
+    assert "todowrite" not in dumped
+    assert "todoread" not in dumped
+    assert dumped["bash"] == PermissionAction.ASK
+
+
+def test_legacy_todo_tool_flags_migrate_to_todo_permission():
+    config = ConfigInfo.model_validate({
+        "tools": {
+            "todowrite": False,
+            "todoread": True,
+        },
+        "agent": {
+            "worker": {
+                "tools": {
+                    "todowrite": False,
+                    "bash": True,
+                },
+            },
+        },
+    })
+
+    assert isinstance(config.permission, dict)
+    assert config.permission["todo"] == PermissionAction.DENY
+    assert "todowrite" not in config.permission
+    assert "todoread" not in config.permission
+
+    worker = config.agent["worker"]
+    assert isinstance(worker.permission, dict)
+    assert worker.permission["todo"] == PermissionAction.DENY
+    assert worker.permission["bash"] == PermissionAction.ALLOW
+
+
+def test_ui_config_normalizes_and_dumps_aliases():
+    config = ConfigInfo.model_validate({
+        "ui": {
+            "displayName": "  Acme SOC  ",
+            "faviconPath": "assets/favicon.png",
+        }
+    })
+
+    assert config.ui is not None
+    assert config.ui.display_name == "Acme SOC"
+    assert config.ui.favicon_path == "assets/favicon.png"
+    assert config.model_dump(by_alias=True, exclude_none=True)["ui"] == {
+        "displayName": "Acme SOC",
+        "faviconPath": "assets/favicon.png",
+    }
+
+
+def test_ui_display_name_rejects_control_characters():
+    with pytest.raises(ValueError):
+        ConfigInfo.model_validate({"ui": {"displayName": "Acme\nSOC"}})
+
+
+def test_ui_favicon_path_rejects_unsafe_paths():
+    with pytest.raises(ValueError):
+        ConfigInfo.model_validate({"ui": {"faviconPath": "../favicon.svg"}})
 
 
 @pytest.mark.asyncio

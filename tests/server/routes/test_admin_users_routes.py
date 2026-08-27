@@ -22,6 +22,36 @@ async def test_admin_routes_list_users(client: AsyncClient):
     assert len(users) >= 1
     admin_user = users[0]
     assert admin_user["role"] == "admin"
+    assert admin_user["tenant_ids"] == []
+    assert admin_user["asset_groups"] == []
+
+
+@pytest.mark.asyncio
+async def test_admin_routes_update_contract_scope(client: AsyncClient):
+    from flocks.auth.service import AuthService
+
+    member = await AuthService._create_user_internal(
+        username="analyst",
+        password="Password123!",
+        role="member",
+    )
+
+    response = await client.put(
+        f"/api/admin/users/{member.id}/contract-scope",
+        json={
+            "tenant_ids": ["tenant-a", "tenant-a", " "],
+            "asset_groups": ["core"],
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["tenant_ids"] == ["tenant-a"]
+    assert response.json()["asset_groups"] == ["core"]
+
+    stored = await AuthService.get_user_by_id(member.id)
+    assert stored is not None
+    assert stored.to_auth_user().tenant_ids == ("tenant-a",)
+    assert stored.to_auth_user().asset_groups == ("core",)
 
 
 @pytest.mark.asyncio
@@ -66,3 +96,16 @@ async def test_admin_routes_delete_user_not_allowed(client: AsyncClient):
 
     response = await client.delete(f"/api/admin/users/{user_id}")
     assert response.status_code == 404, response.text
+
+
+@pytest.mark.asyncio
+async def test_service_owner_username_is_reserved():
+    from flocks.auth.context import API_TOKEN_SERVICE_USER_ID
+    from flocks.auth.service import AuthService
+
+    with pytest.raises(ValueError, match="系统保留"):
+        await AuthService._create_user_internal(
+            username=API_TOKEN_SERVICE_USER_ID,
+            password="Password123!",
+            role="member",
+        )

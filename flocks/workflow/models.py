@@ -6,9 +6,12 @@ from typing import Any, Dict, List, Literal, Optional
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .errors import WorkflowValidationError
+from .triggers.models import TriggerDefinition, normalize_trigger_definitions
 
 
 class Node(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     id: str = Field(min_length=1)
     type: Literal[
         "python", "logic", "branch", "loop",
@@ -21,6 +24,23 @@ class Node(BaseModel):
     join_mode: Literal["flat", "namespace"] = "flat"
     join_conflict: Literal["overwrite", "error"] = "overwrite"
     join_namespace_key: str = "__by_source__"
+    input_schema: Optional[Dict[str, Any]] = Field(None, alias="inputSchema")
+    output_schema: Optional[Dict[str, Any]] = Field(None, alias="outputSchema")
+    # Trusted host subprocess isolation for memory-heavy Python nodes. The
+    # child exits after the node, returning its allocator arenas to the OS.
+    process_isolated: bool = Field(False, alias="processIsolated")
+    process_inherit_fd_keys: List[str] = Field(
+        default_factory=list,
+        alias="processInheritFdKeys",
+    )
+    # File descriptors that must remain owned by the parent while the child
+    # executes, then continue downstream unchanged. Unlike inherited FDs these
+    # are only opaque numeric values in the child, which is portable to Windows.
+    process_retain_fd_keys: List[str] = Field(
+        default_factory=list,
+        alias="processRetainFdKeys",
+    )
+    timeout_fatal: bool = Field(False, alias="timeoutFatal")
 
     # tool 节点
     tool_name: Optional[str] = None
@@ -47,6 +67,12 @@ class Node(BaseModel):
 
     @model_validator(mode="after")
     def _validate_code(self) -> "Node":
+        overlapping_fd_keys = set(self.process_inherit_fd_keys).intersection(self.process_retain_fd_keys)
+        if overlapping_fd_keys:
+            raise ValueError(
+                "processInheritFdKeys and processRetainFdKeys must not overlap: "
+                + ", ".join(sorted(overlapping_fd_keys))
+            )
         if self.type == "python":
             if self.code is None or not str(self.code).strip():
                 raise ValueError("python node requires non-empty code")
@@ -96,12 +122,15 @@ class Workflow(BaseModel):
     start: str = Field(min_length=1)
     nodes: List[Node] = Field(default_factory=list)
     edges: List[Edge] = Field(default_factory=list)
+    triggers: List[TriggerDefinition] = Field(default_factory=list)
     metadata: Optional[Dict[str, Any]] = None
 
     @model_validator(mode="after")
     def _validate_graph(self) -> "Workflow":
         if self.version is not None:
             self.version = None
+        if not self.triggers and isinstance(self.metadata, dict) and isinstance(self.metadata.get("triggers"), list):
+            self.triggers = normalize_trigger_definitions(self.metadata.get("triggers"))
         node_ids = [n.id for n in self.nodes]
         if len(node_ids) != len(set(node_ids)):
             dupes = sorted({x for x in node_ids if node_ids.count(x) > 1})

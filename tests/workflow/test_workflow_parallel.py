@@ -8,6 +8,7 @@ ThreadPoolExecutor rather than serially.
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 from typing import Any, Dict
 from unittest.mock import patch
@@ -15,6 +16,7 @@ from unittest.mock import patch
 import pytest
 
 from flocks.tool.registry import ParameterType, ToolCategory, ToolParameter, ToolRegistry, ToolResult
+from flocks.workflow.errors import NodeTimeoutError
 from flocks.workflow.engine import ExecutionResult, StepResult, WorkflowEngine
 from flocks.workflow.models import Workflow
 from flocks.workflow.repl_runtime import PythonExecRuntime
@@ -91,7 +93,7 @@ class TestParallelExecution:
             max_parallel_workers=4,
         )
         t0 = time.perf_counter()
-        result = engine.run()
+        result = engine.run(retain_history=True)
         elapsed = time.perf_counter() - t0
 
         assert result.steps >= 5  # start + 3 workers + end
@@ -108,7 +110,7 @@ class TestParallelExecution:
             max_parallel_workers=1,
         )
         t0 = time.perf_counter()
-        result = engine.run()
+        result = engine.run(retain_history=True)
         elapsed = time.perf_counter() - t0
 
         assert result.steps >= 5
@@ -123,7 +125,7 @@ class TestParallelExecution:
             runtime=PythonExecRuntime(),
             max_parallel_workers=4,
         )
-        result = engine.run()
+        result = engine.run(retain_history=True)
 
         worker_steps = [s for s in result.history if s.node_id.startswith("worker_")]
         assert len(worker_steps) == 4
@@ -139,7 +141,7 @@ class TestParallelExecution:
             runtime=PythonExecRuntime(),
             max_parallel_workers=4,
         )
-        result = engine.run()
+        result = engine.run(retain_history=True)
 
         end_steps = [s for s in result.history if s.node_id == "end"]
         assert len(end_steps) == 1
@@ -165,7 +167,7 @@ class TestParallelExecution:
             runtime=PythonExecRuntime(),
             max_parallel_workers=4,
         )
-        result = engine.run()
+        result = engine.run(retain_history=True)
 
         assert result.steps == 3
         last = result.history[-1]
@@ -201,7 +203,7 @@ class TestParallelErrorHandling:
         )
         from flocks.workflow.errors import NodeExecutionError
         with pytest.raises(NodeExecutionError, match="boom"):
-            engine.run()
+            engine.run(retain_history=True)
 
     def test_parallel_one_node_fails_continue(self):
         """When stop_on_error=False, other siblings still complete."""
@@ -226,7 +228,7 @@ class TestParallelErrorHandling:
             max_parallel_workers=4,
             stop_on_error=False,
         )
-        result = engine.run()
+        result = engine.run(retain_history=True)
 
         ok_steps = [s for s in result.history if s.error is None and s.node_id.startswith("ok_")]
         assert len(ok_steps) == 2
@@ -293,11 +295,11 @@ class TestParallelToolExecution:
         try:
             calls: list[str] = []
 
-            def _spy_run_sync(coro):
+            def _spy_run_sync(coro, cancel_checker):
                 calls.append(type(coro).__name__)
-                from flocks.workflow._async_runtime import run_sync
+                from flocks.workflow._async_runtime import run_sync_cancellable
 
-                return run_sync(coro)
+                return run_sync_cancellable(coro, cancel_checker)
 
             wf = Workflow.from_dict({
                 "name": "parallel_tool_test",
@@ -339,12 +341,15 @@ class TestParallelToolExecution:
                 ],
             })
 
-            with patch("flocks.workflow.tools_adapter._run_sync_on_shared_loop", side_effect=_spy_run_sync):
+            with patch(
+                "flocks.workflow.tools_adapter._run_sync_cancellable_on_shared_loop",
+                side_effect=_spy_run_sync,
+            ):
                 result = WorkflowEngine(
                     wf,
                     runtime=PythonExecRuntime(),
                     max_parallel_workers=4,
-                ).run()
+                ).run(retain_history=True)
 
             worker_steps = [step for step in result.history if step.node_id.startswith("worker_")]
             assert len(worker_steps) == 3
@@ -365,7 +370,8 @@ class TestParallelToolExecution:
 class TestParallelDedup:
     """Dedup still works correctly with batch draining."""
 
-    def test_dedup_with_parallel_batch(self):
+    @pytest.mark.parametrize("history_mode", ["full", "summary"])
+    def test_dedup_with_parallel_batch(self, history_mode):
         """Identical inputs to the same node are deduped within a batch."""
         wf = Workflow.from_dict({
             "name": "dedup_par",
@@ -383,8 +389,9 @@ class TestParallelDedup:
             wf,
             runtime=PythonExecRuntime(),
             max_parallel_workers=4,
+            history_mode=history_mode,
         )
-        result = engine.run()
+        result = engine.run(retain_history=True)
         b_steps = [s for s in result.history if s.node_id == "b"]
         assert len(b_steps) == 1
 
@@ -392,18 +399,25 @@ class TestParallelDedup:
 class TestParallelTimeout:
     """Node timeout behaviour in parallel mode."""
 
-    def test_parallel_timeout_marks_slow_node(self):
-        """A slow parallel node is marked as timed-out while fast ones succeed."""
+    def test_parallel_timeout_aborts_after_draining_workers(self):
+        """A slow parallel node aborts the run after all workers exit."""
         wf = Workflow.from_dict({
             "name": "par_timeout",
             "start": "start",
             "nodes": [
                 {"id": "start", "type": "python", "code": "outputs['x'] = 1"},
-                {"id": "fast", "type": "python", "code": "outputs['r'] = 'ok'"},
+                {
+                    "id": "fast",
+                    "type": "python",
+                    "code": "outputs['r'] = 'ok'",
+                    "processIsolated": True,
+                },
                 {
                     "id": "slow",
                     "type": "python",
                     "code": "import time; time.sleep(5); outputs['r'] = 'done'",
+                    "processIsolated": True,
+                    "timeoutFatal": True,
                 },
             ],
             "edges": [
@@ -419,22 +433,23 @@ class TestParallelTimeout:
             stop_on_error=False,
         )
         t0 = time.perf_counter()
-        result = engine.run()
+        with pytest.raises(NodeTimeoutError) as caught:
+            engine.run(retain_history=True)
         elapsed = time.perf_counter() - t0
 
-        # Should complete near the timeout, not wait for the 5s sleep.
         assert elapsed < 2.0
-
-        fast_step = next(s for s in result.history if s.node_id == "fast")
+        history = caught.value.execution_context["history"]
+        fast_step = next(s for s in history if s.node_id == "fast")
         assert fast_step.error is None
         assert fast_step.outputs.get("r") == "ok"
 
-        slow_step = next(s for s in result.history if s.node_id == "slow")
+        slow_step = next(s for s in history if s.node_id == "slow")
         assert slow_step.error is not None
         assert "超时" in slow_step.error
+        assert not any(thread.name.startswith("wf-par") for thread in threading.enumerate())
 
-    def test_parallel_timeout_is_non_fatal(self):
-        """Timeout in parallel does not trigger stop_on_error."""
+    def test_parallel_isolated_timeout_can_be_nonfatal(self):
+        """timeoutFatal preserves the historical nonfatal default when false."""
         wf = Workflow.from_dict({
             "name": "par_timeout_nonfatal",
             "start": "start",
@@ -444,8 +459,14 @@ class TestParallelTimeout:
                     "id": "slow",
                     "type": "python",
                     "code": "import time; time.sleep(5); outputs['r'] = 'done'",
+                    "processIsolated": True,
                 },
-                {"id": "fast", "type": "python", "code": "outputs['r'] = 'ok'"},
+                {
+                    "id": "fast",
+                    "type": "python",
+                    "code": "outputs['r'] = 'ok'",
+                    "processIsolated": True,
+                },
             ],
             "edges": [
                 {"from": "start", "to": "slow"},
@@ -457,10 +478,9 @@ class TestParallelTimeout:
             runtime=PythonExecRuntime(),
             max_parallel_workers=4,
             node_timeout_s=0.3,
-            stop_on_error=True,
+            stop_on_error=False,
         )
-        # Should NOT raise even though stop_on_error=True, because timeout is non-fatal.
-        result = engine.run()
+        result = engine.run(retain_history=True)
         errors = [s for s in result.history if s.error is not None]
         assert len(errors) == 1
         assert "超时" in errors[0].error
@@ -495,7 +515,7 @@ class TestParallelBranch:
             runtime=PythonExecRuntime(),
             max_parallel_workers=4,
         )
-        result = engine.run()
+        result = engine.run(retain_history=True)
 
         executed_ids = [s.node_id for s in result.history]
         assert "a" in executed_ids

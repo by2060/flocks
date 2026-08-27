@@ -13,7 +13,7 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union, Literal
 from enum import Enum
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import AliasChoices, BaseModel, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings
 
 # ==================== Permission System ====================
@@ -29,6 +29,35 @@ class PermissionAction(str, Enum):
 PermissionRule = Union[PermissionAction, Dict[str, Union[PermissionAction, Dict[str, PermissionAction]]]]
 
 
+_LEGACY_TODO_TOOL_NAMES = {"todowrite", "todoread"}
+
+
+def _canonical_permission_tool_name(tool: str) -> str:
+    if tool in _LEGACY_TODO_TOOL_NAMES:
+        return "todo"
+    return tool
+
+
+def _merge_permission_action(existing: Any, incoming: Any) -> Any:
+    """Merge duplicate legacy permission names conservatively."""
+    existing_value = existing.value if hasattr(existing, "value") else existing
+    incoming_value = incoming.value if hasattr(incoming, "value") else incoming
+    if existing_value == PermissionAction.DENY.value or incoming_value == PermissionAction.DENY.value:
+        return PermissionAction.DENY
+    return existing if existing is not None else incoming
+
+
+def _assign_permission(permission_dict: Dict[str, Any], tool: str, action: Any) -> None:
+    canonical_tool = _canonical_permission_tool_name(tool)
+    if canonical_tool in permission_dict:
+        permission_dict[canonical_tool] = _merge_permission_action(
+            permission_dict[canonical_tool],
+            action,
+        )
+        return
+    permission_dict[canonical_tool] = action
+
+
 class PermissionConfig(BaseModel):
     """Permission configuration (simplified for Phase 1-3)"""
     model_config = {"extra": "allow"}  # Allow additional fields
@@ -40,16 +69,24 @@ class PermissionConfig(BaseModel):
     bash: Optional[PermissionRule] = None
     task: Optional[PermissionRule] = None
     external_directory: Optional[PermissionRule] = None
-    todowrite: Optional[PermissionAction] = None
-    todoread: Optional[PermissionAction] = None
+    todo: Optional[PermissionAction] = None
     question: Optional[PermissionAction] = None
     webfetch: Optional[PermissionAction] = None
     websearch: Optional[PermissionAction] = None
     lsp: Optional[PermissionRule] = None
     doom_loop: Optional[PermissionAction] = None
     delegate_task: Optional[PermissionRule] = None
-    background_output: Optional[PermissionRule] = None
-    background_cancel: Optional[PermissionRule] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_legacy_todo_permissions(cls, data):
+        if not isinstance(data, dict):
+            return data
+        migrated = dict(data)
+        for legacy_name in _LEGACY_TODO_TOOL_NAMES:
+            if legacy_name in migrated:
+                _assign_permission(migrated, legacy_name, migrated.pop(legacy_name))
+        return migrated
 
 
 # ==================== Agent Configuration ====================
@@ -103,26 +140,13 @@ class AgentConfig(BaseModel):
                 action = PermissionAction.ALLOW if enabled else PermissionAction.DENY
                 # Map write/edit/patch to edit
                 if tool in ["write", "edit", "patch"]:
-                    permission_dict["edit"] = action
+                    _assign_permission(permission_dict, "edit", action)
                 else:
-                    permission_dict[tool] = action
+                    _assign_permission(permission_dict, tool, action)
             
             self.permission = permission_dict
         
         return self
-
-
-# ==================== Category Configuration ====================
-
-class CategoryConfig(BaseModel):
-    """Delegate-task category configuration"""
-    model_config = {"extra": "allow", "populate_by_name": True}
-
-    model: Optional[str] = None
-    variant: Optional[str] = None
-    prompt_append: Optional[str] = Field(None, alias="promptAppend")
-    description: Optional[str] = None
-    is_unstable_agent: Optional[bool] = Field(None, alias="isUnstableAgent")
 
 
 # ==================== Command Configuration ====================
@@ -187,11 +211,14 @@ class McpOAuthConfig(BaseModel):
 
 class McpLocalConfig(BaseModel):
     """MCP local server configuration"""
-    model_config = {"extra": "allow"}
+    model_config = {"extra": "allow", "populate_by_name": True}
     
     type: Literal["local"]
     command: List[str]
-    environment: Optional[Dict[str, str]] = None
+    environment: Optional[Dict[str, str]] = Field(
+        None,
+        validation_alias=AliasChoices("environment", "env"),
+    )
     enabled: Optional[bool] = None
     timeout: Optional[int] = Field(None, gt=0)
 
@@ -264,9 +291,121 @@ class CompactionConfig(BaseModel):
     prune: Optional[bool] = Field(None, description="Enable pruning")
 
 
+class ToolOutputConfig(BaseModel):
+    """Tool output size limits.
+
+    Controls how much content individual tool calls may return before
+    being truncated.  All values are configurable so power users can
+    tune them without patching source code.
+
+    Defaults mirror the hard-coded constants that were previously spread
+    across ``flocks/tool/file/read.py`` and ``flocks/tool/truncation.py``.
+
+    Both camelCase (``readMaxLines``) and snake_case (``read_max_lines``)
+    keys are accepted in ``flocks.json``.
+    """
+
+    model_config = {"populate_by_name": True}
+
+    read_max_lines: Optional[int] = Field(
+        None,
+        alias="readMaxLines",
+        gt=0,
+        description=(
+            "Max lines returned by the read tool per call (default 2000). "
+            "For files longer than this, use offset + limit to page."
+        ),
+    )
+    read_max_bytes: Optional[int] = Field(
+        None,
+        alias="readMaxBytes",
+        gt=0,
+        description=(
+            "Byte cap for a single read tool call (default 51200 = 50 KB). "
+            "Truncation fires whichever limit is hit first."
+        ),
+    )
+    read_max_line_length: Optional[int] = Field(
+        None,
+        alias="readMaxLineLength",
+        gt=0,
+        description=(
+            "Characters per line before the remainder is replaced with '...' "
+            "(default 2000).  Keeps very wide log lines from bloating context."
+        ),
+    )
+
+
+class ToolFailureConfig(BaseModel):
+    """Repeated tool-failure handling."""
+
+    model_config = {"populate_by_name": True}
+
+    disable_on_repeated_failure: bool = Field(
+        True,
+        alias="disableOnRepeatedFailure",
+        description=(
+            "Disable a standalone custom tool after repeated identical failures."
+        ),
+    )
+
+
 class EnterpriseConfig(BaseModel):
     """Enterprise configuration"""
+
+
+class FlocksProConfig(BaseModel):
+    """Flocks Pro configuration"""
     url: Optional[str] = None
+
+
+class UIConfig(BaseModel):
+    """WebUI display preferences."""
+
+    model_config = {"populate_by_name": True}
+
+    display_name: Optional[str] = Field(
+        None,
+        alias="displayName",
+        max_length=48,
+        description="Custom product display name used by visible WebUI branding.",
+    )
+    favicon_path: Optional[str] = Field(
+        None,
+        alias="faviconPath",
+        max_length=256,
+        description="Relative path to a custom WebUI favicon stored in the user config directory.",
+    )
+
+    @field_validator("display_name", mode="before")
+    @classmethod
+    def normalize_display_name(cls, value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError("displayName must be a string")
+        normalized = value.strip()
+        if not normalized:
+            return None
+        if any(ord(ch) < 32 or ord(ch) == 127 for ch in normalized):
+            raise ValueError("displayName must not contain control characters")
+        return normalized
+
+    @field_validator("favicon_path", mode="before")
+    @classmethod
+    def normalize_favicon_path(cls, value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError("faviconPath must be a string")
+        normalized = value.strip().replace("\\", "/")
+        if not normalized:
+            return None
+        if normalized.startswith("/") or ".." in normalized.split("/"):
+            raise ValueError("faviconPath must be a safe relative path")
+        if any(ord(ch) < 32 or ord(ch) == 127 for ch in normalized):
+            raise ValueError("faviconPath must not contain control characters")
+        return normalized
 
 
 class ExperimentalConfig(BaseModel):
@@ -409,8 +548,25 @@ class ChannelConfig(BaseModel):
     """
     model_config = {"extra": "allow", "populate_by_name": True}
 
+    @model_validator(mode="before")
+    @classmethod
+    def discard_removed_role_field(cls, data: Any) -> Any:
+        """Ignore removed legacy role data while loading existing config files.
+
+        New API writes reject the field explicitly. Dropping it here allows an
+        existing on-disk config to boot once and removes it on the next save
+        without interpreting it as authorization.
+        """
+        if not isinstance(data, dict):
+            return data
+        normalized = dict(data)
+        normalized.pop("role", None)
+        normalized.pop("permissionMode", None)
+        return normalized
+
     enabled: bool = False
     default_agent: Optional[str] = Field(None, alias="defaultAgent")
+    visible_agents: Optional[List[str]] = Field(None, alias="visibleAgents")
     dm_policy: Optional[str] = Field(None, alias="dmPolicy")
     group_trigger: Optional[str] = Field("mention", alias="groupTrigger")
     allow_from: Optional[List[str]] = Field(None, alias="allowFrom")
@@ -476,6 +632,72 @@ class ChannelConfig(BaseModel):
 
 # ==================== Main Configuration ====================
 
+class FallbackProviderConfig(BaseModel):
+    """Ordered model identity used for runtime provider fallback."""
+
+    model_config = {"extra": "forbid"}
+
+    provider_id: str
+    model_id: str
+
+
+def normalize_fallback_provider_entries(value: Any) -> List[Dict[str, str]]:
+    """Return ordered, trimmed, structurally valid fallback identities."""
+    from flocks.utils.log import Log
+
+    config_log = Log.create(service="config")
+    if not isinstance(value, list):
+        config_log.warning("config.fallback_providers_invalid", {
+            "reason": "not_a_list",
+        })
+        return []
+
+    normalized: List[Dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for index, raw in enumerate(value):
+        if not isinstance(raw, dict):
+            config_log.warning("config.fallback_provider_invalid", {
+                "index": index,
+                "reason": "not_an_object",
+            })
+            continue
+
+        provider_id = raw.get("provider_id")
+        model_id = raw.get("model_id")
+        if not isinstance(provider_id, str) or not isinstance(model_id, str):
+            config_log.warning("config.fallback_provider_invalid", {
+                "index": index,
+                "reason": "invalid_identity",
+            })
+            continue
+
+        provider_id = provider_id.strip()
+        model_id = model_id.strip()
+        if not provider_id or not model_id:
+            config_log.warning("config.fallback_provider_invalid", {
+                "index": index,
+                "reason": "empty_identity",
+            })
+            continue
+
+        identity = (provider_id, model_id)
+        if identity in seen:
+            config_log.warning("config.fallback_provider_duplicate", {
+                "index": index,
+                "provider_id": provider_id,
+                "model_id": model_id,
+            })
+            continue
+
+        seen.add(identity)
+        normalized.append({
+            "provider_id": provider_id,
+            "model_id": model_id,
+        })
+
+    return normalized
+
+
 class ConfigInfo(BaseModel):
     """
     Main configuration schema
@@ -508,12 +730,12 @@ class ConfigInfo(BaseModel):
     enabled_providers: Optional[List[str]] = None
     model: Optional[str] = None
     small_model: Optional[str] = Field(None, alias="smallModel")
+    fallback_providers: Optional[List[FallbackProviderConfig]] = None
     default_agent: Optional[str] = Field(None, alias="defaultAgent")
     username: Optional[str] = None
     mode: Optional[Dict[str, AgentConfig]] = Field(None, description="@deprecated Use 'agent'")
     agent: Optional[Dict[str, AgentConfig]] = None
     provider: Optional[Dict[str, ProviderConfig]] = None
-    categories: Optional[Dict[str, CategoryConfig]] = None
     mcp: Optional[Dict[str, Union[McpConfig, Dict[str, Any]]]] = None
     formatter: Optional[Union[Literal[False], Dict[str, Any]]] = None
     lsp: Optional[Union[Literal[False], Dict[str, Any]]] = None
@@ -529,8 +751,19 @@ class ConfigInfo(BaseModel):
         ),
     )
     agent_logic: Optional[Literal["base", "rex"]] = Field(None, alias="agentLogic")
-    enterprise: Optional[EnterpriseConfig] = None
+    flockspro: Optional[FlocksProConfig] = None
+    ui: Optional[UIConfig] = None
     compaction: Optional[CompactionConfig] = None
+    tool_output: Optional[ToolOutputConfig] = Field(
+        None,
+        alias="toolOutput",
+        description="Tool output size limits (read, truncation caps).",
+    )
+    tool_failure: Optional[ToolFailureConfig] = Field(
+        None,
+        alias="toolFailure",
+        description="Repeated tool-failure handling.",
+    )
     experimental: Optional[ExperimentalConfig] = None
     
     # Memory system configuration (added for memory system integration)
@@ -548,6 +781,14 @@ class ConfigInfo(BaseModel):
             "workspace_access (none/ro/rw), workspace_root, docker, tools, prune."
         ),
     )
+
+    @field_validator("fallback_providers", mode="before")
+    @classmethod
+    def normalize_fallback_providers(cls, value: Any) -> Any:
+        """Normalize ordered fallback identities without rewriting user config."""
+        if value is None:
+            return None
+        return normalize_fallback_provider_entries(value)
     allow_read_paths: Optional[List[str]] = Field(
         None,
         alias="allowReadPaths",
@@ -573,6 +814,33 @@ class ConfigInfo(BaseModel):
         None,
         description="Self-update configuration (GitHub repo, git remote, etc.)",
     )
+    portal_base_url: Optional[str] = Field(
+        None,
+        alias="portalBaseUrl",
+        description="Console portal base URL used by OSS console account login redirect.",
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def remove_legacy_delegate_categories(cls, data):
+        """Drop the removed categories config instead of preserving it as an extra."""
+        if not isinstance(data, dict) or "categories" not in data:
+            return data
+
+        cleaned = dict(data)
+        cleaned.pop("categories", None)
+        from flocks.utils.log import Log
+
+        Log.create(service="config").warn(
+            "config.categories_removed",
+            {
+                "message": (
+                    "The categories configuration is no longer supported; "
+                    "select a delegatable agent with subagent_type."
+                )
+            },
+        )
+        return cleaned
 
     @model_validator(mode='after')
     def post_process(self):
@@ -617,9 +885,9 @@ class ConfigInfo(BaseModel):
             for tool, enabled in self.tools.items():
                 action = PermissionAction.ALLOW if enabled else PermissionAction.DENY
                 if tool in ["write", "edit", "patch"]:
-                    permission_dict["edit"] = action
+                    _assign_permission(permission_dict, "edit", action)
                 else:
-                    permission_dict[tool] = action
+                    _assign_permission(permission_dict, tool, action)
             
             self.permission = permission_dict
         
@@ -1008,6 +1276,67 @@ class Config:
             raise ValueError(f"Failed to read config file {filepath}: {e}")
         
         return await cls.load_text(text, filepath)
+
+    @staticmethod
+    def parse_jsonc(text: str, filepath: Path) -> Dict[str, Any]:
+        """Parse JSONC text without resolving environment or secret references."""
+        output: List[str] = []
+        index = 0
+        in_string = False
+        escaped = False
+
+        while index < len(text):
+            char = text[index]
+            next_char = text[index + 1] if index + 1 < len(text) else ""
+
+            if in_string:
+                output.append(char)
+                if escaped:
+                    escaped = False
+                elif char == '\\':
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                index += 1
+                continue
+
+            if char == '"':
+                in_string = True
+                output.append(char)
+                index += 1
+                continue
+
+            if char == "/" and next_char == "/":
+                index += 2
+                while index < len(text) and text[index] not in "\r\n":
+                    index += 1
+                continue
+
+            if char == "/" and next_char == "*":
+                index += 2
+                while index + 1 < len(text) and text[index:index + 2] != "*/":
+                    if text[index] in "\r\n":
+                        output.append(text[index])
+                    index += 1
+                if index + 1 >= len(text):
+                    raise ValueError(
+                        f"Invalid JSON in {filepath}: unterminated block comment"
+                    )
+                index += 2
+                continue
+
+            output.append(char)
+            index += 1
+
+        try:
+            data = json.loads("".join(output))
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid JSON in {filepath}: {exc}") from exc
+        if not isinstance(data, dict):
+            raise ValueError(
+                f"Invalid configuration in {filepath}: expected an object"
+            )
+        return data
     
     @classmethod
     async def load_text(cls, text: str, filepath: Path) -> ConfigInfo:
@@ -1021,8 +1350,6 @@ class Config:
         Returns:
             ConfigInfo instance
         """
-        original = text
-        
         # Replace environment variables
         text = cls.replace_env_vars(text)
         
@@ -1032,52 +1359,7 @@ class Config:
         # Replace file references
         text = await cls.replace_file_refs(text, filepath.parent)
         
-        # Try to parse as JSONC (JSON with comments)
-        try:
-            # Remove comments properly
-            # 1. Remove /* */ block comments first
-            text_no_comments = re.sub(r'/\*.*?\*/', '', text, flags=re.DOTALL)
-            
-            # 2. Remove // line comments, but NOT in strings!
-            # We need to be careful not to remove // inside quoted strings (like URLs)
-            # This regex matches // that are NOT inside quotes
-            # Negative lookbehind to avoid matching inside strings
-            lines = text_no_comments.split('\n')
-            cleaned_lines = []
-            for line in lines:
-                # Find // but not inside strings
-                # Simple approach: find first // that is not between quotes
-                in_string = False
-                escape_next = False
-                comment_start = -1
-                
-                for i, char in enumerate(line):
-                    if escape_next:
-                        escape_next = False
-                        continue
-                    
-                    if char == '\\':
-                        escape_next = True
-                        continue
-                    
-                    if char == '"' and not escape_next:
-                        in_string = not in_string
-                    
-                    if not in_string and i < len(line) - 1 and line[i:i+2] == '//':
-                        comment_start = i
-                        break
-                
-                if comment_start >= 0:
-                    line = line[:comment_start]
-                
-                cleaned_lines.append(line)
-            
-            text_no_comments = '\n'.join(cleaned_lines)
-            
-            # Parse JSON
-            data = json.loads(text_no_comments)
-        except json.JSONDecodeError as e:
-            raise ValueError(f"Invalid JSON in {filepath}: {e}")
+        data = cls.parse_jsonc(text, filepath)
         
         # Validate and parse with Pydantic
         try:
@@ -1223,7 +1505,13 @@ class Config:
         return None
 
     @classmethod
-    async def update(cls, config: ConfigInfo, project_dir: Optional[Path] = None) -> None:
+    async def update(
+        cls,
+        config: ConfigInfo,
+        project_dir: Optional[Path] = None,
+        *,
+        channel_allow_from_deletions: Optional[set[str]] = None,
+    ) -> None:
         """
         Update configuration
         
@@ -1231,6 +1519,9 @@ class Config:
             config: New configuration
             project_dir: Deprecated and ignored. Config is always written to
                 the unified user config directory.
+            channel_allow_from_deletions: Channel IDs whose persisted
+                allowFrom field should be removed after a successful full
+                config validation and merge.
         """
         _ = project_dir
 
@@ -1247,6 +1538,13 @@ class Config:
         
         # Write
         config_data = merged.model_dump(by_alias=True, exclude_none=True, mode="json")
+        if channel_allow_from_deletions:
+            channels = config_data.get("channels")
+            if isinstance(channels, dict):
+                for channel_id in channel_allow_from_deletions:
+                    channel_cfg = channels.get(channel_id)
+                    if isinstance(channel_cfg, dict):
+                        channel_cfg.pop("allowFrom", None)
         config_file.write_text(json.dumps(config_data, indent=2), encoding="utf-8")
         
         # Clear cache

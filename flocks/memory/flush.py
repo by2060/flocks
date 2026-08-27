@@ -1,11 +1,11 @@
 """
 Memory Flush - Pre-compaction memory save mechanism
 
-Inspired by OpenClaw's memory flush design, triggers automatic memory
-saves when the session approaches context limits.
+Inspired by OpenClaw's memory flush design, preserves Session evidence when
+the Session approaches context limits.
 
 Includes:
-  - MemoryFlush: flush threshold logic and trigger helpers
+  - MemoryFlush: flush threshold and statistics helpers
   - extract_and_save: LLM-based memory extraction from conversation history
 """
 
@@ -111,104 +111,6 @@ class MemoryFlush:
         })
         
         return True
-    
-    @staticmethod
-    def get_flush_prompts(
-        config: MemoryAutoFlushConfig,
-        today: Optional[str] = None,
-    ) -> Dict[str, str]:
-        """
-        Get memory flush prompts with date filled in
-        
-        Args:
-            config: Memory flush configuration
-            today: Today's date (YYYY-MM-DD format)
-            
-        Returns:
-            Dict with system_prompt and user_prompt
-        """
-        if today is None:
-            today = datetime.now().strftime("%Y-%m-%d")
-        
-        # Replace YYYY-MM-DD with actual date
-        system_prompt = config.system_prompt
-        user_prompt = config.user_prompt.replace("YYYY-MM-DD", today)
-        
-        return {
-            "system_prompt": system_prompt,
-            "user_prompt": user_prompt,
-            "date": today,
-        }
-    
-    @staticmethod
-    async def trigger_flush(
-        session_id: str,
-        config: MemoryAutoFlushConfig,
-        create_flush_message: callable,
-        execute_agent_turn: callable,
-    ) -> bool:
-        """
-        Trigger a memory flush turn
-        
-        This creates a special agent turn with flush prompts.
-        The agent should save important memories before compaction.
-        
-        Args:
-            session_id: Session ID
-            config: Memory flush configuration
-            create_flush_message: Callback to create flush user message
-            execute_agent_turn: Callback to execute agent turn
-            
-        Returns:
-            True if flush succeeded
-        """
-        log.info("flush.trigger", {
-            "session_id": session_id,
-        })
-        
-        try:
-            # Get prompts with today's date
-            prompts = MemoryFlush.get_flush_prompts(config)
-            
-            # Create flush user message
-            flush_message = await create_flush_message(
-                content=prompts["user_prompt"],
-                metadata={
-                    "memory_flush": True,
-                    "date": prompts["date"],
-                }
-            )
-            
-            if not flush_message:
-                log.error("flush.create_message_failed", {
-                    "session_id": session_id,
-                })
-                return False
-            
-            # Execute agent turn with flush system prompt
-            result = await execute_agent_turn(
-                system_prompt_append=prompts["system_prompt"],
-                is_memory_flush=True,
-            )
-            
-            if result and result.get("success"):
-                log.info("flush.success", {
-                    "session_id": session_id,
-                })
-                return True
-            else:
-                log.warn("flush.turn_failed", {
-                    "session_id": session_id,
-                    "result": result,
-                })
-                return False
-        
-        except Exception as e:
-            log.error("flush.error", {
-                "session_id": session_id,
-                "error": str(e),
-            })
-            return False
     
     @staticmethod
     def calculate_threshold(
@@ -343,7 +245,10 @@ async def extract_and_save(
     usable = policy.usable_context if policy else 96_000
     reserve_tokens = 2000
     target_tokens = max(1000, usable - reserve_tokens)
-    max_chars = max(3000, target_tokens * 2)
+    # tokens × 4 matches the chars/4 estimate used elsewhere in the
+    # compaction stack.  Previously ``× 2`` silently halved the input
+    # budget, forcing tail-cuts on conversations that fit comfortably.
+    max_chars = max(3000, target_tokens * 4)
 
     conversation_parts: list[str] = []
     for msg in chat_messages:
@@ -375,19 +280,22 @@ async def extract_and_save(
     memory_prompt = (
         "Below is the conversation history of a session:\n\n"
         f"---\n{full_text}\n---\n\n"
-        "From this conversation, extract the KEY MEMORIES worth "
-        "persisting for future sessions. Focus on:\n"
-        "- Important decisions made\n"
-        "- Technical facts (APIs, configs, file paths, commands, etc.)\n"
-        "- Action items / to-dos\n"
-        "- User preferences or corrections\n\n"
-        "Output a concise bullet list in Markdown. "
+        "Extract only high-signal evidence that may deserve later "
+        "consolidation into durable Memory. Include:\n"
+        "- Explicit user preferences and corrections\n"
+        "- Decisions and their rationale\n"
+        "- Non-derivable constraints and verified discoveries\n\n"
+        "Exclude secrets, credentials, guesses, plans, action items, task "
+        "status, PR or issue numbers, commit hashes, completed-work logs, "
+        "large outputs, and facts cheaply rediscoverable from code or "
+        "configuration.\n\n"
+        "Output concise declarative Markdown bullets. "
         "Use the same language as the conversation. "
-        "Omit trivial greetings or small-talk. "
         "If there is nothing worth remembering, reply with NOTHING."
     )
 
     memory_text: Optional[str] = None
+    extraction_completed = False
     try:
         mem_response = await provider.chat(
             model_id=model_id,
@@ -395,6 +303,7 @@ async def extract_and_save(
             max_tokens=1500,
         )
         if mem_response and mem_response.content:
+            extraction_completed = True
             content = mem_response.content.strip()
             if content.upper() != "NOTHING":
                 memory_text = content
@@ -404,8 +313,10 @@ async def extract_and_save(
             "error": str(e),
         })
 
-    if not memory_text:
+    if not extraction_completed:
         memory_text = summary
+    if not memory_text:
+        return
 
     daily = DailyMemory()
     header = f"\n## Session {session_id[:16]}… ({today} {now_ts})\n\n"

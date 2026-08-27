@@ -10,6 +10,9 @@ from typing import Optional
 from pydantic import BaseModel, Field
 
 
+API_TOKEN_SERVICE_USER_ID = "api-token-service"
+
+
 class AuthUser(BaseModel):
     """Current authenticated local user."""
 
@@ -18,6 +21,8 @@ class AuthUser(BaseModel):
     role: str = Field(..., description="admin or member")
     status: str = Field("active", description="active or disabled")
     must_reset_password: bool = False
+    tenant_ids: tuple[str, ...] = Field(default_factory=tuple)
+    asset_groups: tuple[str, ...] = Field(default_factory=tuple)
 
 
 _current_auth_user: contextvars.ContextVar[Optional[AuthUser]] = contextvars.ContextVar(

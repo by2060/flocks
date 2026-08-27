@@ -21,6 +21,7 @@ from flocks.cli.commands import (
     admin_app,
     BROWSER_CONTEXT_SETTINGS,
     browser_command,
+    doctor_command,
     export_app,
     import_app,
     mcp_app,
@@ -30,18 +31,25 @@ from flocks.cli.commands import (
     task_app,
 )
 from flocks.cli.commands.update import update_command
-from flocks.cli.service_manager import (
+from flocks.cli.service_config import (
     ServiceConfig,
+    ServiceConfigError,
+    build_service_config,
+    restart_defaults_from_status_payload,
+)
+from flocks.cli.service_control import read_supervisor_status
+from flocks.cli.service_manager import (
     ServiceError,
-    read_runtime_record,
     resolve_flocks_cli_command,
     restart_all,
+    restart_server,
     runtime_paths,
     show_logs,
     show_status,
     start_all,
     stop_all,
 )
+from flocks.cli.service_supervisor import run_service_daemon
 from flocks.config.config import Config
 from flocks.utils.log import Log, LogLevel
 
@@ -66,6 +74,7 @@ app.add_typer(skill_app, name="skills")
 app.add_typer(admin_app, name="admin")
 
 app.command(name="update")(update_command)
+app.command(name="doctor")(doctor_command)
 app.command(
     name="browser",
     context_settings=BROWSER_CONTEXT_SETTINGS,
@@ -140,6 +149,8 @@ def main_callback(
 def _service_config(
     no_browser: bool = False,
     skip_webui_build: bool = False,
+    host: Optional[str] = None,
+    port: Optional[int] = None,
     server_host: Optional[str] = None,
     server_port: Optional[int] = None,
     webui_host: Optional[str] = None,
@@ -151,87 +162,36 @@ def _service_config(
 ) -> ServiceConfig:
     """Build service config from environment and CLI toggles."""
     global_config = Config.get_global()
-    return ServiceConfig(
-        backend_host=_resolve_host(
-            cli_value=server_host,
-            env_names=("FLOCKS_SERVER_HOST", "FLOCKS_BACKEND_HOST"),
-            default=default_server_host or global_config.server_host,
-        ),
-        backend_port=_resolve_port(
-            cli_value=server_port,
-            env_names=("FLOCKS_SERVER_PORT", "FLOCKS_BACKEND_PORT"),
-            default=default_server_port or global_config.server_port,
-            label="server",
-        ),
-        frontend_host=_resolve_host(
-            cli_value=webui_host,
-            env_names=("FLOCKS_WEBUI_HOST", "FLOCKS_FRONTEND_HOST"),
-            default=default_webui_host or "127.0.0.1",
-        ),
-        frontend_port=_resolve_port(
-            cli_value=webui_port,
-            env_names=("FLOCKS_WEBUI_PORT", "FLOCKS_FRONTEND_PORT"),
-            default=default_webui_port or 5173,
-            label="webui",
-        ),
+    return build_service_config(
         no_browser=no_browser,
-        skip_frontend_build=skip_webui_build,
+        skip_webui_build=skip_webui_build,
+        public_host=host,
+        public_port=port,
+        server_host=server_host,
+        server_port=server_port,
+        webui_host=webui_host,
+        webui_port=webui_port,
+        default_server_host=default_server_host or global_config.server_host,
+        default_server_port=default_server_port or global_config.server_port,
+        default_webui_host=default_webui_host or "127.0.0.1",
+        default_webui_port=default_webui_port or 5173,
     )
 
 
-def _resolve_host(cli_value: Optional[str], env_names: tuple[str, ...], default: str) -> str:
-    """Resolve a host value from CLI, environment, and default values."""
-    if cli_value is not None:
-        return cli_value
-    for env_name in env_names:
-        env_value = os.getenv(env_name)
-        if env_value:
-            return env_value
-    return default
-
-
-def _resolve_port(
-    cli_value: Optional[int],
-    env_names: tuple[str, ...],
-    default: int,
-    label: str,
-) -> int:
-    """Resolve a port value from CLI, environment, and default values."""
-    if cli_value is not None:
-        return cli_value
-    for env_name in env_names:
-        env_value = os.getenv(env_name)
-        if not env_value:
-            continue
-        try:
-            return int(env_value)
-        except ValueError as error:
-            raise ServiceError(f"{label} port from {env_name} must be an integer.") from error
-    return default
-
-
 def _restart_runtime_defaults() -> dict[str, Any]:
-    """Load host/port defaults from the last recorded service runtime."""
-    paths = runtime_paths()
-    backend = read_runtime_record(paths.backend_pid)
-    frontend = read_runtime_record(paths.frontend_pid)
-    defaults: dict[str, Any] = {}
-    if backend is not None:
-        if backend.host:
-            defaults["default_server_host"] = backend.host
-        if backend.port is not None:
-            defaults["default_server_port"] = backend.port
-    if frontend is not None:
-        if frontend.host:
-            defaults["default_webui_host"] = frontend.host
-        if frontend.port is not None:
-            defaults["default_webui_port"] = frontend.port
-    return defaults
+    """Load host/port defaults from the running supervisor when available."""
+    try:
+        status = read_supervisor_status(paths=runtime_paths(), timeout=1.0)
+    except Exception:
+        return {}
+    return restart_defaults_from_status_payload(getattr(status, "raw", status))
 
 
 def _restart_service_config(
     no_browser: bool = False,
     skip_webui_build: bool = False,
+    host: Optional[str] = None,
+    port: Optional[int] = None,
     server_host: Optional[str] = None,
     server_port: Optional[int] = None,
     webui_host: Optional[str] = None,
@@ -241,6 +201,8 @@ def _restart_service_config(
     return _service_config(
         no_browser=no_browser,
         skip_webui_build=skip_webui_build,
+        host=host,
+        port=port,
         server_host=server_host,
         server_port=server_port,
         webui_host=webui_host,
@@ -261,21 +223,25 @@ def start(
     skip_webui_build: bool = typer.Option(
         False,
         "--skip-webui-build",
-        help="Skip `npm run build` before starting WebUI",
+        help="Skip WebUI static asset build before starting Flocks service",
     ),
+    host: Optional[str] = typer.Option(None, "--host", "-h", help="Public service host"),
+    port: Optional[int] = typer.Option(None, "--port", "-p", help="Public service port"),
     server_host: Optional[str] = typer.Option(None, "--server-host", help="Backend server host"),
     server_port: Optional[int] = typer.Option(None, "--server-port", help="Backend server port"),
     webui_host: Optional[str] = typer.Option(None, "--webui-host", help="WebUI host"),
     webui_port: Optional[int] = typer.Option(None, "--webui-port", help="WebUI port"),
 ):
     """
-    Start backend and WebUI in daemon mode
+    Start Flocks service in daemon mode.
     """
     try:
         start_all(
             _service_config(
                 no_browser=no_browser,
                 skip_webui_build=skip_webui_build,
+                host=host,
+                port=port,
                 server_host=server_host,
                 server_port=server_port,
                 webui_host=webui_host,
@@ -290,7 +256,7 @@ def start(
 @app.command()
 def stop():
     """
-    Stop backend and WebUI
+    Stop Flocks service.
     """
     try:
         stop_all(console)
@@ -300,25 +266,38 @@ def stop():
 
 @app.command()
 def restart(
+    server_only: bool = typer.Option(
+        False,
+        "--server-only",
+        help="Restart only the backend server without stopping the supervisor daemon",
+    ),
     no_browser: bool = typer.Option(False, "--no-browser", help="Do not open WebUI in a browser"),
     skip_webui_build: bool = typer.Option(
         False,
         "--skip-webui-build",
-        help="Skip `npm run build` before starting WebUI",
+        help="Skip WebUI static asset build before starting Flocks service",
     ),
+    host: Optional[str] = typer.Option(None, "--host", "-h", help="Public service host"),
+    port: Optional[int] = typer.Option(None, "--port", "-p", help="Public service port"),
     server_host: Optional[str] = typer.Option(None, "--server-host", help="Backend server host"),
     server_port: Optional[int] = typer.Option(None, "--server-port", help="Backend server port"),
     webui_host: Optional[str] = typer.Option(None, "--webui-host", help="WebUI host"),
     webui_port: Optional[int] = typer.Option(None, "--webui-port", help="WebUI port"),
 ):
     """
-    Restart backend and WebUI
+    Restart Flocks service. Agents must use `flocks restart --server-only`;
+    bare restart stops the supervisor and terminates the running agent.
     """
     try:
+        if server_only:
+            restart_server(console)
+            return
         restart_all(
             _restart_service_config(
                 no_browser=no_browser,
                 skip_webui_build=skip_webui_build,
+                host=host,
+                port=port,
                 server_host=server_host,
                 server_port=server_port,
                 webui_host=webui_host,
@@ -326,14 +305,14 @@ def restart(
             ),
             console,
         )
-    except ServiceError as error:
+    except (ServiceConfigError, ServiceError) as error:
         _handle_service_error(error)
 
 
 @app.command()
 def status():
     """
-    Show backend and WebUI status
+    Show Flocks service status.
     """
     try:
         show_status(console)
@@ -343,13 +322,13 @@ def status():
 
 @app.command()
 def logs(
-    backend: bool = typer.Option(False, "--backend", help="Only show backend logs"),
-    webui: bool = typer.Option(False, "--webui", help="Only show WebUI logs"),
+    backend: bool = typer.Option(False, "--backend", help="Only show service logs"),
+    webui: bool = typer.Option(False, "--webui", help="Only show service logs"),
     follow: bool = typer.Option(True, "--follow/--no-follow", help="Follow logs in real time"),
     lines: int = typer.Option(50, "--lines", "-n", min=0, help="Number of recent lines to show"),
 ):
     """
-    Show backend and WebUI logs
+    Show Flocks service logs.
     """
     try:
         show_logs(console, backend=backend, webui=webui, follow=follow, lines=lines)
@@ -385,6 +364,8 @@ def serve(
     """
     import uvicorn
 
+    os.environ["_FLOCKS_SERVER_PORT"] = str(port)
+
     console.print(Panel(logo(), border_style="cyan"))
     console.print(f"[cyan]Starting server on:[/cyan] http://{host}:{port}")
     console.print(f"[cyan]API docs:[/cyan] http://{host}:{port}/docs")
@@ -398,6 +379,39 @@ def serve(
         log_level="info",
         log_config=_uvicorn_log_config(),
         access_log=False,
+    )
+
+
+@app.command(name="service-daemon", hidden=True)
+def service_daemon(
+    server_host: str = typer.Option("127.0.0.1", "--server-host", help="Backend server host"),
+    server_port: int = typer.Option(5173, "--server-port", help="Public service port"),
+    webui_host: str = typer.Option("127.0.0.1", "--webui-host", help="WebUI host"),
+    webui_port: int = typer.Option(5173, "--webui-port", help="WebUI port"),
+    legacy_server_host: Optional[str] = typer.Option(None, "--legacy-server-host", help="Legacy backend host"),
+    legacy_server_port: Optional[int] = typer.Option(8000, "--legacy-server-port", help="Legacy backend port"),
+    server_port_migration_hint: bool = typer.Option(
+        False,
+        "--server-port-migration-hint",
+        help="Print server-port migration hint in parent CLI",
+    ),
+    skip_webui_build: bool = typer.Option(False, "--skip-webui-build", help="Skip WebUI static asset build"),
+):
+    """
+    Run the Flocks service supervisor daemon.
+    """
+    run_service_daemon(
+        ServiceConfig(
+            backend_host=server_host,
+            backend_port=server_port,
+            frontend_host=webui_host,
+            frontend_port=webui_port,
+            legacy_backend_host=legacy_server_host,
+            legacy_backend_port=legacy_server_port,
+            server_port_migration_hint=server_port_migration_hint,
+            no_browser=True,
+            skip_frontend_build=skip_webui_build,
+        ),
     )
 
 
@@ -468,10 +482,11 @@ def tui(
         if _ensure_server_api_token():
             console.print("[dim]Initialized local API token for TUI access[/dim]")
 
-        # Set auto-approve environment variable for TUI mode
         if auto_approve:
             env["FLOCKS_AUTO_APPROVE"] = "true"
-            console.print("[dim]Auto-approve enabled: All permissions will be automatically granted[/dim]")
+            console.print(
+                "[dim]Auto-approve enabled: all permissions will be automatically granted[/dim]"
+            )
 
         server_process = subprocess.Popen(
             resolve_flocks_cli_command() + [

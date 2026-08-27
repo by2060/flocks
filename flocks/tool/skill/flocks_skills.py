@@ -12,7 +12,6 @@ situation.
 from __future__ import annotations
 
 import asyncio
-import shlex
 import shutil
 from typing import Optional
 
@@ -32,65 +31,21 @@ log = Log.create(service="tool.flocks_skills")
 _TIMEOUT_SEC = 120
 _MAX_OUTPUT = 8_000  # chars — keep responses concise for the model
 
-_DESCRIPTION = """\
-Manage agent skills: search the registry, install, check dependency status,
-install deps, and remove skills.  Use this tool (not bash) for any
-`flocks skills` operation.
+_DESCRIPTION = (
+    "Manage skills from external registries. Actions: find by query, install from "
+    "source, show dependency status, install a skill's dependencies, or remove a "
+    "user-managed skill. Use skill_load instead to load an installed skill."
+)
 
-⚠️ IMPORTANT DISTINCTION:
-  • To search for skills available in the **external public registry** (not yet installed):
-      → use this tool with subcommand="find"
-  • To see skills that are **already installed** in the current Flocks instance:
-      → use run_slash_command(command="skills") instead (not this tool)
-
-## Subcommands
-
-**find <query>**
-  Search the **external public skill registry** by keyword.
-  This does NOT show installed skills — it discovers skills that can be installed.
-  → Use BEFORE telling the user "I can't do X".  A matching skill may exist.
-  → To list already-installed skills, use run_slash_command(command="skills") instead.
-  Example: flocks_skills(subcommand="find", args="malware phishing")
-
-**install <source>**
-  Install a skill from an external source.
-  Source formats:
-    github:<owner>/<repo>/<skill-dir>   e.g. github:octocat/skills/find-ioc
-    clawhub:<name>                      e.g. clawhub:ndr-alert-analysis
-    https://...                         direct SKILL.md URL
-    /local/path or ./relative           local directory
-  → After install, always call status to check if deps are missing.
-  Example: flocks_skills(subcommand="install", args="github:owner/repo/skill-name")
-
-**status**
-  Show all discovered skills with eligibility info (missing bins / env vars).
-  → Run after install or when the user asks "which skills are ready?".
-  Example: flocks_skills(subcommand="status")
-
-**install-deps <skill-name>**
-  Install the tool dependencies declared in a skill's SKILL.md
-  (brew packages, npm globals, uv/pip packages, go binaries).
-  → Run when status shows a skill is not eligible.
-  Example: flocks_skills(subcommand="install-deps", args="find-ioc")
-
-**list**
-  List all locally discovered skills with source and description.
-  Example: flocks_skills(subcommand="list")
-
-**remove <skill-name>**
-  Uninstall a user-managed skill from ~/.flocks.
-  Example: flocks_skills(subcommand="remove", args="old-skill")
-"""
-
-# Allowed subcommands — enforced to prevent arbitrary shell injection via args.
+# Allowed subcommands — enforced to prevent arbitrary command execution.
 # Ordered for consistent display in tool schema enum and error messages.
 _ALLOWED_SUBCOMMANDS = frozenset(
-    ["find", "install", "status", "install-deps", "list", "remove"]
+    ["find", "install", "status", "install-deps", "remove"]
 )
-_SUBCOMMAND_ENUM = ["find", "install", "status", "install-deps", "list", "remove"]
+_SUBCOMMAND_ENUM = ["find", "install", "status", "install-deps", "remove"]
 
 # Read-only registry / discovery — no shell side effects; skip bash permission gate.
-_READ_ONLY_SUBCOMMANDS = frozenset({"find", "list", "status"})
+_READ_ONLY_SUBCOMMANDS = frozenset({"find", "status"})
 
 
 def _flocks_executable() -> Optional[str]:
@@ -108,30 +63,50 @@ def _flocks_executable() -> Optional[str]:
             type=ParameterType.STRING,
             description=(
                 "Skill management subcommand: "
-                "find | install | status | install-deps | list | remove"
+                "find | install | status | install-deps | remove"
             ),
             required=True,
             enum=_SUBCOMMAND_ENUM,
         ),
         ToolParameter(
-            name="args",
+            name="query",
+            type=ParameterType.STRING,
+            description="Registry search query for subcommand=find.",
+            required=False,
+        ),
+        ToolParameter(
+            name="source",
             type=ParameterType.STRING,
             description=(
-                "Arguments for the subcommand.  "
-                "For find: search query.  "
-                "For install: source string.  "
-                "For install-deps / remove: skill name.  "
-                "For status / list: leave empty."
+                "Skill source for subcommand=install, such as "
+                "github:owner/repo/skill, clawhub:name, skills-sh:owner/repo/skill, "
+                "safeskill://..., or an HTTPS SKILL.md URL."
             ),
             required=False,
-            default="",
+        ),
+        ToolParameter(
+            name="skill_name",
+            type=ParameterType.STRING,
+            description="Installed skill name for install-deps or remove.",
+            required=False,
+        ),
+        ToolParameter(
+            name="scope",
+            type=ParameterType.STRING,
+            description="Installation scope for subcommand=install.",
+            required=False,
+            default="global",
+            enum=["global", "project"],
         ),
     ],
 )
 async def flocks_skills(
     ctx: ToolContext,
     subcommand: str,
-    args: str = "",
+    query: Optional[str] = None,
+    source: Optional[str] = None,
+    skill_name: Optional[str] = None,
+    scope: str = "global",
 ) -> ToolResult:
     """Execute a `flocks skills <subcommand>` command and return its output."""
     if subcommand not in _ALLOWED_SUBCOMMANDS:
@@ -141,6 +116,56 @@ async def flocks_skills(
                 f"Unknown subcommand: {subcommand!r}. "
                 f"Allowed: {', '.join(sorted(_ALLOWED_SUBCOMMANDS))}"
             ),
+        )
+
+    if subcommand == "install":
+        if not source:
+            return ToolResult(
+                success=False,
+                error="install requires a source, e.g. github:owner/repo/skill-name or safeskill://...",
+            )
+        if scope not in {"global", "project"}:
+            return ToolResult(
+                success=False,
+                error="install --scope must be 'global' or 'project'",
+            )
+        await ctx.ask(
+            permission="bash",
+            patterns=[
+                f"flocks skills install {source} "
+                f"--scope {scope} --yes"
+            ],
+            always=["*flocks skills *"],
+            metadata={"subcommand": subcommand},
+        )
+        try:
+            from flocks.skill.installer import SkillInstaller
+
+            result = await SkillInstaller.install_from_source(
+                source,
+                scope=scope,
+                yes=True,
+            )
+        except Exception as exc:
+            return ToolResult(
+                success=False,
+                error=f"Skill install failed: {exc}",
+                title="flocks skills install",
+            )
+        if not result.success:
+            return ToolResult(
+                success=False,
+                error=result.error or result.message or "Skill install failed",
+                title="flocks skills install",
+            )
+        return ToolResult(
+            success=True,
+            output={
+                "message": result.message,
+                "skill_name": result.skill_name,
+                "location": result.location,
+            },
+            title="flocks skills install",
         )
 
     flocks_bin = _flocks_executable()
@@ -153,15 +178,31 @@ async def flocks_skills(
             ),
         )
 
+    command_args: list[str] = []
+    if subcommand == "find":
+        if not query:
+            return ToolResult(success=False, error="find requires query")
+        command_args.append(query)
+    elif subcommand in {"install-deps", "remove"}:
+        if not skill_name:
+            return ToolResult(
+                success=False,
+                error=f"{subcommand} requires skill_name",
+            )
+        command_args.append(skill_name)
+
     # Build the command list — no shell interpolation, safe from injection.
     cmd: list[str] = [flocks_bin, "skills", subcommand]
-    if args.strip():
-        # shlex.split preserves quoted tokens (e.g. paths with spaces).
-        cmd += shlex.split(args.strip())
+    cmd.extend(command_args)
+    # `skills add` (downstream of install for skills-sh sources) and remove
+    # both prompt interactively. Auto-add --yes so non-interactive agent
+    # calls don't hang.
+    if subcommand in ("install", "remove") and "--yes" not in cmd and "-y" not in cmd:
+        cmd.append("--yes")
 
     log.info("flocks_skills.run", {"cmd": cmd})
 
-    # Mutating subcommands need bash approval. Read-only (find/list/status) runs
+    # Mutating subcommands need bash approval. Read-only (find/status) runs
     # without prompting — same trust model as listing skills in the UI.
     #
     # For install/remove/install-deps, always-patterns must match the *full*

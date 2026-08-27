@@ -2,14 +2,16 @@
 
 只在以下情况进入浏览器模式：
 
-- API 不可用（未配置 / 未开通 / 认证失败 / Cookie 持久反复过期 / SSL 校验失败 / 网络不通）
+- API 不可用（未配置 / 未开通 / ApiKey 或 Secret 缺失 / 签名失败 / SSL 校验失败 / 网络不通）
 - 任务必须看页面级详情（攻击链、威胁图、报表预览、报文 hex view、PCAP 在线播放）
 - 需要图形验证码 / TOTP / 强制改密之类的人工交互
 - 用户明确要求使用浏览器，或者已经在浏览器操作过程中
 
-如果走 API 能完成，请回到 [api-reference.md](api-reference.md) —— 浏览器操作不稳定、不可批量、字段不一定完整。
+如果当前 Strategy API 能完成，请回到 [api-reference.md](api-reference.md)；浏览器操作不稳定、不可批量、字段不一定完整。
 
 > ⚠️ OneSIG 的 Web 控制台与 OneSEC、青藤是不同产品；不要把 OneSEC / 青藤的页面路径或 API 套用到 OneSIG。
+> 本文档统一按 `browser-use` 的 `cdp-direct` 流程执行：先 `flocks browser --doctor`，doctor 通过后只使用 `flocks browser`。
+> 对后台任务 / 定时任务，或系统不支持可视化，使用 `browser-use` 的 `cdp-headless` 模式。
 
 ## 零、登录认证
 
@@ -18,8 +20,31 @@ State 文件路径：`~/.flocks/browser/onesig/auth-state.json`（固定，全�
 ### 首次登录 / Session 过期重新登录
 
 ```bash
-agent-browser close
-agent-browser --headed open "https://<onesig-domain>/login"
+flocks browser --doctor
+```
+
+如果 `flocks browser --doctor` 提示浏览器已运行，但 daemon 或 active browser connection 不可用，必须直接提示用户：
+
+```text
+browser: not connected — 请确保 Chrome / Chromium / Edge 已打开，然后访问对应浏览器的 inspect 页面（例如 chrome://inspect/#remote-debugging 或 edge://inspect/#remote-debugging）并勾选 Allow remote debugging
+```
+
+然后等待用户进一步指示，不要直接操作。
+
+当用户确认已开启 remote debugging 后：
+
+1. 执行 `flocks browser --setup` 触发交互式 attach，不要用短超时包装该命令。
+2. 再运行 `flocks browser --doctor` 做只读确认。
+3. 如果还失败，先执行 `flocks browser --reload` 清理旧 daemon，再重新执行 `flocks browser --setup`，避免因为残留 daemon 造成干扰。
+4. 只有随后 `--doctor` 通过后，才继续后面的登录或页面操作。
+
+```bash
+flocks browser -c '
+tid = new_tab("https://<onesig-domain>/login", activate=True)
+wait_for_load()
+print(tid)
+print(page_info())
+'
 ```
 
 OneSIG 多数部署启用了图形验证码 + TOTP + 强制改密：
@@ -31,7 +56,7 @@ OneSIG 多数部署启用了图形验证码 + TOTP + 强制改密：
 等用户登录结束、收到通知后保存 state：
 
 ```bash
-agent-browser state save ~/.flocks/browser/onesig/auth-state.json
+flocks browser state save ~/.flocks/browser/onesig/auth-state.json
 ```
 
 ### Session 失效恢复
@@ -45,22 +70,19 @@ agent-browser state save ~/.flocks/browser/onesig/auth-state.json
 恢复步骤（最多尝试 1 次）：
 
 ```bash
-# 1) close 并重新加载 state
-agent-browser close
-agent-browser state load ~/.flocks/browser/onesig/auth-state.json
+# 1) 重新加载 state，并直接带目标 URL 验证
+flocks browser state load ~/.flocks/browser/onesig/auth-state.json --url "https://<onesig-domain>/monitoring/dashboard"
 
-# 2) 打开受保护页面验证 session
-agent-browser open "https://<onesig-domain>/monitoring/dashboard"
-agent-browser wait --load networkidle
+# 2) 读取当前页面状态
+flocks browser -c '
+print(page_info())
+'
+```
 
-# 3) 根据结果决策
-URL=$(agent-browser get url)
-if [[ "$URL" == *"/login"* ]]; then
-  echo "Session 仍无效，需重新登录"
-else
-  agent-browser state save ~/.flocks/browser/onesig/auth-state.json
-  echo "Session 已恢复，可重试页面操作"
-fi
+如果输出 URL 仍然落回登录页，再要求用户重新登录；否则重新保存一次 state 并继续：
+
+```bash
+flocks browser state save ~/.flocks/browser/onesig/auth-state.json
 ```
 
 如果仍然落回登录页，再要求用户重新登录，**不要无限循环重试**。
@@ -71,9 +93,12 @@ fi
 > 进入页面首选直接拼接 URL（比菜单点击更稳定）。
 
 ```bash
-agent-browser open "https://<onesig-domain>/<path>"
-agent-browser wait --load networkidle
-agent-browser get text body
+flocks browser -c '
+tid = new_tab("https://<onesig-domain>/<path>", activate=True)
+wait_for_load()
+print(page_info())
+print(js("document.body.innerText.slice(0, 2000)"))
+'
 ```
 
 | 模块 | 子功能 | URL 路径 | 主要用途 |
@@ -120,14 +145,17 @@ agent-browser get text body
 
 ## 二、浏览器与 API 的互补建议
 
-进入浏览器模式后，对于"查询类"诉求，应该**优先回到 API**（除非 API 真的不可用）：
+进入浏览器模式后，只有当前 Strategy API 覆盖的诉求才优先回到 API；未覆盖的控制台能力继续走浏览器：
 
 | 任务 | 优先方案 |
 |---|---|
-| 列威胁事件 / 失陷主机 / 趋势数据 | API（`onesig_monitoring`） —— 浏览器只在需要威胁图、报文 hex 时用 |
-| 增删改黑白名单 / IPS 规则 / 多维封锁 | API（`onesig_strategy`），写操作前要二次确认 |
-| 看资产清单、增改资产 | API（`onesig_assets`） —— 浏览器仅做导入文件预览 |
-| 设备升级 / 重启 / HA 切换 | 浏览器 + API 并用：先在浏览器里走完确认弹窗、备份提示，再用 API 触发；或者全程在浏览器里完成（更稳） |
+| 看设备平台 / 系统 / 网络状态 | API（`onesig_strategy_api_query`） |
+| 看资产组、资产列表、资产类型 | API（`onesig_strategy_api_query`） |
+| 增删改资产或资产组 | API（`onesig_strategy_api_ops`），写操作前要二次确认 |
+| 看 / 改防护策略、全局白名单、全局黑名单、封禁白名单、HTTP 黑名单 | API（`onesig_strategy_api_query` / `onesig_strategy_api_ops`），写操作前要二次确认 |
+| 列威胁事件 / 失陷主机 / 趋势数据 | 浏览器（当前 Strategy API 不覆盖） |
+| IPS 规则、多维封锁、Syslog 自动封禁、FTP/SFTP 联动、高危端口防护 | 浏览器（当前 Strategy API 不覆盖） |
+| 设备升级 / 重启 / HA 切换 | 浏览器；强破坏性动作必须显式确认 |
 | 看证书 / 解密策略详情 | 浏览器（API 返回的字段比页面少） |
 | 看页面级图表 / 攻击链 / IOC 关联 | 浏览器（API 没有） |
 | 处理图形验证码 / TOTP / 强制改密 | 浏览器（API 不能完成人工交互） |
@@ -150,14 +178,17 @@ agent-browser get text body
 
 ## 四、文件下载与导出
 
-OneSIG 控制台的导出按钮（资产 / 黑白名单 / 报表 / 审计 / coredump / pcap）多数会触发浏览器下载。在 `agent-browser` 模式下：
+OneSIG 控制台的导出按钮（资产 / 黑白名单 / 报表 / 审计 / coredump / pcap）多数会触发浏览器下载。当前 Strategy API 工具没有导出 / 下载 action；需要导出文件时走浏览器页面。
+
+先用 `js(...)` 或稳定 selector 触发下载，再用浏览器系统的下载目录或页面提示确认下载已开始；不要在 skill 里承诺不存在的“等待下载完成”专有命令。
+
+页面下载最小模板：
 
 ```bash
-# 触发下载
-agent-browser click "<导出 / 下载 按钮的 selector>"
-# 等下载完成 —— OneSIG 服务端通常 < 30s
-agent-browser wait --download
-agent-browser download list
+flocks browser -c '
+attach_tab("<TARGET_ID>")
+js("document.querySelector(\"<导出按钮选择器>\")?.click()")
+wait(1.0)
+print(page_info())
+'
 ```
-
-建议优先用 API 的导出 / 下载 action（参见 [api-reference.md](api-reference.md) "文件类返回 / 上传"小节）。

@@ -203,6 +203,27 @@ class Command:
                 visible_surfaces=("webui", "tui", "acp", "cli"),
             ),
             CommandDef(
+                name="goal",
+                description="Set a persistent session goal",
+                template="Set session goal: $ARGUMENTS",
+                agent="rex",
+                execution_kind="direct",
+                allow_attachments=False,
+                visible_surfaces=ALL_SURFACES,
+                requires_existing_session=True,
+                channel_safe=True,
+            ),
+            CommandDef(
+                name="dream",
+                description="Run self-improvement for Memory and Skills",
+                template="Run Dream self-improvement for Memory and Skills.",
+                execution_kind="direct",
+                allow_attachments=False,
+                visible_surfaces=ALL_SURFACES,
+                requires_existing_session=True,
+                channel_safe=True,
+            ),
+            CommandDef(
                 name="model",
                 description="Change or inspect the current model",
                 template="Switch to model: $1",
@@ -240,14 +261,17 @@ class Command:
                 agent="rex",
                 execution_kind="session_control",
                 allow_attachments=False,
-                visible_surfaces=("webui", "tui", "acp"),
+                visible_surfaces=("webui", "tui", "acp", "channel"),
+                channel_safe=True,
             ),
             CommandDef(
                 name="clear",
-                description="Clear screen output",
-                template="Clear the current UI output only.",
+                description="Clear the current session history",
+                template="Clear all messages in the current session.",
                 execution_kind="direct",
                 allow_attachments=False,
+                visible_surfaces=ALL_SURFACES,
+                channel_safe=True,
             ),
             CommandDef(
                 name="bug",
@@ -258,32 +282,23 @@ class Command:
                 allow_attachments=True,
             ),
             CommandDef(
-                name="plan",
-                description="Create a plan for a task",
-                template="Create a detailed plan for: $ARGUMENTS",
-                agent="plan",
-                execution_kind="llm",
-                allow_attachments=True,
-            ),
-            CommandDef(
-                name="ask",
-                description="Ask a question without making changes",
-                template="$ARGUMENTS",
-                agent="ask",
-                execution_kind="llm",
-                allow_attachments=True,
-            ),
-            CommandDef(
                 name="tasks",
                 description="Show task center overview",
-                template="Use the schedule_task_list tool to show the current task center overview including running, queued, and recently completed tasks. Present the results clearly.",
+                template=(
+                    "Use schedule_task with action='list' and resource_type='execution' "
+                    "to show running, queued, and recently completed task executions. "
+                    "Present the results clearly."
+                ),
                 execution_kind="llm",
                 allow_attachments=True,
             ),
             CommandDef(
                 name="queue",
                 description="Show task queue status",
-                template="Use the schedule_task_list tool with status filter to show the current task queue status: running tasks, queued tasks, and queue configuration. Present the results clearly.",
+                template=(
+                    "Use schedule_task with action='list' and resource_type='execution' "
+                    "to show running and queued task executions. Present the results clearly."
+                ),
                 execution_kind="llm",
                 allow_attachments=True,
             ),

@@ -9,6 +9,7 @@ import os
 import unicodedata
 from dataclasses import dataclass
 from difflib import unified_diff
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from flocks.tool.registry import (
@@ -26,16 +27,20 @@ from flocks.utils.log import Log
 log = Log.create(service="tool.edit")
 
 
-DESCRIPTION = """Edit a single file using exact text replacement.
+DESCRIPTION = """Edit a single existing file using targeted text replacement.
 
-Usage:
-- Prefer `edits` for one or more disjoint replacements in the same file.
-- Every `edits[].oldString` is matched against the original file content, not after earlier edits are applied.
-- Do not use overlapping or nested edits. Merge nearby changes into one edit.
-- Legacy `oldString`/`newString`/`replaceAll` is still supported for single-edit callers.
-- Use `replaceAll` only with legacy single-edit arguments when you want to replace every occurrence in the file.
-- CRITICAL: match text exactly including whitespace and newlines.
-- The tool preserves the file's existing encoding and dominant line-ending style."""
+Use this tool for one or more changes within the same file.
+
+Do not use this tool when a dedicated tool is a better fit:
+- Create a new file -> `write`
+- Modify, add, delete, or move multiple files in one coordinated change -> `apply_patch`
+
+Usage notes:
+- Prefer `edits` for one or more disjoint replacements.
+- Every `edits[].oldString` is matched against the original file snapshot.
+- Each `oldString` must be unique, and edits must not overlap.
+- The tool preserves the file's encoding and line-ending style.
+- Legacy `oldString` / `newString` / `replaceAll` remains supported."""
 
 
 def normalize_line_endings(text: str) -> str:
@@ -270,12 +275,12 @@ def _count_occurrences(
 def _get_not_found_error(filepath: str, edit_index: int, total_edits: int) -> str:
     if total_edits == 1:
         return (
-            f"Could not find the exact text in {filepath}. "
-            "The oldString must match exactly including all whitespace and newlines."
+            f"Could not find oldString in {filepath}. "
+            "Re-read the file and provide a slightly larger unique snippet from the current file contents."
         )
     return (
         f"Could not find edits[{edit_index}] in {filepath}. "
-        "The oldString must match exactly including all whitespace and newlines."
+        "Re-read the file and provide a slightly larger unique snippet from the current file contents."
     )
 
 
@@ -519,13 +524,43 @@ async def edit_tool(
         return ToolResult(success=False, error="filePath is required")
 
     try:
-        resolution = await resolve_tool_path(ctx, filePath)
+        resolution = await resolve_tool_path(
+            ctx,
+            filePath,
+            allow_host_memory=True,
+            allow_host_skills=True,
+        )
     except ValueError as exc:
         return ToolResult(success=False, error=str(exc), title=filePath)
     filepath = resolution.resolved_path
 
+    from flocks.config import Config
+    from flocks.memory.paths import DAILY_AGENT_WRITE_ERROR, is_daily_memory_path
+
+    memory_root = Config.get_data_path() / "memory"
+    if is_daily_memory_path(memory_root, Path(filepath)):
+        return ToolResult(
+            success=False,
+            error=DAILY_AGENT_WRITE_ERROR,
+            title=resolution.display_path,
+        )
+
     sandbox = ctx.extra.get("sandbox") if ctx.extra else None
     if isinstance(sandbox, dict) and sandbox.get("workspace_access") == "ro":
+        from flocks.session.execution_mode import is_plan_file_edit
+
+        plan_file_edit = is_plan_file_edit(
+            ctx.extra.get("execution_mode"),
+            ctx,
+            filepath,
+        )
+    else:
+        plan_file_edit = False
+    if (
+        isinstance(sandbox, dict)
+        and sandbox.get("workspace_access") == "ro"
+        and not plan_file_edit
+    ):
         return ToolResult(
             success=False,
             error=(
@@ -540,14 +575,29 @@ async def edit_tool(
     if oldString == "" and edits is None:
         if newString is None:
             return ToolResult(success=False, error="newString is required when oldString is empty", title=title)
-        diff = trim_diff(generate_diff(filepath, "", newString))
-        await ctx.ask(
-            permission="edit",
-            patterns=[resolution.permission_pattern],
-            always=["*"],
-            metadata={"filepath": filepath, "diff": diff},
-        )
+        if ctx.agent == "self-improve" and Path(filepath).name == "SKILL.md":
+            from flocks.memory.evolution.skill_guard import (
+                validate_evolution_skill_write,
+            )
 
+            skill_path = Path(filepath)
+            if skill_path.exists():
+                evolution_error = (
+                    "Read the existing managed Skill and use a precise edit"
+                )
+            else:
+                evolution_error = await validate_evolution_skill_write(
+                    skill_path,
+                    newString,
+                    exists=False,
+                )
+            if evolution_error:
+                return ToolResult(
+                    success=False,
+                    error=evolution_error,
+                    title=title,
+                )
+        diff = trim_diff(generate_diff(filepath, "", newString))
         parent_dir = os.path.dirname(filepath)
         if parent_dir and not os.path.exists(parent_dir):
             os.makedirs(parent_dir, exist_ok=True)
@@ -620,13 +670,25 @@ async def edit_tool(
     content_new = bom + restore_line_endings(normalized_content_new, original_line_ending)
     diff = trim_diff(generate_diff(filepath, base_content, normalized_content_new))
 
-    await ctx.ask(
-        permission="edit",
-        patterns=[resolution.permission_pattern],
-        always=["*"],
-        metadata={"filepath": filepath, "diff": diff},
-    )
+    if (
+        ctx.agent == "self-improve"
+        and Path(filepath).name == "SKILL.md"
+    ):
+        from flocks.memory.evolution.skill_guard import (
+            validate_evolution_skill_edit,
+        )
 
+        evolution_error = validate_evolution_skill_edit(
+            Path(filepath),
+            raw_content_old,
+            content_new,
+        )
+        if evolution_error:
+            return ToolResult(
+                success=False,
+                error=evolution_error,
+                title=title,
+            )
     try:
         with open(filepath, "w", encoding="utf-8", newline="") as file_handle:
             file_handle.write(content_new)

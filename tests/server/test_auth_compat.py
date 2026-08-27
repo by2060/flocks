@@ -2,7 +2,11 @@ from starlette.requests import Request
 from fastapi import HTTPException
 import pytest
 
-from flocks.auth.context import AuthUser
+from flocks.auth.context import (
+    AuthUser,
+    get_current_auth_user,
+    set_current_auth_user,
+)
 from flocks.server import auth as auth_module
 
 
@@ -80,6 +84,32 @@ async def test_apply_auth_for_request_non_browser_accepts_valid_token(monkeypatc
         assert user.username == "api-token-service"
     finally:
         auth_module.clear_auth_context(token)
+
+
+@pytest.mark.asyncio
+async def test_apply_auth_for_request_resets_context_when_adapter_fails(monkeypatch):
+    authenticated = AuthUser(
+        id="usr_adapter",
+        username="adapter-user",
+        role="member",
+        status="active",
+    )
+
+    async def apply_authenticated_request(_request):
+        token = set_current_auth_user(authenticated)
+        return None, token, authenticated
+
+    async def failing_adapter(_request, _user):
+        raise RuntimeError("adapter failed")
+
+    monkeypatch.setattr(auth_module, "_apply_auth_for_request", apply_authenticated_request)
+    auth_module.register_auth_context_adapter("failing-test-adapter", failing_adapter)
+    try:
+        with pytest.raises(RuntimeError, match="adapter failed"):
+            await auth_module.apply_auth_for_request(_make_request())
+        assert get_current_auth_user() is None
+    finally:
+        auth_module.unregister_auth_context_adapter("failing-test-adapter")
 
 
 @pytest.mark.asyncio
@@ -162,6 +192,7 @@ async def test_apply_auth_for_request_requires_password_reset_before_access(monk
 
     assert exc_info.value.status_code == 403
     assert "必须先修改密码" in str(exc_info.value.detail)
+    assert get_current_auth_user() is None
 
 
 @pytest.mark.asyncio
@@ -295,6 +326,9 @@ class TestAuthMiddlewareExempt:
     def test_protected_path_is_not_exempt(self):
         assert auth_module.auth_middleware_exempt("/api/session") is False
         assert auth_module.auth_middleware_exempt("/api/admin/users") is False
+        assert auth_module.auth_middleware_exempt("/docs") is False
+        assert auth_module.auth_middleware_exempt("/redoc") is False
+        assert auth_module.auth_middleware_exempt("/openapi.json") is False
 
     def test_channel_webhook_is_exempt_via_regex(self):
         # /api/channel/{channel_id}/webhook is the public callback entry for
@@ -304,6 +338,10 @@ class TestAuthMiddlewareExempt:
         assert auth_module.auth_middleware_exempt("/channel/dingtalk/webhook") is True
         assert auth_module.auth_middleware_exempt("/api/channel/wecom/webhook") is True
         assert auth_module.auth_middleware_exempt("/api/channel/feishu/webhook/") is True
+
+    def test_workflow_webhook_is_exempt_via_regex(self):
+        assert auth_module.auth_middleware_exempt("/webhook/workflows/wf-1/hook-default") is True
+        assert auth_module.auth_middleware_exempt("/webhook/workflows/wf-1/hook-default/") is True
 
     def test_other_channel_subpaths_are_still_protected(self):
         # Only ``/webhook`` is public; ``/bind``, ``/restart``, ``/status``
@@ -315,6 +353,7 @@ class TestAuthMiddlewareExempt:
         # Defense-in-depth: a malicious caller must not hide a protected path
         # behind a fake ``webhook`` segment.
         assert auth_module.auth_middleware_exempt("/api/channel/dingtalk/webhook/extra") is False
+        assert auth_module.auth_middleware_exempt("/webhook/workflows/wf-1/hook-default/extra") is False
 
 
 @pytest.mark.asyncio
@@ -339,6 +378,26 @@ async def test_apply_auth_for_request_channel_webhook_passes_without_credentials
     try:
         assert blocked is None
         # Public paths intentionally do not synthesize an auth user.
+        assert user is None
+    finally:
+        auth_module.clear_auth_context(token)
+
+
+@pytest.mark.asyncio
+async def test_apply_auth_for_request_workflow_webhook_passes_without_credentials(monkeypatch):
+    monkeypatch.setattr(
+        auth_module,
+        "get_secret_manager",
+        lambda: _FakeSecrets({auth_module.API_TOKEN_SECRET_ID: "abc123"}),
+    )
+    request = _make_request(
+        headers={"user-agent": "Alertmanager-Webhook"},
+        client_host="203.0.113.20",
+        path="/webhook/workflows/wf-1/hook-default",
+    )
+    blocked, token, user = await auth_module.apply_auth_for_request(request)
+    try:
+        assert blocked is None
         assert user is None
     finally:
         auth_module.clear_auth_context(token)

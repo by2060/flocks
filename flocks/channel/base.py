@@ -39,6 +39,7 @@ class ChannelCapabilities:
     reactions: bool = False
     edit: bool = False
     rich_text: bool = False
+    self_managed_connection: bool = False
 
 
 @dataclass
@@ -84,6 +85,10 @@ class DeliveryResult:
     success: bool = True
     error: Optional[str] = None
     retryable: bool = False
+
+
+class NonRetryableChannelError(RuntimeError):
+    """Raised when reconnecting cannot fix a channel startup failure."""
 
 
 @dataclass
@@ -238,6 +243,20 @@ class ChannelPlugin(ABC):
             f"Channel '{self.meta().id}' does not support webhook mode"
         )
 
+    async def webhook_authentication_evidence(
+        self,
+        body: bytes,
+        headers: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Return opaque verification evidence before a public webhook effect.
+
+        The default reports no verification.  Flocks does not decide whether
+        this evidence is sufficient; extensions may apply their own policy at
+        the generic Channel webhook lifecycle boundary.
+        """
+        del body, headers
+        return {"plugin_authenticated": False}
+
     async def stop(self) -> None:
         """Stop listening and release resources."""
 
@@ -278,6 +297,7 @@ class ChannelPlugin(ABC):
 
     def mark_connected(self) -> None:
         self._status.connected = True
+        self._status.last_error = None
 
     def mark_disconnected(self, error: Optional[str] = None) -> None:
         self._status.connected = False

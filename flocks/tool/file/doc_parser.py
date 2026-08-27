@@ -158,10 +158,7 @@ def _sanitize_stem(path: Path) -> str:
 
 def _default_output_path(input_file: Path) -> Path:
     workspace = WorkspaceManager.get_instance()
-    workspace.ensure_dirs()
-    today = dt.date.today().isoformat()
-    output_dir = workspace.get_workspace_dir() / "outputs" / today
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = workspace.get_default_outputs_dir()
     suffix = input_file.suffix.lower().lstrip(".") or "file"
     return output_dir / f"{_sanitize_stem(input_file)}_{suffix}.md"
 
@@ -705,13 +702,6 @@ async def doc_parser(
     if output_file.exists() and not overwrite:
         return ToolResult(success=False, error=f"Output file already exists: {output_file}")
 
-    await ctx.ask(
-        permission="read",
-        patterns=[str(input_file)],
-        always=["*"],
-        metadata={"filepath": str(input_file)},
-    )
-
     markdown, parser_name, errors = await asyncio.to_thread(_run_extractors, input_file)
     if not markdown:
         error_lines = "\n".join(errors) if errors else "No parser produced content."
@@ -721,14 +711,6 @@ async def doc_parser(
         )
 
     output_file.parent.mkdir(parents=True, exist_ok=True)
-    diff = f"Generated markdown for {input_file.name}"
-    await ctx.ask(
-        permission="edit",
-        patterns=[str(output_file)],
-        always=["*"],
-        metadata={"filepath": str(output_file), "diff": diff},
-    )
-
     output_file.write_text(markdown + "\n", encoding="utf-8")
     return ToolResult(
         success=True,

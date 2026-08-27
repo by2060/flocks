@@ -3,23 +3,40 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
-from typing import Any, Dict, List
+import uuid
+from typing import Any, Dict, List, Optional
 
-from flocks.storage.storage import Storage
+from flocks.hooks.execution import execute_with_hooks
+from flocks.hooks.pipeline import HookPipeline
 from flocks.utils.log import Log
 from flocks.workflow.execution_store import (
-    compact_history_for_storage,
     compact_outputs_for_storage,
     create_execution_record,
+    ExecutionStepRecorder,
     record_execution_result,
     resolve_execution_outcome,
 )
+from flocks.workflow.execution_plan import build_workflow_execution_plan
 from flocks.workflow.fs_store import read_workflow_from_fs
+from flocks.workflow.models import Workflow
 from flocks.workflow.runner import run_workflow
+from flocks.workflow.store import WorkflowStore
+from flocks.workflow.tool_context import (
+    build_workflow_tool_context,
+    cleanup_workflow_tool_context,
+)
 
 from flocks.ingest.syslog.constants import WORKFLOW_SYSLOG_CONFIG_PREFIX
 from flocks.ingest.syslog.listener import run_tcp_syslog_server, run_udp_syslog_server
+from flocks.workflow.triggers.compat import legacy_syslog_trigger_from_config
+from flocks.workflow.triggers.dispatcher import EventDispatcher, TriggerDispatchError, build_trigger_event
+from flocks.workflow.triggers.models import (
+    TriggerDefinition,
+    workflow_json_declares_triggers,
+    workflow_trigger_definitions_from_json,
+)
 
 log = Log.create(service="syslog.manager")
 
@@ -37,6 +54,14 @@ _BIND_WAIT_TIMEOUT_S = 3.0
 # Minimum interval between two ``syslog.queue_full_dropped`` warnings; a
 # sustained queue overflow is aggregated into a single warning per window.
 _DROP_LOG_WINDOW_S = 1.0
+
+
+def _worker_count_for_trigger(trigger: TriggerDefinition) -> int:
+    return min(_MAX_CONCURRENT_EXECUTIONS, max(1, int(trigger.concurrency.maxParallel)))
+
+
+def _queue_size_for_trigger(trigger: TriggerDefinition) -> int:
+    return min(_MAX_QUEUE_SIZE, max(1, int(trigger.concurrency.queueSize)))
 
 
 class _DropWarningThrottle:
@@ -84,13 +109,16 @@ class _DropWarningThrottle:
             self._flush(trigger=trigger)
 
     def _flush(self, *, trigger: str) -> None:
-        log.warning("syslog.queue_full_dropped", {
-            "workflow_id": self._workflow_id,
-            "queue_size": self._queue.qsize(),
-            "queue_capacity": self._queue.maxsize,
-            "dropped_in_window": int(self._count),
-            "trigger": trigger,
-        })
+        log.warning(
+            "syslog.queue_full_dropped",
+            {
+                "workflow_id": self._workflow_id,
+                "queue_size": self._queue.qsize(),
+                "queue_capacity": self._queue.maxsize,
+                "dropped_in_window": int(self._count),
+                "trigger": trigger,
+            },
+        )
         self._count = 0
         self._last_log = time.monotonic()
 
@@ -118,6 +146,11 @@ class SyslogManager:
         self._queues: dict[str, asyncio.Queue] = {}
         # Per-workflow fixed worker pool draining the queue
         self._worker_pools: dict[str, List[asyncio.Task]] = {}
+        # One cancellation event per listener generation. It is installed
+        # before any worker starts, so stop cannot miss a run that is still
+        # creating its execution record or tool context.
+        self._generation_cancel_events: dict[str, threading.Event] = {}
+        self._draining_workers: dict[str, set[asyncio.Task]] = {}
         # Per-workflow listener runtime status for the syslog-status API.
         # Possible state values: "binding" | "listening" | "failed" | "stopped".
         self._listener_status: dict[str, Dict[str, Any]] = {}
@@ -125,31 +158,65 @@ class SyslogManager:
         # successfully or failed.  Used by ``restart_workflow`` so the HTTP
         # save endpoint can report bind failures synchronously.
         self._listener_ready: dict[str, asyncio.Event] = {}
+        self._dispatcher = EventDispatcher()
 
     @staticmethod
     def _config_key(workflow_id: str) -> str:
         return f"{WORKFLOW_SYSLOG_CONFIG_PREFIX}{workflow_id}"
 
+    @staticmethod
+    def _default_trigger_from_config(data: Dict[str, Any]) -> TriggerDefinition:
+        trigger = legacy_syslog_trigger_from_config(data)
+        if trigger is None:
+            return TriggerDefinition.model_validate(
+                {
+                    "id": "syslog-default",
+                    "type": "syslog",
+                    "enabled": bool(data.get("enabled")),
+                    "source": {
+                        "protocol": data.get("protocol") or "udp",
+                        "host": data.get("host") or "0.0.0.0",
+                        "port": int(data.get("port") or 5140),
+                        "format": data.get("format") or "auto",
+                    },
+                    "mapping": {
+                        str(data.get("inputKey") or "syslog_message"): "$.body",
+                    },
+                    "updatedAt": data.get("updatedAt"),
+                }
+            )
+        return trigger
+
+    def _resolve_active_trigger(self, workflow_json: Dict[str, Any], data: Dict[str, Any]) -> TriggerDefinition:
+        if workflow_json_declares_triggers(workflow_json):
+            triggers = workflow_trigger_definitions_from_json(workflow_json)
+            trigger = next((item for item in triggers if item.type == "syslog"), None)
+            if trigger is not None:
+                return trigger
+        return self._default_trigger_from_config(data)
+
     async def start_all(self) -> None:
         try:
-            keys = await Storage.list_keys(WORKFLOW_SYSLOG_CONFIG_PREFIX)
+            configs = await WorkflowStore.list_configs(kind="workflow_syslog_config")
         except Exception as exc:
-            log.warning("syslog.list_keys_failed", {"error": str(exc)})
+            log.warning("syslog.list_configs_failed", {"error": str(exc)})
             return
 
-        for key in keys:
-            if not key.startswith(WORKFLOW_SYSLOG_CONFIG_PREFIX):
-                continue
-            workflow_id = key[len(WORKFLOW_SYSLOG_CONFIG_PREFIX) :]
+        for workflow_id, data in configs:
             if not workflow_id:
                 continue
-            try:
-                data = await Storage.read(key)
-            except Exception as exc:
-                log.warning("syslog.config_read_failed", {"key": key, "error": str(exc)})
-                continue
             if isinstance(data, dict) and data.get("enabled"):
-                await self.restart_workflow(workflow_id)
+                try:
+                    await self.restart_workflow(workflow_id, startup=True)
+                except Exception as exc:
+                    self._listener_status[workflow_id] = {
+                        "state": "failed",
+                        "error": str(exc),
+                    }
+                    log.warning(
+                        "syslog.start_failed",
+                        {"workflow_id": workflow_id, "error": str(exc)},
+                    )
 
     async def stop_all(self) -> None:
         for workflow_id in list(self._tasks.keys()):
@@ -178,7 +245,40 @@ class SyslogManager:
             status["workerCount"] = sum(1 for t in pool if not t.done())
         return status
 
+    def _track_draining_workers(
+        self,
+        workflow_id: str,
+        workers: set[asyncio.Task],
+    ) -> None:
+        if not workers:
+            return
+        bucket = self._draining_workers.setdefault(workflow_id, set())
+        bucket.update(workers)
+
+        def _discard(done: asyncio.Task) -> None:
+            current = self._draining_workers.get(workflow_id)
+            if current is None:
+                return
+            current.discard(done)
+            if not current:
+                self._draining_workers.pop(workflow_id, None)
+
+        for worker in workers:
+            worker.add_done_callback(_discard)
+
+    def _active_draining_workers(self, workflow_id: str) -> set[asyncio.Task]:
+        workers = self._draining_workers.get(workflow_id, set())
+        active = {worker for worker in workers if not worker.done()}
+        if active:
+            self._draining_workers[workflow_id] = active
+        else:
+            self._draining_workers.pop(workflow_id, None)
+        return active
+
     async def stop_workflow(self, workflow_id: str) -> None:
+        cancel_event = self._generation_cancel_events.pop(workflow_id, None)
+        if cancel_event is not None:
+            cancel_event.set()
         ev = self._abort_events.pop(workflow_id, None)
         if ev is not None:
             ev.set()
@@ -189,26 +289,24 @@ class SyslogManager:
                 await task
             except asyncio.CancelledError:
                 pass
-        # Cancel all worker pool tasks; pop first so callers observing a
-        # stopped listener see an empty pool immediately.
+        # Let workers drain their current ``to_thread`` workflow after the
+        # cooperative cancel signal. Pending workers stay tracked instead of
+        # becoming invisible orphan threads.
         pool = self._worker_pools.pop(workflow_id, None)
         if pool:
-            for w in pool:
-                if not w.done():
-                    w.cancel()
-            try:
-                await asyncio.wait_for(
-                    asyncio.gather(*pool, return_exceptions=True),
-                    timeout=5.0,
-                )
-            except (asyncio.TimeoutError, asyncio.CancelledError):
-                pass
+            _, pending = await asyncio.wait(pool, timeout=5.0)
+            self._track_draining_workers(workflow_id, pending)
         self._queues.pop(workflow_id, None)
         self._listener_ready.pop(workflow_id, None)
         if workflow_id in self._listener_status:
             self._listener_status[workflow_id] = {"state": "stopped", "error": None}
 
-    async def restart_workflow(self, workflow_id: str) -> Dict[str, Any]:
+    async def restart_workflow(
+        self,
+        workflow_id: str,
+        *,
+        startup: bool = False,
+    ) -> Dict[str, Any]:
         """Restart the listener and return its post-bind runtime status.
 
         This call blocks until the underlying socket either binds successfully,
@@ -218,9 +316,12 @@ class SyslogManager:
         user instead of silently leaving the listener in a failed state.
         """
         await self.stop_workflow(workflow_id)
-        key = self._config_key(workflow_id)
+        if self._active_draining_workers(workflow_id):
+            error = "previous_workers_still_draining"
+            self._listener_status[workflow_id] = {"state": "failed", "error": error}
+            return {"state": "failed", "error": error}
         try:
-            data = await Storage.read(key)
+            data = await WorkflowStore.get_config(workflow_id, kind="workflow_syslog_config")
         except Exception as exc:
             log.warning("syslog.restart_read_failed", {"workflow_id": workflow_id, "error": str(exc)})
             return {"state": "failed", "error": str(exc)}
@@ -232,8 +333,15 @@ class SyslogManager:
         wf_data = read_workflow_from_fs(workflow_id)
         if not wf_data:
             err = "workflow_not_found"
+            if startup:
+                self._listener_status[workflow_id] = {"state": "stopped", "error": err}
+                log.info("syslog.workflow_not_found_on_start", {
+                    "workflow_id": workflow_id,
+                    "action": "stale_config_skipped",
+                })
+                return {"state": "stopped", "error": err}
             self._listener_status[workflow_id] = {"state": "failed", "error": err}
-            log.warning("syslog.workflow_not_found_on_start", {"workflow_id": workflow_id})
+            log.warning("syslog.workflow_not_found", {"workflow_id": workflow_id})
             return {"state": "failed", "error": err}
         workflow_json = wf_data.get("workflowJson")
         if not workflow_json:
@@ -242,18 +350,31 @@ class SyslogManager:
             log.warning("syslog.workflow_json_missing_on_start", {"workflow_id": workflow_id})
             return {"state": "failed", "error": err}
 
-        queue: asyncio.Queue = asyncio.Queue(maxsize=_MAX_QUEUE_SIZE)
-        self._queues[workflow_id] = queue
-
-        abort = asyncio.Event()
-        self._abort_events[workflow_id] = abort
-
-        ready = asyncio.Event()
-        self._listener_ready[workflow_id] = ready
+        trigger = self._resolve_active_trigger(workflow_json, data)
+        try:
+            workflow_plan = build_workflow_execution_plan(Workflow.from_dict(workflow_json))
+        except Exception as exc:
+            err = f"workflow_plan_failed: {exc}"
+            self._listener_status[workflow_id] = {"state": "failed", "error": err}
+            log.warning("syslog.workflow_plan_failed", {"workflow_id": workflow_id, "error": str(exc)})
+            return self.get_listener_status(workflow_id)
 
         host = str(data.get("host") or "0.0.0.0")
         port = int(data.get("port") or 5140)
         protocol = str(data.get("protocol") or "udp").lower()
+        queue_capacity = _queue_size_for_trigger(trigger)
+        worker_count = _worker_count_for_trigger(trigger)
+        queue: asyncio.Queue = asyncio.Queue(maxsize=queue_capacity)
+        self._queues[workflow_id] = queue
+
+        abort = asyncio.Event()
+        self._abort_events[workflow_id] = abort
+        generation_cancel_event = threading.Event()
+        self._generation_cancel_events[workflow_id] = generation_cancel_event
+
+        ready = asyncio.Event()
+        self._listener_ready[workflow_id] = ready
+
         self._listener_status[workflow_id] = {
             "state": "binding",
             "error": None,
@@ -262,16 +383,19 @@ class SyslogManager:
             "protocol": protocol,
         }
 
-        input_key = str(data.get("inputKey") or "syslog_message")
-
-        # Spin up a fixed worker pool: exactly _MAX_CONCURRENT_EXECUTIONS
-        # coroutines drain the queue.  pending tasks cannot exceed this number,
-        # which is the actual backpressure invariant we want.
+        # Spin up the trigger-configured worker pool within service safety caps.
         workers: List[asyncio.Task] = []
-        for i in range(_MAX_CONCURRENT_EXECUTIONS):
+        for i in range(worker_count):
             workers.append(
                 asyncio.create_task(
-                    self._worker_loop(workflow_id, workflow_json, input_key, queue, abort),
+                    self._worker_loop(
+                        workflow_id,
+                        workflow_plan,
+                        trigger,
+                        queue,
+                        abort,
+                        generation_cancel_event,
+                    ),
                     name=f"syslog-worker-{workflow_id}-{i}",
                 )
             )
@@ -416,10 +540,11 @@ class SyslogManager:
     async def _worker_loop(
         self,
         workflow_id: str,
-        workflow_json: Any,
-        input_key: str,
+        workflow_plan: Any,
+        trigger: TriggerDefinition,
         queue: asyncio.Queue,
         abort: asyncio.Event,
+        generation_cancel_event: Optional[threading.Event] = None,
     ) -> None:
         """One worker drains the queue serially.
 
@@ -427,6 +552,11 @@ class SyslogManager:
         do not spawn additional asyncio.Tasks per message so the total number
         of in-flight workflow runs is exactly ``_MAX_CONCURRENT_EXECUTIONS``.
         """
+        run_cancel_event = (
+            generation_cancel_event
+            or self._generation_cancel_events.get(workflow_id)
+            or threading.Event()
+        )
         while not abort.is_set():
             try:
                 msg = await asyncio.wait_for(queue.get(), timeout=0.5)
@@ -435,7 +565,15 @@ class SyslogManager:
             except asyncio.CancelledError:
                 return
             try:
-                await self._trigger_workflow(workflow_id, workflow_json, msg, input_key)
+                await self._trigger_workflow(
+                    workflow_id,
+                    workflow_plan,
+                    msg,
+                    next(iter(trigger.mapping or {}), "syslog_message"),
+                    trigger=trigger,
+                    source=f"{(trigger.source or {}).get('protocol', 'udp')}://{(trigger.source or {}).get('host', '0.0.0.0')}:{(trigger.source or {}).get('port', 5140)}",
+                    generation_cancel_event=run_cancel_event,
+                )
             except asyncio.CancelledError:
                 return
             except Exception as exc:
@@ -447,57 +585,147 @@ class SyslogManager:
     async def _trigger_workflow(
         self,
         workflow_id: str,
-        workflow_json: Any,
+        workflow_plan: Any,
         syslog_msg: dict,
         input_key: str,
+        *,
+        trigger: Optional[TriggerDefinition] = None,
+        source: Optional[str] = None,
+        generation_cancel_event: Optional[threading.Event] = None,
     ) -> None:
-        inputs = {input_key: syslog_msg}
-
-        exec_data = await create_execution_record(
-            workflow_id,
-            input_params={"_trigger": "syslog", **inputs},
+        run_cancel_event = generation_cancel_event or threading.Event()
+        trigger = trigger or TriggerDefinition.model_validate(
+            {
+                "id": "syslog-default",
+                "type": "syslog",
+                "enabled": True,
+                "mapping": {input_key: "$.body"},
+            }
         )
-        exec_id = exec_data["id"]
-        start_time = time.time()
+        event = build_trigger_event(
+            workflow_id=workflow_id,
+            trigger=trigger,
+            body=syslog_msg,
+            raw=syslog_msg,
+            source=source or "syslog",
+            delivery_id=f"syslog-{uuid.uuid4().hex}",
+        )
+
+        async def _executor(mapped_inputs: Dict[str, Any]) -> Dict[str, Any]:
+            summarized_inputs = {"_trigger": trigger.type}
+            summarized_inputs.update(mapped_inputs)
+
+            exec_data = await create_execution_record(
+                workflow_id,
+                input_params=summarized_inputs,
+            )
+            exec_id = exec_data["id"]
+            loop = asyncio.get_running_loop()
+            step_recorder = ExecutionStepRecorder(
+                exec_id=exec_id,
+                loop=loop,
+                logger=log,
+                log_event="syslog.execution_step.write_failed",
+            )
+            start_time = time.time()
+            trigger_meta = mapped_inputs.get("_flocks", {}).get("trigger", {})
+            tool_context = None
+            try:
+                tool_context = await build_workflow_tool_context(
+                    workflow_id=workflow_id,
+                    action_name=f"trigger:{trigger.type}",
+                )
+                result = await asyncio.to_thread(
+                    run_workflow,
+                    workflow=workflow_plan,
+                    inputs=mapped_inputs,
+                    run_id=exec_id,
+                    trace=False,
+                    execution_profile="high_frequency",
+                    cancel=run_cancel_event.is_set,
+                    on_step_complete=step_recorder.on_step_complete,
+                    tool_context=tool_context,
+                )
+                status, error_msg = resolve_execution_outcome(result)
+                duration = time.time() - start_time
+                step_count = step_recorder.step_count or result.steps
+                exec_data.update(step_recorder.summary)
+                exec_data.update(
+                    {
+                        "status": status,
+                        "outputResults": compact_outputs_for_storage(result.outputs),
+                        "finishedAt": int(time.time() * 1000),
+                        "duration": duration,
+                        "errorMessage": error_msg,
+                        "executionLog": [],
+                        "stepCount": step_count,
+                        "currentNodeId": result.last_node_id,
+                        "currentPhase": status,
+                        "currentStepIndex": step_count,
+                        "triggerId": trigger.id,
+                        "triggerType": trigger.type,
+                        "deliveryId": trigger_meta.get("deliveryId"),
+                        "attempt": trigger_meta.get("attempt"),
+                        "triggerSource": trigger_meta.get("source"),
+                    }
+                )
+            except Exception as exc:
+                duration = time.time() - start_time
+                log.error(
+                    "syslog.workflow_run_failed",
+                    {"workflow_id": workflow_id, "exec_id": exec_id, "error": str(exc)},
+                )
+                exec_data.update(step_recorder.summary)
+                exec_data.update(
+                    {
+                        "status": "error",
+                        "errorMessage": str(exc),
+                        "finishedAt": int(time.time() * 1000),
+                        "duration": duration,
+                        "executionLog": [],
+                        "currentPhase": "error",
+                        "triggerId": trigger.id,
+                        "triggerType": trigger.type,
+                        "deliveryId": trigger_meta.get("deliveryId"),
+                        "attempt": trigger_meta.get("attempt"),
+                        "triggerSource": trigger_meta.get("source"),
+                    }
+                )
+            finally:
+                await cleanup_workflow_tool_context(tool_context)
+                try:
+                    await record_execution_result(workflow_id, exec_id, exec_data)
+                except Exception as exc:
+                    log.warning("syslog.exec_record_failed", {"exec_id": exec_id, "error": str(exc)})
+            return exec_data
 
         try:
-            result = await asyncio.to_thread(
-                run_workflow,
-                workflow=workflow_json,
-                inputs=inputs,
-                trace=False,
+            action_payload = {
+                "operation": "workflow.trigger.syslog",
+                "transport": "headless",
+                "workflow_id": workflow_id,
+                "trigger": trigger,
+                "event": event,
+                "metadata": {
+                    "legacy_compat": True,
+                    "trigger_type": "syslog",
+                },
+            }
+            await execute_with_hooks(
+                action_payload,
+                lambda: self._dispatcher.dispatch(
+                    trigger=trigger,
+                    event=event,
+                    executor=_executor,
+                ),
+                before=HookPipeline.run_ingress_before,
+                after=HookPipeline.run_ingress_after,
             )
-            status, error_msg = resolve_execution_outcome(result)
-            duration = time.time() - start_time
-            exec_data.update({
-                "status": status,
-                "outputResults": compact_outputs_for_storage(result.outputs),
-                "finishedAt": int(time.time() * 1000),
-                "duration": duration,
-                "errorMessage": error_msg,
-                "executionLog": compact_history_for_storage(result.history),
-                "currentNodeId": result.last_node_id,
-                "currentPhase": status,
-                "currentStepIndex": result.steps,
-            })
-        except Exception as exc:
-            duration = time.time() - start_time
-            log.error(
-                "syslog.workflow_run_failed",
-                {"workflow_id": workflow_id, "exec_id": exec_id, "error": str(exc)},
+        except TriggerDispatchError as exc:
+            log.warning(
+                "syslog.trigger_dispatch_failed",
+                {"workflow_id": workflow_id, "trigger_id": trigger.id, "error": str(exc)},
             )
-            exec_data.update({
-                "status": "error",
-                "errorMessage": str(exc),
-                "finishedAt": int(time.time() * 1000),
-                "duration": duration,
-                "currentPhase": "error",
-            })
-        finally:
-            try:
-                await record_execution_result(workflow_id, exec_id, exec_data)
-            except Exception as exc:
-                log.warning("syslog.exec_record_failed", {"exec_id": exec_id, "error": str(exc)})
 
 
 default_manager = SyslogManager()

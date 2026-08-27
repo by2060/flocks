@@ -19,6 +19,36 @@ interface RunTabProps {
   latestExecution: WorkflowExecution | null;
   onLatestExecutionChange?: (execution: WorkflowExecution | null) => void;
   onExecutionSettled?: () => void;
+  sections?: RunTabSection[];
+  embedded?: boolean;
+  embeddedTabs?: boolean;
+  hideSectionHeaders?: boolean;
+  focusExecutionId?: string;
+}
+
+export type RunTabSection = 'test' | 'history';
+
+function getExecutionDisplayStatus(execution?: WorkflowExecution | null): string {
+  if (!execution) return 'unknown';
+  if (execution.status === 'running' && execution.currentPhase) {
+    return execution.currentPhase;
+  }
+  return execution.status;
+}
+
+function getExecutionDisplayMessage(
+  execution: WorkflowExecution | null | undefined,
+  t: (key: string) => string,
+): string {
+  if (!execution?.errorMessage) return '';
+  const displayStatus = getExecutionDisplayStatus(execution);
+  if (
+    displayStatus === 'cancelling'
+    && execution.errorMessage === 'Cancellation requested'
+  ) {
+    return t('detail.run.cancelRequested');
+  }
+  return execution.errorMessage;
 }
 
 function SectionHeader({
@@ -26,18 +56,24 @@ function SectionHeader({
   expanded,
   onToggle,
   badge,
+  embedded = false,
 }: {
   title: string;
   expanded: boolean;
   onToggle: () => void;
   badge?: React.ReactNode;
+  embedded?: boolean;
 }) {
   return (
     <button
       onClick={onToggle}
-      className="w-full flex items-center justify-between px-4 py-3 bg-gray-50 border-b border-gray-100 hover:bg-gray-100 transition-colors text-left"
+      className={`w-full flex items-center justify-between transition-colors text-left ${
+        embedded
+          ? 'px-3 py-2.5 bg-white border-b border-gray-100 hover:bg-gray-50'
+          : 'px-4 py-3 bg-gray-50 border-b border-gray-100 hover:bg-gray-100'
+      }`}
     >
-      <span className="text-xs font-semibold text-gray-700 flex items-center gap-2">
+      <span className={`${embedded ? 'text-sm text-gray-900' : 'text-xs text-gray-700'} font-semibold flex items-center gap-2`}>
         {title}
         {badge}
       </span>
@@ -165,6 +201,224 @@ function isPlainObject(value: unknown): value is Record<string, any> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+const MOCK_DASHBOARD_STORAGE_KEYS = [
+  'soc-dashboard-mock-v1',
+  'soc-dashboard-mock-activity-v1',
+  'soc-dashboard-mock-task-center-v1',
+];
+
+function isMockExecutionFallbackEnabled(): boolean {
+  if (typeof window === 'undefined') return false;
+  const params = new URLSearchParams(window.location.search);
+  if (
+    params.get('mockDashboard') === '1'
+    || params.get('mockActivity') === '1'
+    || params.get('mockTaskCenter') === '1'
+    || params.get('mockExecution') === '1'
+  ) {
+    return true;
+  }
+  try {
+    return MOCK_DASHBOARD_STORAGE_KEYS.some((key) => window.localStorage?.getItem(key) === '1');
+  } catch {
+    return false;
+  }
+}
+
+function createMockWorkflowExecutions(workflowId: string): WorkflowExecution[] {
+  const now = Date.now();
+  if (workflowId === 'stream_alert_triage') {
+    return [
+      {
+        id: 'mock-triage-run-002',
+        workflowId: 'stream_alert_triage',
+        inputParams: {
+          alert_id: 'mock-alert-rce',
+          source_type: 'tdp',
+          threat_name: '远程命令执行攻击（Mock）',
+          src_ip: '203.0.113.41',
+          dst_ip: '10.12.4.18',
+          request_uri: '/cgi-bin/luci/;stok=/locale',
+        },
+        status: 'running',
+        startedAt: now - 4 * 60 * 1000,
+        duration: 240.2,
+        outputResults: {
+          alert_id: 'mock-alert-rce',
+          verdict: '疑似攻击行为',
+          confidence: 0.82,
+          next_action: '等待证据汇总节点完成后自动提交研判结论',
+        },
+        executionLog: [
+          {
+            node_id: 'load_dedup_file',
+            node_type: 'python',
+            inputs: {
+              alert_id: 'mock-alert-rce',
+              dedup_path: '~/.flocks/workspace/outputs/2026-08-13/artifacts/dedup.jsonl',
+            },
+            outputs: {
+              related_count: 3,
+              cluster_id: 'MOCK-RCE-12',
+              latest_seen: new Date(now - 6 * 60 * 1000).toISOString(),
+            },
+            stdout: 'Loaded 3 related alerts from dedup artifact.',
+            duration_ms: 892,
+          },
+          {
+            node_id: 'concurrent_triage',
+            node_type: 'python',
+            inputs: {
+              alert_id: 'mock-alert-rce',
+              evidence_count: 3,
+              model: 'security-triage-llm',
+            },
+            outputs: {
+              verdict: '疑似攻击行为',
+              confidence: 0.82,
+              evidence: [
+                '请求路径命中历史 RCE 利用模式',
+                '源 IP 在最近窗口内触发多类探测',
+                '目标资产暴露管理接口',
+              ],
+            },
+            stdout: 'LLM triage completed; waiting for downstream cursor commit.',
+            duration_ms: 31244,
+          },
+        ],
+        triggerSource: 'workflow_execution',
+        currentNodeId: 'concurrent_triage',
+        currentNodeType: 'python',
+        currentPhase: 'running',
+        currentStepIndex: 2,
+        stepCount: 4,
+        stepLogOffset: 0,
+        stepLogLimit: 500,
+        stepLogTotal: 2,
+      },
+      {
+        id: 'mock-triage-run-003',
+        workflowId: 'stream_alert_triage',
+        inputParams: {
+          alert_id: 'mock-alert-sql',
+          source_type: 'onesec',
+          threat_name: 'SQL 注入探测（Mock）',
+        },
+        status: 'running',
+        startedAt: now - 18 * 1000,
+        duration: 18,
+        outputResults: {},
+        executionLog: [
+          {
+            node_id: 'load_dedup_file',
+            node_type: 'python',
+            inputs: { alert_id: 'mock-alert-sql' },
+            outputs: { related_count: 1, cluster_id: 'MOCK-SQL-04' },
+            stdout: 'Loaded 1 related alert.',
+            duration_ms: 711,
+          },
+        ],
+        triggerSource: 'workflow_execution',
+        currentNodeId: 'concurrent_triage',
+        currentNodeType: 'python',
+        currentPhase: 'running',
+        currentStepIndex: 1,
+        stepCount: 4,
+        stepLogOffset: 0,
+        stepLogLimit: 500,
+        stepLogTotal: 1,
+      },
+    ];
+  }
+  if (workflowId === 'stream_alert_denoise') {
+    return [
+      {
+        id: 'mock-denoise-run-001',
+        workflowId: 'stream_alert_denoise',
+        inputParams: {
+          batch_id: 'mock-alert-login-burst',
+          source_type: 'skyeye',
+          sample_count: 6,
+        },
+        status: 'running',
+        startedAt: now - 7 * 60 * 1000,
+        duration: 421.6,
+        outputResults: {
+          cluster_id: 'MOCK-LOGIN-07',
+          raw_count: 18,
+          reduced_count: 11,
+          unique_count: 7,
+          reduction_rate: 0.6111,
+        },
+        executionLog: [
+          {
+            node_id: 'normalize_alerts',
+            node_type: 'python',
+            inputs: { batch_id: 'mock-alert-login-burst', raw_count: 18 },
+            outputs: { normalized_count: 18 },
+            stdout: 'Normalized 18 alerts from skyeye.',
+            duration_ms: 1024,
+          },
+          {
+            node_id: 'cluster_alerts',
+            node_type: 'python',
+            inputs: { normalized_count: 18 },
+            outputs: { cluster_id: 'MOCK-LOGIN-07', duplicate_count: 7, unique_count: 7 },
+            stdout: 'Clustered alerts by source, target and login pattern.',
+            duration_ms: 2380,
+          },
+        ],
+        triggerSource: 'workflow_execution',
+        currentNodeId: 'cluster_alerts',
+        currentNodeType: 'python',
+        currentPhase: 'running',
+        currentStepIndex: 2,
+        stepCount: 5,
+        stepLogOffset: 0,
+        stepLogLimit: 500,
+        stepLogTotal: 2,
+      },
+      {
+        id: 'mock-denoise-run-004',
+        workflowId: 'stream_alert_denoise',
+        inputParams: {
+          batch_id: 'mock-alert-scan',
+          source_type: 'qingteng',
+          sample_count: 4,
+        },
+        status: 'running',
+        startedAt: now - 26 * 1000,
+        duration: 26,
+        outputResults: {},
+        executionLog: [
+          {
+            node_id: 'normalize_alerts',
+            node_type: 'python',
+            inputs: { batch_id: 'mock-alert-scan', raw_count: 12 },
+            outputs: { normalized_count: 12 },
+            stdout: 'Normalized 12 scan alerts.',
+            duration_ms: 944,
+          },
+        ],
+        triggerSource: 'workflow_execution',
+        currentNodeId: 'cluster_alerts',
+        currentNodeType: 'python',
+        currentPhase: 'running',
+        currentStepIndex: 1,
+        stepCount: 5,
+        stepLogOffset: 0,
+        stepLogLimit: 500,
+        stepLogTotal: 1,
+      },
+    ];
+  }
+  return [];
+}
+
+function getMockWorkflowExecution(workflowId: string, executionId: string): WorkflowExecution | null {
+  return createMockWorkflowExecutions(workflowId).find((execution) => execution.id === executionId) ?? null;
+}
+
 // ─────────────────────────────────────────────
 // 区块1：测试运行
 // ─────────────────────────────────────────────
@@ -173,11 +427,15 @@ function TestSection({
   execution,
   onExecutionChange,
   onExecutionSettled,
+  embedded = false,
+  hideSectionHeader = false,
 }: {
   workflow: Workflow;
   execution: WorkflowExecution | null;
   onExecutionChange?: (execution: WorkflowExecution | null) => void;
   onExecutionSettled?: () => void;
+  embedded?: boolean;
+  hideSectionHeader?: boolean;
 }) {
   const { t } = useTranslation('workflow');
   const [expanded, setExpanded] = useState(true);
@@ -246,7 +504,7 @@ function TestSection({
 
     const pollExecution = async () => {
       try {
-        const response = await workflowAPI.getExecution(workflow.id, execution.id);
+        const response = await workflowAPI.getExecution(workflow.id, execution.id, { stepLimit: 0 });
         if (cancelled) return;
         onExecutionChange?.(response.data);
         if (response.data.status === 'running') {
@@ -274,6 +532,10 @@ function TestSection({
       }
     };
   }, [execution, onExecutionChange, onExecutionSettled, t, workflow.id]);
+
+  const displayStatus = getExecutionDisplayStatus(execution);
+  const isCancelling = displayStatus === 'cancelling';
+  const displayMessage = getExecutionDisplayMessage(execution, t);
 
   const scheduleSampleSave = useCallback((raw: string, parsed: Record<string, any>) => {
     if (saveTimerRef.current) {
@@ -357,6 +619,12 @@ function TestSection({
     try {
       setStopping(true);
       await workflowAPI.cancelExecution(workflow.id, execution.id);
+      onExecutionChange?.({
+        ...execution,
+        currentPhase: 'cancelling',
+        errorMessage: execution.errorMessage || 'Cancellation requested',
+      });
+      setStopping(false);
     } catch (error) {
       setStopping(false);
       onExecutionChange?.(execution ? {
@@ -367,12 +635,20 @@ function TestSection({
   };
 
   const showSampleSaveHint = sampleSaveState === 'saving' || sampleSaveState === 'saved';
+  const bodyExpanded = hideSectionHeader || expanded;
 
   return (
-    <div className="border-b border-gray-100">
-      <SectionHeader title={t('detail.run.testSection')} expanded={expanded} onToggle={() => setExpanded(v => !v)} />
-      {expanded && (
-        <div className="p-4 space-y-3">
+    <div className={embedded ? 'bg-white' : 'border-b border-gray-100'}>
+      {!hideSectionHeader && (
+        <SectionHeader
+          title={t('detail.run.testSection')}
+          expanded={expanded}
+          onToggle={() => setExpanded(v => !v)}
+          embedded={embedded}
+        />
+      )}
+      {bodyExpanded && (
+        <div className={`${embedded ? 'p-3' : 'p-4'} space-y-3`}>
           <div>
             <div className="flex items-center justify-between gap-2 mb-1">
               <label className="block text-xs text-gray-500">{t('detail.run.inputParams')}</label>
@@ -397,21 +673,21 @@ function TestSection({
           </div>
           <button
             onClick={running ? handleStop : handleRun}
-            disabled={stopping}
+            disabled={stopping || isCancelling}
             className="w-full flex items-center justify-center gap-2 py-2 bg-red-600 text-white text-xs font-medium rounded-lg hover:bg-red-700 disabled:opacity-60 disabled:cursor-not-allowed transition-colors"
           >
-            {stopping
+            {stopping || isCancelling
               ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
               : running
                 ? <StopCircle className="w-3.5 h-3.5" />
                 : <FlaskConical className="w-3.5 h-3.5" />}
-            {stopping ? t('detail.run.stopping') : running ? t('detail.run.stopRun') : t('detail.run.testRun')}
+            {stopping || isCancelling ? t('detail.run.stopping') : running ? t('detail.run.stopRun') : t('detail.run.testRun')}
           </button>
 
           {execution && (
             <div className="border border-gray-200 rounded-lg overflow-hidden">
               <div className="flex items-center justify-between px-3 py-2 bg-gray-50 border-b border-gray-200">
-                <WorkflowStatusBadge status={execution.status} />
+                <WorkflowStatusBadge status={displayStatus} />
                 {execution.duration != null && (
                   <span className="text-xs text-gray-400 flex items-center gap-1">
                     <Clock className="w-3 h-3" />
@@ -420,9 +696,11 @@ function TestSection({
                 )}
               </div>
 
-              {execution.errorMessage && (
-                <div className="px-3 py-2 bg-red-50 border-b border-red-100">
-                  <p className="text-xs text-red-600">{execution.errorMessage}</p>
+              {displayMessage && (
+                <div className={`px-3 py-2 border-b ${
+                  isCancelling ? 'bg-amber-50 border-amber-100' : 'bg-red-50 border-red-100'
+                }`}>
+                  <p className={`text-xs ${isCancelling ? 'text-amber-700' : 'text-red-600'}`}>{displayMessage}</p>
                 </div>
               )}
 
@@ -598,24 +876,27 @@ function StepDetail({ step, index, hasInputs, hasOutputs }: {
 function HistoryExecDetail({ exec: ex }: { exec: WorkflowExecution }) {
   const { t } = useTranslation('workflow');
   const [logExpanded, setLogExpanded] = useState(false);
+  const displayStatus = getExecutionDisplayStatus(ex);
   const isRunning = ex.status === 'running';
+  const isCancelling = displayStatus === 'cancelling';
   const hasOutput = ex.outputResults && Object.keys(ex.outputResults).length > 0;
   const hasLog = ex.executionLog && ex.executionLog.length > 0;
+  const displayMessage = getExecutionDisplayMessage(ex, t);
 
   return (
     <div className="border-t border-gray-200 bg-gray-50">
       {isRunning && (
         <div className="px-4 py-2 flex items-center gap-2 border-b border-gray-200">
-          <Loader2 className="w-3 h-3 animate-spin text-red-500" />
-          <span className="text-xs text-red-600">
-            {t('detail.run.running')}
+          <Loader2 className={`w-3 h-3 animate-spin ${isCancelling ? 'text-amber-500' : 'text-red-500'}`} />
+          <span className={`text-xs ${isCancelling ? 'text-amber-700' : 'text-red-600'}`}>
+            {isCancelling ? t('detail.run.stopping') : t('detail.run.running')}
             {hasLog && ` (${ex.executionLog.length} ${t('detail.run.stepsCompleted')})`}
           </span>
         </div>
       )}
-      {ex.errorMessage && (
+      {displayMessage && (
         <div className="px-4 py-2 border-b border-gray-200">
-          <p className="text-xs text-red-600">{ex.errorMessage}</p>
+          <p className={`text-xs ${isCancelling ? 'text-amber-700' : 'text-red-600'}`}>{displayMessage}</p>
         </div>
       )}
       {hasOutput && (
@@ -662,45 +943,111 @@ function HistoryExecDetail({ exec: ex }: { exec: WorkflowExecution }) {
 function HistorySection({
   workflowId,
   latestExecutionId,
+  focusExecutionId,
   onLatestExecutionChange,
+  embedded = false,
+  hideSectionHeader = false,
 }: {
   workflowId: string;
   latestExecutionId?: string;
+  focusExecutionId?: string;
   onLatestExecutionChange?: (execution: WorkflowExecution | null) => void;
+  embedded?: boolean;
+  hideSectionHeader?: boolean;
 }) {
   const { t } = useTranslation('workflow');
   const [expanded, setExpanded] = useState(true);
   const [history, setHistory] = useState<WorkflowExecution[]>([]);
   const [loading, setLoading] = useState(true);
   const [selectedExec, setSelectedExec] = useState<WorkflowExecution | null>(null);
+  const [focusedExecutionError, setFocusedExecutionError] = useState('');
+  const executionNotFoundText = t('detail.run.executionNotFound');
+
+  const loadFocusedExecution = useCallback(async (executionId: string): Promise<WorkflowExecution | null> => {
+    try {
+      const res = await workflowAPI.getExecution(workflowId, executionId);
+      return res.data;
+    } catch {
+      if (!isMockExecutionFallbackEnabled()) return null;
+      return getMockWorkflowExecution(workflowId, executionId);
+    }
+  }, [workflowId]);
 
   const fetchHistory = useCallback(async () => {
     try {
+      setFocusedExecutionError('');
       const res = await workflowAPI.getHistory(workflowId, { limit: 10 });
-      setHistory(res.data);
-      if (res.data.length > 0) {
+      let nextHistory = res.data;
+      if (nextHistory.length === 0 && isMockExecutionFallbackEnabled()) {
+        nextHistory = createMockWorkflowExecutions(workflowId);
+      }
+      if (focusExecutionId && !nextHistory.some((item: WorkflowExecution) => item.id === focusExecutionId)) {
+        const focusedExecution = await loadFocusedExecution(focusExecutionId);
+        if (focusedExecution) {
+          nextHistory = [focusedExecution, ...nextHistory];
+        } else {
+          setFocusedExecutionError(executionNotFoundText);
+        }
+      }
+      setHistory(nextHistory);
+      if (focusExecutionId) {
+        const focusedExecution = nextHistory.find((item: WorkflowExecution) => item.id === focusExecutionId) ?? null;
+        if (focusedExecution) {
+          onLatestExecutionChange?.(focusedExecution);
+          setSelectedExec(focusedExecution);
+          setExpanded(true);
+        }
+      } else if (nextHistory.length > 0) {
         const matchingExecution = latestExecutionId
-          ? res.data.find((item: WorkflowExecution) => item.id === latestExecutionId)
-          : res.data[0];
+          ? nextHistory.find((item: WorkflowExecution) => item.id === latestExecutionId)
+          : nextHistory[0];
         if (matchingExecution) {
           onLatestExecutionChange?.(matchingExecution);
         } else if (!latestExecutionId) {
-          onLatestExecutionChange?.(res.data[0]);
+          onLatestExecutionChange?.(nextHistory[0]);
         }
       } else if (!latestExecutionId) {
         onLatestExecutionChange?.(null);
       }
       setSelectedExec(prev => {
         if (!prev) return null;
-        const updated = res.data.find((e: WorkflowExecution) => e.id === prev.id);
-        return updated ?? prev;
+        const updated = nextHistory.find((e: WorkflowExecution) => e.id === prev.id);
+        if (!updated) return prev;
+        return {
+          ...updated,
+          executionLog: prev.executionLog?.length ? prev.executionLog : updated.executionLog,
+          stepLogOffset: prev.stepLogOffset ?? updated.stepLogOffset,
+          stepLogLimit: prev.stepLogLimit ?? updated.stepLogLimit,
+          stepLogTotal: prev.stepLogTotal ?? updated.stepLogTotal,
+        };
       });
     } catch {
-      setHistory([]);
+      const fallbackHistory = isMockExecutionFallbackEnabled()
+        ? createMockWorkflowExecutions(workflowId)
+        : [];
+      let nextHistory = fallbackHistory;
+      if (focusExecutionId && !nextHistory.some((item) => item.id === focusExecutionId)) {
+        const focusedExecution = getMockWorkflowExecution(workflowId, focusExecutionId);
+        if (focusedExecution) {
+          nextHistory = [focusedExecution, ...nextHistory];
+        } else if (isMockExecutionFallbackEnabled()) {
+          setFocusedExecutionError(executionNotFoundText);
+        }
+      }
+      setHistory(nextHistory);
+      if (focusExecutionId) {
+        const focusedExecution = nextHistory.find((item) => item.id === focusExecutionId) ?? null;
+        setSelectedExec(focusedExecution);
+        if (focusedExecution) onLatestExecutionChange?.(focusedExecution);
+      } else if (nextHistory.length > 0) {
+        onLatestExecutionChange?.(nextHistory[0]);
+      } else {
+        onLatestExecutionChange?.(null);
+      }
     } finally {
       setLoading(false);
     }
-  }, [latestExecutionId, onLatestExecutionChange, workflowId]);
+  }, [executionNotFoundText, focusExecutionId, latestExecutionId, loadFocusedExecution, onLatestExecutionChange, workflowId]);
 
   const hasRunning = history.some(e => e.status === 'running');
 
@@ -717,20 +1064,52 @@ function HistorySection({
   };
 
   const statusIcon = (status: string) => {
+    if (status === 'cancelling') return <Loader2 className="w-3.5 h-3.5 text-amber-500 animate-spin" />;
     if (status === 'success' || status === 'SUCCEEDED') return <CheckCircle className="w-3.5 h-3.5 text-green-500" />;
     if (status === 'running') return <Loader2 className="w-3.5 h-3.5 text-red-500 animate-spin" />;
     if (status === 'error' || status === 'FAILED') return <XCircle className="w-3.5 h-3.5 text-red-500" />;
     return <AlertCircle className="w-3.5 h-3.5 text-orange-500" />;
   };
+  const bodyExpanded = hideSectionHeader || expanded;
+
+  const toggleExecutionDetail = async (exec: WorkflowExecution) => {
+    if (selectedExec?.id === exec.id) {
+      setSelectedExec(null);
+      return;
+    }
+    setSelectedExec(exec);
+    try {
+      const res = await workflowAPI.getExecution(workflowId, exec.id);
+      setSelectedExec(res.data);
+    } catch {
+      setSelectedExec(
+        isMockExecutionFallbackEnabled()
+          ? getMockWorkflowExecution(workflowId, exec.id) ?? exec
+          : exec,
+      );
+    }
+  };
 
   return (
-    <div>
-      <SectionHeader title={t('detail.run.historySection')} expanded={expanded} onToggle={() => setExpanded(v => !v)} />
-      {expanded && (
+    <div className={embedded ? 'bg-white' : undefined}>
+      {!hideSectionHeader && (
+        <SectionHeader
+          title={t('detail.run.historySection')}
+          expanded={expanded}
+          onToggle={() => setExpanded(v => !v)}
+          embedded={embedded}
+        />
+      )}
+      {bodyExpanded && (
         <div>
           {loading ? (
             <div className="flex items-center justify-center py-6">
               <Loader2 className="w-4 h-4 animate-spin text-gray-400" />
+            </div>
+          ) : focusedExecutionError ? (
+            <div className="py-6 text-center">
+              <AlertCircle className="w-8 h-8 text-orange-300 mx-auto mb-2" />
+              <p className="text-xs text-gray-400">{focusedExecutionError}</p>
             </div>
           ) : history.length === 0 ? (
             <div className="py-6 text-center">
@@ -739,31 +1118,32 @@ function HistorySection({
             </div>
           ) : (
             <div>
-              <div className="divide-y divide-gray-100">
+              <div>
                 {history.map((exec) => (
-                  <button
-                    key={exec.id}
-                    onClick={() => setSelectedExec(selectedExec?.id === exec.id ? null : exec)}
-                    className="w-full flex items-center gap-2 px-4 py-2.5 hover:bg-gray-50 transition-colors text-left"
-                  >
-                    {statusIcon(exec.status)}
-                    <div className="flex-1 min-w-0">
-                      <p className="text-xs text-gray-700 truncate">{formatTime(exec.startedAt)}</p>
-                    </div>
-                    {exec.duration != null && (
-                      <span className="text-xs text-gray-400 flex-shrink-0">{exec.duration.toFixed(1)}s</span>
+                  <div key={exec.id} className="border-b border-gray-100 last:border-b-0">
+                    <button
+                      onClick={() => void toggleExecutionDetail(exec)}
+                      className="w-full flex items-center gap-2 px-4 py-2.5 hover:bg-gray-50 transition-colors text-left"
+                    >
+                      {statusIcon(getExecutionDisplayStatus(exec))}
+                      <div className="flex-1 min-w-0">
+                        <p className="text-xs text-gray-700 truncate">{formatTime(exec.startedAt)}</p>
+                      </div>
+                      {exec.duration != null && (
+                        <span className="text-xs text-gray-400 flex-shrink-0">{exec.duration.toFixed(1)}s</span>
+                      )}
+                      {selectedExec?.id === exec.id ? (
+                        <ChevronDown className="w-3 h-3 text-gray-400 flex-shrink-0" />
+                      ) : (
+                        <ChevronRight className="w-3 h-3 text-gray-400 flex-shrink-0" />
+                      )}
+                    </button>
+                    {selectedExec?.id === exec.id && (
+                      <HistoryExecDetail exec={selectedExec} />
                     )}
-                    {selectedExec?.id === exec.id ? (
-                      <ChevronDown className="w-3 h-3 text-gray-400 flex-shrink-0" />
-                    ) : (
-                      <ChevronRight className="w-3 h-3 text-gray-400 flex-shrink-0" />
-                    )}
-                  </button>
+                  </div>
                 ))}
               </div>
-              {selectedExec && (
-                <HistoryExecDetail exec={selectedExec} />
-              )}
             </div>
           )}
         </div>
@@ -780,20 +1160,105 @@ export default function RunTab({
   latestExecution,
   onLatestExecutionChange,
   onExecutionSettled,
+  sections = ['test', 'history'],
+  embedded = false,
+  embeddedTabs = false,
+  hideSectionHeaders = false,
+  focusExecutionId,
 }: RunTabProps) {
+  const { t } = useTranslation('workflow');
+  const [activeEmbeddedSection, setActiveEmbeddedSection] = useState<RunTabSection>(focusExecutionId ? 'history' : 'test');
+  const showTest = sections.includes('test');
+  const showHistory = sections.includes('history');
+  useEffect(() => {
+    if (focusExecutionId && showHistory) {
+      setActiveEmbeddedSection('history');
+    }
+  }, [focusExecutionId, showHistory]);
+  const activeSection =
+    activeEmbeddedSection === 'test' && showTest
+      ? 'test'
+      : activeEmbeddedSection === 'history' && showHistory
+        ? 'history'
+        : showTest
+          ? 'test'
+          : 'history';
+  const embeddedTabItems = [
+    showTest ? { id: 'test' as const, label: t('detail.run.testSection') } : null,
+    showHistory ? { id: 'history' as const, label: t('detail.run.historySection') } : null,
+  ].filter((item): item is { id: RunTabSection; label: string } => Boolean(item));
+
+  if (embeddedTabs) {
+    return (
+      <div className={embedded ? 'space-y-3' : 'flex-1 min-h-0 overflow-y-auto space-y-3'}>
+        <div className="flex rounded-md bg-gray-100 p-1">
+          {embeddedTabItems.map((item) => (
+            <button
+              key={item.id}
+              type="button"
+              onClick={() => setActiveEmbeddedSection(item.id)}
+              className={`flex-1 rounded px-2 py-1.5 text-xs font-medium transition-colors ${
+                activeSection === item.id
+                  ? 'bg-white text-red-600 shadow-sm'
+                  : 'text-gray-500 hover:text-gray-800'
+              }`}
+            >
+              {item.label}
+            </button>
+          ))}
+        </div>
+        <div className="overflow-hidden rounded-md border border-gray-200 bg-white">
+          {showTest && (
+            <div className={activeSection === 'test' ? 'block' : 'hidden'}>
+              <TestSection
+                workflow={workflow}
+                execution={latestExecution}
+                onExecutionChange={onLatestExecutionChange}
+                onExecutionSettled={onExecutionSettled}
+                embedded={embedded}
+                hideSectionHeader={hideSectionHeaders}
+              />
+            </div>
+          )}
+          {showHistory && (
+            <div className={activeSection === 'history' ? 'block' : 'hidden'}>
+              <HistorySection
+                workflowId={workflow.id}
+                latestExecutionId={latestExecution?.id}
+                focusExecutionId={focusExecutionId}
+                onLatestExecutionChange={onLatestExecutionChange}
+                embedded={embedded}
+                hideSectionHeader={hideSectionHeaders}
+              />
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
   return (
-    <div className="flex-1 min-h-0 overflow-y-auto divide-y divide-gray-100">
-      <TestSection
-        workflow={workflow}
-        execution={latestExecution}
-        onExecutionChange={onLatestExecutionChange}
-        onExecutionSettled={onExecutionSettled}
-      />
-      <HistorySection
-        workflowId={workflow.id}
-        latestExecutionId={latestExecution?.id}
-        onLatestExecutionChange={onLatestExecutionChange}
-      />
+    <div className={embedded ? 'space-y-3' : 'flex-1 min-h-0 overflow-y-auto divide-y divide-gray-100'}>
+      {showTest && (
+        <TestSection
+          workflow={workflow}
+          execution={latestExecution}
+          onExecutionChange={onLatestExecutionChange}
+          onExecutionSettled={onExecutionSettled}
+          embedded={embedded}
+          hideSectionHeader={hideSectionHeaders}
+        />
+      )}
+      {showHistory && (
+        <HistorySection
+          workflowId={workflow.id}
+          latestExecutionId={latestExecution?.id}
+          focusExecutionId={focusExecutionId}
+          onLatestExecutionChange={onLatestExecutionChange}
+          embedded={embedded}
+          hideSectionHeader={hideSectionHeaders}
+        />
+      )}
     </div>
   );
 }

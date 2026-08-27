@@ -37,6 +37,7 @@ from flocks.channel.inbound.dispatcher import (
 from flocks.channel.inbound.session_binding import (
     SessionBindingService,
     _resolve_session_directory,
+    resolve_channel_session_owner_kwargs,
 )
 from flocks.config.config import ChannelConfig
 
@@ -228,6 +229,74 @@ class TestSessionBindingDirectoryPropagation:
         assert captured["directory"] == "/instance/dir"
 
 
+class TestChannelSessionOwnerPropagation:
+    @pytest.mark.asyncio
+    async def test_create_session_does_not_assign_unrelated_local_admin_owner(self):
+        captured = {}
+
+        class _StubSession:
+            id = "ses_admin_owned"
+
+        async def _fake_create(**kwargs):
+            captured.update(kwargs)
+            return _StubSession()
+
+        with patch("flocks.session.session.Session.create", new=_fake_create), \
+             patch("flocks.auth.service.AuthService.has_users", new=AsyncMock(return_value=True)), \
+             patch("flocks.auth.service.AuthService.list_users", new=AsyncMock()) as list_users:
+            sid = await SessionBindingService._create_session(
+                _msg(),
+                default_agent="rex",
+                directory="/explicit/dir",
+            )
+
+        assert sid == "ses_admin_owned"
+        assert "owner_user_id" not in captured
+        assert "owner_username" not in captured
+        list_users.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_create_session_uses_system_owner_without_local_accounts(self):
+        captured = {}
+
+        class _StubSession:
+            id = "ses_ownerless"
+
+        async def _fake_create(**kwargs):
+            captured.update(kwargs)
+            return _StubSession()
+
+        with patch("flocks.session.session.Session.create", new=_fake_create), \
+             patch("flocks.auth.service.AuthService.has_users", new=AsyncMock(return_value=False)), \
+             patch("flocks.auth.service.AuthService.list_users", new=AsyncMock()) as list_users:
+            sid = await SessionBindingService._create_session(
+                _msg(),
+                default_agent="rex",
+                directory="/explicit/dir",
+            )
+
+        assert sid == "ses_ownerless"
+        assert captured["owner_user_id"] == "api-token-service"
+        assert captured["owner_username"] == "api-token-service"
+        list_users.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_owner_kwargs_preserve_existing_session_owner(self):
+        existing = SimpleNamespace(
+            owner_user_id="usr_existing",
+            owner_username="existing",
+        )
+
+        with patch("flocks.auth.service.AuthService.has_users", new=AsyncMock()) as has_users:
+            owner_kwargs = await resolve_channel_session_owner_kwargs(existing)
+
+        assert owner_kwargs == {
+            "owner_user_id": "usr_existing",
+            "owner_username": "existing",
+        }
+        has_users.assert_not_awaited()
+
+
 # ---------------------------------------------------------------------------
 # 2. default_agent unification
 # ---------------------------------------------------------------------------
@@ -337,6 +406,15 @@ class TestResolveSessionModel:
 
 
 class TestAppendUserMessagePersistsModel:
+    @pytest.fixture(autouse=True)
+    def _active_session_write(self, monkeypatch):
+        from flocks.session.session import Session
+
+        async def run_active_write(_cls, _session_id, operation, **_kwargs):
+            return await operation()
+
+        monkeypatch.setattr(Session, "run_active_write", classmethod(run_active_write))
+
     @pytest.mark.asyncio
     async def test_model_is_passed_to_message_create(self):
         captured = {}
@@ -426,6 +504,29 @@ class TestAppendUserMessagePersistsModel:
         # we don't override it here so the historical behaviour is kept
         # for sessions whose binding has no agent recorded.
         assert "agent" not in captured
+
+
+@pytest.mark.asyncio
+async def test_append_user_message_rejects_inactive_session_before_persisting(monkeypatch):
+    from flocks.session.message import Message
+    from flocks.session.session import Session, SessionInactiveError
+
+    create = AsyncMock()
+    monkeypatch.setattr(Message, "create", create)
+    monkeypatch.setattr(
+        Session,
+        "run_active_write",
+        AsyncMock(side_effect=SessionInactiveError("archived")),
+    )
+
+    with pytest.raises(SessionInactiveError, match="archived"):
+        await InboundDispatcher._append_user_message(
+            "ses_archived",
+            "must not be stored",
+            _msg(),
+        )
+
+    create.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------

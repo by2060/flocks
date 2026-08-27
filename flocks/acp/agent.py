@@ -512,10 +512,20 @@ class ACPAgent:
                     "newText": new_text,
                 })
             
-            # Handle todowrite - send plan update
-            if tool_name == "todowrite":
+            # Handle todo writes - send plan update
+            if tool_name == "todo":
                 try:
-                    todos = json.loads(output)
+                    metadata = state.get("metadata") or {}
+                    parsed_output = json.loads(output) if output else []
+                    todos = (
+                        metadata.get("newTodos")
+                        or metadata.get("todos")
+                        or (
+                            parsed_output.get("newTodos")
+                            if isinstance(parsed_output, dict)
+                            else parsed_output
+                        )
+                    )
                     if isinstance(todos, list):
                         entries = []
                         for todo in todos:
@@ -1179,6 +1189,16 @@ class ACPAgent:
         self._session_manager.set_mode(session_id, mode_id)
         
         return {"_meta": {}}
+
+    @staticmethod
+    def _parse_command_arguments(raw_args: str) -> Any:
+        stripped = (raw_args or "").strip()
+        if not stripped or stripped[0] not in "{[":
+            return None
+        try:
+            return json.loads(stripped)
+        except json.JSONDecodeError:
+            return None
     
     async def prompt(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -1303,6 +1323,7 @@ class ACPAgent:
             session_id=session_id,
             command=cmd["name"],
             arguments=cmd["args"],
+            arguments_json=self._parse_command_arguments(cmd["args"]),
             model=f"{model['providerID']}/{model['modelID']}",
             agent=agent,
             directory=directory,
@@ -1313,9 +1334,13 @@ class ACPAgent:
         from flocks.session.message import Message
         from flocks.session.features.todo import Todo
         from flocks.session.core.status import SessionStatus
+        from flocks.session.session import Session
 
-        await Message.clear(session_id)
-        await Todo.clear(session_id)
+        async def clear_persisted_state() -> None:
+            await Message.clear(session_id)
+            await Todo.clear(session_id)
+
+        await Session.run_active_write(session_id, clear_persisted_state)
         SessionStatus.clear(session_id)
 
         session = self._session_manager.get(session_id)

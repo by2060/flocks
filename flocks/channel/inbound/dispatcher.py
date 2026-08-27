@@ -17,8 +17,14 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 from flocks.channel.base import ChatType, InboundMessage, OutboundContext
-from flocks.channel.inbound.session_binding import SessionBindingService
+from flocks.channel.inbound.session_binding import (
+    SessionBindingService,
+    is_channel_media_placeholder,
+)
 from flocks.config.config import ChannelConfig
+from flocks.hooks.execution import execute_with_hooks
+from flocks.hooks.pipeline import HookPipeline
+from flocks.identity import ChannelIngressProvenance
 from flocks.utils.log import Log
 
 log = Log.create(service="channel.dispatcher")
@@ -34,15 +40,63 @@ class _GroupContextEntry:
 
 
 def _parse_slash_command(text: str) -> tuple[Optional[str], str]:
+    """Parse a slash command from inbound text.
+
+    Strict path: text begins with ``/cmd [args]``.
+
+    Channel fallback: group-mention IM messages often arrive with the bot's
+    display name still in the body (e.g. ``"- test /compact"`` on WeCom).
+    In that case we scan for the first ``/<word>`` token and treat it as a
+    command **only when** ``<word>`` resolves against the registry, so plain
+    chatter like ``"see /tmp/foo.log"`` does not get hijacked.
+    """
+    import re
+
+    from flocks.command.command import Command
+
     stripped = text.strip()
-    if not stripped.startswith("/"):
+    if stripped.startswith("/"):
+        parts = stripped[1:].split(None, 1)
+        if not parts:
+            return None, ""
+        name = parts[0].strip().lower()
+        args = parts[1].strip() if len(parts) > 1 else ""
+        return name or None, args
+
+    match = re.search(r"(?:^|\s)/([A-Za-z_][\w-]*)(?:\s+(.*))?$", stripped)
+    if not match:
         return None, ""
-    parts = stripped[1:].split(None, 1)
-    if not parts:
+    candidate = match.group(1).strip().lower()
+    if not candidate:
         return None, ""
-    name = parts[0].strip().lower()
-    args = parts[1].strip() if len(parts) > 1 else ""
-    return name or None, args
+    if Command.resolve(candidate) is None:
+        return None, ""
+
+    # Guard: the text BEFORE the slash must look like a bot-mention prefix,
+    # not natural-language content.  Group-IM platforms (WeCom, Feishu) inject
+    # a short "- BotName" or "@BotName" prefix before the command; anything
+    # else (e.g. "请解释一下 /help" or "prefix /new thanks") is a sentence
+    # that happens to contain a slash word and must NOT be hijacked.
+    #
+    # Accepted:  "- rex"  "@flocks_bot"  ""  (empty = leading slash already
+    #            handled by the strict path above)
+    # Rejected:  "请解释一下"  "prefix"  "I want to know about"
+    pre_slash = stripped[: match.start()].rstrip()
+    if pre_slash and not re.match(r"^[-@]\s*\w+\s*$", pre_slash):
+        log.debug("dispatcher.slash_command.fallback_rejected", {
+            "raw_text_preview": stripped[:80],
+            "pre_slash": pre_slash[:40],
+            "candidate": candidate,
+        })
+        return None, ""
+
+    args = (match.group(2) or "").strip()
+    log.info("dispatcher.slash_command.fallback_matched", {
+        "raw_text_preview": stripped[:80],
+        "command": candidate,
+        "has_args": bool(args),
+    })
+    return candidate, args
 
 
 # =====================================================================
@@ -87,6 +141,22 @@ class MessageDedup:
 # Allowlist / authorisation check
 # =====================================================================
 
+def _matches_allow_from(msg: InboundMessage, allow_from: list[str]) -> bool:
+    if msg.channel_id == "whatsapp":
+        try:
+            from flocks.channel.builtin.whatsapp.config import matches_identifier
+
+            aliases = [msg.sender_id]
+            if isinstance(msg.raw, dict):
+                raw_aliases = msg.raw.get("senderAliases")
+                if isinstance(raw_aliases, list):
+                    aliases.extend(str(alias) for alias in raw_aliases if str(alias).strip())
+            return matches_identifier(aliases, allow_from)
+        except Exception:
+            log.warning("allowlist.whatsapp_match_failed", {"sender": msg.sender_id})
+    return msg.sender_id in allow_from
+
+
 def _check_allowlist(msg: InboundMessage, config: ChannelConfig) -> bool:
     """Return True if the message is allowed through.
 
@@ -99,7 +169,10 @@ def _check_allowlist(msg: InboundMessage, config: ChannelConfig) -> bool:
       non-empty, but are otherwise unrestricted.
     """
     allow_from = config.allow_from
-    dm_policy = config.dm_policy or "open"
+    dm_policy = config.dm_policy
+    if msg.channel_id == "slack" and dm_policy is None and allow_from:
+        dm_policy = "allowlist"
+    dm_policy = dm_policy or "open"
 
     if msg.chat_type == ChatType.DIRECT:
         if dm_policy == "open":
@@ -108,12 +181,12 @@ def _check_allowlist(msg: InboundMessage, config: ChannelConfig) -> bool:
             if not allow_from:
                 log.debug("allowlist.dm_blocked_no_list", {"sender": msg.sender_id})
                 return False
-            return msg.sender_id in allow_from
+            return _matches_allow_from(msg, allow_from)
         if dm_policy == "pairing":
             return True
         return True
 
-    if allow_from and msg.sender_id not in allow_from:
+    if allow_from and not _matches_allow_from(msg, allow_from):
         log.debug("allowlist.group_blocked", {
             "sender": msg.sender_id, "chat_id": msg.chat_id,
         })
@@ -204,6 +277,18 @@ class _CachedConfig:
 
 _channel_config_cache: dict[str, _CachedConfig] = {}
 
+
+def invalidate_channel_config_cache(channel_id: str | None = None) -> None:
+    """Invalidate cached channel config entries.
+
+    Args:
+        channel_id: When provided, drop only this channel. Otherwise clear all.
+    """
+    if channel_id is None:
+        _channel_config_cache.clear()
+        return
+    _channel_config_cache.pop(str(channel_id), None)
+
 _SESSION_LOCK_MAX = 5000
 
 
@@ -223,7 +308,39 @@ class InboundDispatcher:
         self._session_locks: OrderedDict[str, asyncio.Lock] = OrderedDict()
         self._group_context: OrderedDict[str, deque[_GroupContextEntry]] = OrderedDict()
 
-    async def dispatch(self, msg: InboundMessage) -> None:
+    async def dispatch(
+        self,
+        msg: InboundMessage,
+        *,
+        provenance: ChannelIngressProvenance | None = None,
+    ) -> None:
+        ingress_payload = {
+            "operation": "channel.inbound.dispatch",
+            "transport": "channel",
+            "entry": "channel_webhook",
+            "channel_id": msg.channel_id,
+            "account_id": msg.account_id,
+            "chat_id": msg.chat_id,
+            "sender_id": msg.sender_id,
+            "chat_type": msg.chat_type.value,
+            "message_id": msg.message_id,
+            "authentication": {
+                "plugin_authenticated": bool(provenance is not None)
+            },
+            "provenance": provenance,
+            "message": msg,
+            "evidence": msg.raw,
+            "raw": msg.raw if isinstance(msg.raw, dict) else {},
+        }
+        return await execute_with_hooks(
+            ingress_payload,
+            lambda: self._dispatch(msg),
+            before=HookPipeline.run_ingress_before,
+            after=HookPipeline.run_ingress_after,
+        )
+
+    async def _dispatch(self, msg: InboundMessage) -> None:
+
         # 1. dedup
         if self.dedup.is_duplicate(msg.message_id):
             log.debug("dispatcher.dedup", {"message_id": msg.message_id})
@@ -244,8 +361,7 @@ class InboundDispatcher:
 
         # 4. channel.inbound hook — allows plugins to inspect/block/modify
         try:
-            from flocks.hooks.pipeline import HookPipeline
-            hook_ctx = await HookPipeline.run_channel_inbound({
+            hook_ctx = await HookPipeline.run_channel_inbound_before({
                 "channel_id": msg.channel_id,
                 "sender_id": msg.sender_id,
                 "chat_id": msg.chat_id,
@@ -272,6 +388,7 @@ class InboundDispatcher:
         # ``rex`` only via ``Agent.get(name) or Agent.get("rex")``, hiding the
         # real default and making behaviour diverge between WebUI and channel.
         default_agent = channel_config.default_agent
+        visible_agents = _resolve_visible_agents(channel_config)
         scope_override = None
         if msg.channel_id == "feishu" and msg.chat_type == ChatType.GROUP:
             scope_override, feishu_agent = _resolve_feishu_group_overrides(
@@ -288,10 +405,13 @@ class InboundDispatcher:
                     "error": str(exc),
                 })
                 default_agent = "rex"
+        if visible_agents and default_agent not in visible_agents:
+            default_agent = visible_agents[0]
 
         binding = await self.binding_service.resolve_or_create(
             msg,
             default_agent=default_agent,
+            visible_agents=visible_agents,
             scope_override=scope_override,
             directory=channel_config.workspace_dir,
         )
@@ -605,6 +725,16 @@ class InboundDispatcher:
         if command_def is None:
             return False
 
+        # Normalise the event text into the canonical "/cmd args" form so the
+        # downstream ``dispatch_user_input`` (which re-parses ``event.text``
+        # with the strict slash parser) does not reject group-mention bodies
+        # like ``"- test /compact"``.
+        normalised_text = (
+            f"/{command_def.name} {command_args}".strip()
+            if command_args
+            else f"/{command_def.name}"
+        )
+
         callbacks = self._build_callbacks(binding, msg)
 
         async def _publish_direct_response(_event, text: str) -> None:
@@ -613,6 +743,24 @@ class InboundDispatcher:
         async def _run_llm(_event, prompt_text: str, display_text: Optional[str] = None) -> None:
             await callbacks.deliver_text(
                 f"命令 `{display_text or prompt_text}` 暂不支持在当前渠道中以 slash 形式执行。"
+            )
+
+        async def _clear_history() -> None:
+            try:
+                from flocks.server.routes.session import _clear_session_history
+
+                deleted_count = await _clear_session_history(binding.session_id)
+            except Exception as exc:
+                log.error("dispatcher.clear_command_failed", {
+                    "session_id": binding.session_id,
+                    "channel_id": msg.channel_id,
+                    "error": str(exc),
+                })
+                await callbacks.deliver_text(f"清空当前会话失败：{type(exc).__name__}")
+                return
+
+            await callbacks.deliver_text(
+                f"已清空当前会话历史，共删除 {deleted_count} 条消息。"
             )
 
         async def _run_session_control(_event, parsed) -> bool:
@@ -628,6 +776,15 @@ class InboundDispatcher:
                     msg=msg,
                     callbacks=callbacks,
                     scope_override=scope_override,
+                    channel_config=channel_config,
+                    initial_text=command_args or None,
+                )
+                return True
+            if parsed.canonical_name == "compact":
+                await self._handle_compact_command(
+                    binding=binding,
+                    callbacks=callbacks,
+                    focus_instruction=command_args or None,
                 )
                 return True
             return False
@@ -635,14 +792,15 @@ class InboundDispatcher:
         event = UserInputEvent(
             source_type=msg.channel_id if msg.channel_id in {"feishu", "wecom", "telegram"} else "channel",
             sessionID=binding.session_id,
-            text=user_text,
-            parts=[{"type": "text", "text": user_text}],
+            text=normalised_text,
+            parts=[{"type": "text", "text": normalised_text}],
             agent=binding.agent_id,
             display_text=user_text,
             working_directory=channel_config.workspace_dir,
             metadata={
                 "channel_id": msg.channel_id,
                 "chat_id": msg.chat_id or msg.sender_id,
+                "original_text": user_text,
             },
         )
         await dispatch_user_input(
@@ -652,6 +810,7 @@ class InboundDispatcher:
                 direct_response=_publish_direct_response,
                 run_llm=_run_llm,
                 session_control=_run_session_control,
+                clear_history=_clear_history,
             ),
         )
         return True
@@ -760,22 +919,52 @@ class InboundDispatcher:
         msg: InboundMessage,
         callbacks: ChannelDeliveryCallbacks,
         scope_override: Optional[str],
+        channel_config: ChannelConfig,
+        initial_text: Optional[str] = None,
     ) -> None:
         from flocks.session.session import Session
-        from flocks.channel.inbound.session_binding import _build_title
+        from flocks.channel.inbound.session_binding import (
+            _build_title,
+            _build_title_fallback,
+            resolve_channel_session_owner_kwargs,
+        )
 
         session = await Session.get_by_id(binding.session_id)
         if not session:
             await callbacks.deliver_text("当前会话不存在，请发送一条普通消息后重试。")
             return
 
+        owner_kwargs = await resolve_channel_session_owner_kwargs(session)
+        title = (
+            _build_title(msg, initial_text)
+            if initial_text and initial_text.strip()
+            else _build_title_fallback(msg)
+        )
         new_session = await Session.create(
             project_id=session.project_id,
             directory=session.directory,
-            title=_build_title(msg),
+            title=title,
             agent=session.agent,
             **Session.inherited_model_kwargs(session),
+            **owner_kwargs,
         )
+        try:
+            from flocks.session.execution_profile import (
+                upsert_session_execution_profile,
+            )
+
+            await upsert_session_execution_profile(
+                new_session.id,
+                patch={
+                    "entry": "channel",
+                    "channel_id": msg.channel_id,
+                    "account_id": msg.account_id,
+                    "default_agent": str(new_session.agent or "").strip(),
+                },
+                source="channel.command.new_session",
+            )
+        except Exception:
+            pass
         new_binding = await self.binding_service.rebind(
             msg,
             new_session.id,
@@ -802,6 +991,96 @@ class InboundDispatcher:
                 ]
             )
         )
+        if initial_text and initial_text.strip():
+            text = initial_text.strip()
+            resolved_model = await _resolve_session_model(new_binding.session_id)
+            await self._append_user_message(
+                new_binding.session_id,
+                text,
+                msg,
+                channel_config,
+                model=resolved_model,
+                agent=new_binding.agent_id,
+            )
+            if msg.channel_id == "feishu":
+                await self._run_agent_with_typing(
+                    new_binding,
+                    new_callbacks,
+                    msg,
+                    channel_config,
+                )
+            else:
+                await self._run_agent(new_binding, new_callbacks)
+
+    @staticmethod
+    async def _handle_compact_command(
+        *,
+        binding,
+        callbacks: "ChannelDeliveryCallbacks",
+        focus_instruction: Optional[str] = None,
+    ) -> None:
+        """Run manual compaction for a channel session and deliver a status reply."""
+        from flocks.session.lifecycle.compaction import run_compaction
+        from flocks.session.lifecycle.compaction.orchestrator import build_compaction_policy
+        from flocks.session.message import Message, MessageRole
+        from flocks.session.session import Session
+
+        session_id = binding.session_id
+        session = await Session.get_by_id(session_id)
+        if not session:
+            await callbacks.deliver_text("当前会话不存在，请重新发送消息后重试。")
+            return
+
+        messages = await Message.list(session_id)
+        parent_message_id: Optional[str] = None
+        for m in reversed(messages):
+            if m.role == MessageRole.USER:
+                parent_message_id = m.id
+                break
+
+        if not parent_message_id:
+            await callbacks.deliver_text("当前会话没有可压缩的消息。")
+            return
+
+        # Resolve provider/model from session (same as session loop)
+        from flocks.session.session_loop import SessionLoop
+        provider_id, model_id = await SessionLoop._resolve_model(session, None, None)
+        if not provider_id or not model_id:
+            await callbacks.deliver_text("无法解析当前会话的模型，请先切换模型后重试。")
+            return
+
+        policy = build_compaction_policy(provider_id, model_id)
+
+        await callbacks.deliver_text("正在压缩上下文，请稍候…")
+        try:
+            result = await run_compaction(
+                session_id,
+                parent_message_id=parent_message_id,
+                messages=messages,
+                provider_id=provider_id,
+                model_id=model_id,
+                auto=False,
+                event_publish_callback=callbacks._publish_sse_event,
+                status_after="idle",
+                policy=policy,
+                focus_instruction=focus_instruction,
+            )
+            if result == "stop":
+                await callbacks.deliver_text("上下文压缩失败，请稍后重试。")
+            elif result == "skipped":
+                await callbacks.deliver_text(
+                    "本轮上下文压缩已被跳过（系统处于冷却期或上一轮节省过小），"
+                    "稍后会自动重试。"
+                )
+            else:
+                focus_note = f"（聚焦：{focus_instruction}）" if focus_instruction else ""
+                await callbacks.deliver_text(f"上下文压缩完成{focus_note}，历史已归档为摘要。")
+        except Exception as e:
+            log.error("dispatcher.compact_command_failed", {
+                "session_id": session_id,
+                "error": str(e),
+            })
+            await callbacks.deliver_text(f"压缩时发生错误：{type(e).__name__}")
 
     @staticmethod
     async def _trigger_command_hook(action: str, session_id: str, context: dict[str, Any]) -> None:
@@ -817,9 +1096,13 @@ class InboundDispatcher:
             })
 
     @staticmethod
-    async def _get_channel_config(channel_id: str) -> ChannelConfig:
+    async def _get_channel_config(
+        channel_id: str,
+        *,
+        force_refresh: bool = False,
+    ) -> ChannelConfig:
         cached = _channel_config_cache.get(channel_id)
-        if cached and not cached.is_stale():
+        if cached and not cached.is_stale() and not force_refresh:
             return cached.config
         try:
             from flocks.config.config import Config
@@ -828,18 +1111,42 @@ class InboundDispatcher:
             _channel_config_cache[channel_id] = _CachedConfig(ch_cfg)
             return ch_cfg
         except Exception:
+            if cached is not None:
+                return cached.config
             return ChannelConfig()
+
+    @staticmethod
+    async def _run_session_loop(binding: Any, loop_callbacks: Any) -> Any:
+        """Run an IM turn with the persisted model preference for its session."""
+        from flocks.session.session import (
+            Session,
+            is_model_auto_session_category,
+        )
+        from flocks.session.session_loop import SessionLoop
+
+        session = await Session.get_by_id(binding.session_id)
+        auto_failover = bool(
+            session
+            and is_model_auto_session_category(
+                getattr(session, "category", "user")
+            )
+            and getattr(session, "model_auto", False)
+        )
+        return await SessionLoop.run(
+            session_id=binding.session_id,
+            agent_name=binding.agent_id,
+            callbacks=loop_callbacks,
+            auto_failover=auto_failover,
+        )
 
     @staticmethod
     async def _run_agent(binding, callbacks: ChannelDeliveryCallbacks) -> None:
         """Run Agent and deliver the final assistant reply."""
         try:
-            from flocks.session.session_loop import SessionLoop
             loop_callbacks = callbacks.to_loop_callbacks()
-            result = await SessionLoop.run(
-                session_id=binding.session_id,
-                agent_name=binding.agent_id,
-                callbacks=loop_callbacks,
+            result = await InboundDispatcher._run_session_loop(
+                binding,
+                loop_callbacks,
             )
 
             if result.last_message:
@@ -924,11 +1231,9 @@ class InboundDispatcher:
             runner_cbs = RunnerCallbacks(on_text_delta=_on_text_delta)
             loop_callbacks = callbacks.to_loop_callbacks(runner_callbacks=runner_cbs)
 
-            from flocks.session.session_loop import SessionLoop
-            result = await SessionLoop.run(
-                session_id=binding.session_id,
-                agent_name=binding.agent_id,
-                callbacks=loop_callbacks,
+            result = await InboundDispatcher._run_session_loop(
+                binding,
+                loop_callbacks,
             )
 
             final_text = None
@@ -959,11 +1264,37 @@ class InboundDispatcher:
         model: Optional[dict] = None,
         agent: Optional[str] = None,
     ) -> None:
+        """Append an inbound message only while its bound session is active."""
+
+        from flocks.session.session import Session
+
+        await Session.run_active_write(
+            session_id,
+            lambda: InboundDispatcher._append_user_message_unchecked(
+                session_id,
+                text,
+                msg,
+                channel_config,
+                model,
+                agent,
+            ),
+        )
+
+    @staticmethod
+    async def _append_user_message_unchecked(
+        session_id: str,
+        text: str,
+        msg: InboundMessage,
+        channel_config: Optional[ChannelConfig] = None,
+        model: Optional[dict] = None,
+        agent: Optional[str] = None,
+    ) -> None:
         import mimetypes
         import os
         from pathlib import Path
-        from urllib.parse import unquote, urlparse
+        from urllib.parse import urlparse
 
+        from flocks.session.utils.file_extractor import file_url_to_path
         from flocks.session.message import FilePart, Message, MessageRole
 
         create_kwargs: dict = dict(
@@ -992,32 +1323,33 @@ class InboundDispatcher:
             parsed = urlparse(msg.media_url)
             scheme = parsed.scheme.lower()
 
-            if msg.channel_id == "feishu" and channel_config is not None:
-                # Feishu: media is still on the remote server, download first.
-                from flocks.channel.builtin.feishu.inbound_media import download_inbound_media
+            raw_cfg = (
+                channel_config.model_dump(by_alias=True, exclude_none=True)
+                if channel_config is not None else {}
+            )
 
-                raw_cfg = channel_config.model_dump(by_alias=True, exclude_none=True)
-                media = await download_inbound_media(msg, raw_cfg)
-                if not media:
-                    return
+            media = await _download_channel_media(msg, raw_cfg)
 
-                await Message.store_part(
-                    session_id,
-                    message.id,
-                    FilePart(
-                        sessionID=session_id,
-                        messageID=message.id,
-                        mime=media.mime,
-                        filename=media.filename,
-                        url=media.url,
-                        source=media.source,
-                    ),
+            file_part: Optional[FilePart] = None
+            if media is not None:
+                file_part = FilePart(
+                    sessionID=session_id,
+                    messageID=message.id,
+                    mime=media.mime,
+                    filename=media.filename,
+                    url=media.url,
+                    source=media.source,
                 )
-
+                await Message.store_part(session_id, message.id, file_part)
+                log.info("dispatcher.inbound_media_attached", {
+                    "channel_id": msg.channel_id,
+                    "filename": media.filename,
+                    "mime": media.mime,
+                })
             elif scheme in ("", "file"):
                 # Local file already downloaded by the channel plugin (e.g. weixin).
-                # file:// URIs may have URL-encoded paths (e.g. Chinese filenames).
-                local_path = unquote(parsed.path) if scheme == "file" else msg.media_url
+                # file:// URIs may have URL-encoded or Windows drive paths.
+                local_path = file_url_to_path(msg.media_url) if scheme == "file" else msg.media_url
                 if not os.path.isfile(local_path):
                     log.warning("dispatcher.inbound_media_missing", {
                         "channel_id": msg.channel_id,
@@ -1031,23 +1363,72 @@ class InboundDispatcher:
                     or "application/octet-stream"
                 )
                 file_uri = Path(local_path).resolve().as_uri()
-                await Message.store_part(
-                    session_id,
-                    message.id,
-                    FilePart(
-                        sessionID=session_id,
-                        messageID=message.id,
-                        mime=mime,
-                        filename=filename,
-                        url=file_uri,
-                        source=None,
-                    ),
+                file_part = FilePart(
+                    sessionID=session_id,
+                    messageID=message.id,
+                    mime=mime,
+                    filename=filename,
+                    url=file_uri,
+                    source=None,
                 )
+                await Message.store_part(session_id, message.id, file_part)
                 log.info("dispatcher.inbound_media_attached", {
                     "channel_id": msg.channel_id,
                     "filename": filename,
                     "mime": mime,
                 })
+            else:
+                # Remote URL with no channel-specific downloader — keep the
+                # reference as a TextPart hint so the agent at least knows
+                # the message carried media. Do not fabricate a FilePart.
+                log.debug("dispatcher.inbound_media_remote_only", {
+                    "channel_id": msg.channel_id,
+                    "media_url": msg.media_url[:200],
+                })
+                return
+
+            # Replace the placeholder text ([图片消息] / [文件消息] / [文件消息: x])
+            # with a path hint so the agent can see the attachment is local.
+            try:
+                from pathlib import PurePosixPath
+                from flocks.session.message import TextPart
+
+                file_path_str = (
+                    file_part.url.replace("file://", "") if file_part else ""
+                )
+                display_path = str(PurePosixPath(file_path_str)) if file_path_str else ""
+                parts = await Message.parts(message.id, session_id=session_id)
+                for p in parts:
+                    if p.type == "text" and hasattr(p, "text") and p.text:
+                        if is_channel_media_placeholder(p.text):
+                            updated = TextPart(
+                                id=p.id,
+                                sessionID=session_id,
+                                messageID=message.id,
+                                type="text",
+                                text=f"Attached files:\n- {display_path}",
+                            )
+                            await Message.store_part(session_id, message.id, updated)
+                            try:
+                                from flocks.server.routes.event import publish_event
+                                await publish_event("message.part.updated", {
+                                    "part": updated.model_dump(by_alias=True, exclude_none=True),
+                                    "sessionID": session_id,
+                                })
+                            except Exception:
+                                pass
+                            break
+            except Exception:
+                pass
+
+            try:
+                from flocks.server.routes.event import publish_event
+                await publish_event("message.part.updated", {
+                    "part": file_part.model_dump(by_alias=True, exclude_none=True),
+                    "sessionID": session_id,
+                })
+            except Exception:
+                pass
 
         except Exception as e:
             log.warning("dispatcher.inbound_media_download_failed", {
@@ -1144,6 +1525,13 @@ def _resolve_feishu_group_overrides(
     )
     agent = merged.get("defaultAgent") or None
     return scope, agent
+
+
+def _resolve_visible_agents(channel_config: ChannelConfig) -> list[str]:
+    raw = channel_config.visible_agents
+    if not isinstance(raw, list):
+        return []
+    return [str(item).strip() for item in raw if str(item).strip()]
 
 
 async def _expand_merge_forward(
@@ -1251,3 +1639,80 @@ async def _fetch_quoted_message(
 # 权限错误通知冷却时间（同一账号 5 分钟内只通知一次）
 _PERM_NOTICE_COOLDOWN = 300
 _perm_notice_last: dict[str, float] = {}
+
+
+# ---------------------------------------------------------------------------
+# Per-channel inbound media download
+# ---------------------------------------------------------------------------
+
+# Mapping of channel_id → module-level ``download_inbound_media`` callable.
+# A channel opts in by adding an entry here.  The dispatcher looks up
+# ``msg.channel_id`` to decide whether to invoke a custom downloader
+# (e.g. WeCom decrypt + download, Telegram getFile resolve) or fall
+# back to the generic ``file://`` / no-scheme handler.
+_DOWNLOADERS: dict[str, Any] = {}
+
+
+def register_inbound_media_downloader(channel_id: str, downloader: Any) -> None:
+    """Register a per-channel ``download_inbound_media`` callable."""
+    _DOWNLOADERS[channel_id] = downloader
+
+
+# Best-effort eager registration at import time.  Channels that need
+# more control can call ``register_inbound_media_downloader`` themselves.
+try:
+    from flocks.channel.builtin.feishu import inbound_media as _feishu_inbound_media
+    register_inbound_media_downloader("feishu", _feishu_inbound_media.download_inbound_media)
+except Exception:  # pragma: no cover - feishu not installed
+    pass
+
+try:
+    from flocks.channel.builtin.wecom import inbound_media as _wecom_inbound_media
+    register_inbound_media_downloader("wecom", _wecom_inbound_media.download_inbound_media)
+except Exception:  # pragma: no cover - wecom SDK not installed
+    pass
+
+try:
+    from flocks.channel.builtin.dingtalk import inbound_media as _dingtalk_inbound_media
+    register_inbound_media_downloader("dingtalk", _dingtalk_inbound_media.download_inbound_media)
+except Exception:  # pragma: no cover
+    pass
+
+try:
+    from flocks.channel.builtin.telegram import inbound_media as _telegram_inbound_media
+    register_inbound_media_downloader("telegram", _telegram_inbound_media.download_inbound_media)
+except Exception:  # pragma: no cover
+    pass
+
+try:
+    from flocks.channel.builtin.slack import inbound_media as _slack_inbound_media
+    register_inbound_media_downloader("slack", _slack_inbound_media.download_inbound_media)
+except Exception:  # pragma: no cover
+    pass
+
+
+async def _download_channel_media(msg: "InboundMessage", config: dict) -> Any:
+    """Dispatch inbound media download to the appropriate channel handler.
+
+    Looks up the channel's downloader module dynamically so test
+    monkeypatches that target ``flocks.channel.builtin.<channel>.inbound_media``
+    still apply — caching a bound callable would otherwise freeze the
+    reference at module-import time and bypass the patch.
+    """
+    channel_id = msg.channel_id
+    if channel_id == "feishu":
+        from flocks.channel.builtin.feishu import inbound_media as _feishu_inbound_media
+        return await _feishu_inbound_media.download_inbound_media(msg, config)
+    if channel_id == "wecom":
+        from flocks.channel.builtin.wecom import inbound_media as _wecom_inbound_media
+        return await _wecom_inbound_media.download_inbound_media(msg, config)
+    if channel_id == "dingtalk":
+        from flocks.channel.builtin.dingtalk import inbound_media as _dingtalk_inbound_media
+        return await _dingtalk_inbound_media.download_inbound_media(msg, config)
+    if channel_id == "telegram":
+        from flocks.channel.builtin.telegram import inbound_media as _telegram_inbound_media
+        return await _telegram_inbound_media.download_inbound_media(msg, config)
+    if channel_id == "slack":
+        from flocks.channel.builtin.slack import inbound_media as _slack_inbound_media
+        return await _slack_inbound_media.download_inbound_media(msg, config)
+    return None

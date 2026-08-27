@@ -7,9 +7,17 @@ Based on Flocks' ported src/session/title.ts
 
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 import asyncio
+import json
+import re
 
 from flocks.utils.log import Log
 from flocks.provider.provider import ChatMessage
+from flocks.session.llm_hook_utils import (
+    apply_hook_request_output,
+    restore_text_with_replacements,
+    serialize_chat_message,
+    stream_text_replacements_from_hook_output,
+)
 
 EventPublishCallback = Optional[Callable[[str, Dict[str, Any]], Awaitable[None]]]
 
@@ -22,6 +30,14 @@ from flocks.session.prompt_strings import PROMPT_TITLE as _CANONICAL_TITLE_PROMP
 
 class SessionTitle:
     """Session title generation"""
+
+    _TOOL_CALL_TITLE_PATTERNS = (
+        re.compile(r"^\s*\[TOOL_CALL\]", re.IGNORECASE),
+        re.compile(r"^\s*<tool[_ -]?call", re.IGNORECASE),
+        re.compile(r"\btool\s*=>", re.IGNORECASE),
+        re.compile(r"\bargs\s*=>", re.IGNORECASE),
+        re.compile(r"^\s*\{?\s*(tool|name)\s*=>", re.IGNORECASE),
+    )
     
     @classmethod
     async def generate_title_after_first_message(
@@ -122,29 +138,69 @@ class SessionTitle:
             # Send PROMPT_TITLE as system instruction, user question as user message
             title = ""
             try:
+                title_messages = [
+                    ChatMessage(role="system", content=_CANONICAL_TITLE_PROMPT),
+                    ChatMessage(role="user", content=question),
+                ]
+                provider_options: Dict[str, Any] = {"max_tokens": 50}
+                replacements: list[tuple[str, str]] = []
+                try:
+                    from flocks.hooks.pipeline import HookPipeline, HookStage
+
+                    llm_hook_metadata = {
+                        "sessionID": session_id,
+                        "agent": "session.title",
+                        "step": None,
+                        "model": {
+                            "providerID": provider_id,
+                            "modelID": model_id,
+                        },
+                        "purpose": "title_generation",
+                    }
+                    if await HookPipeline.has_stage_handlers(HookStage.LLM_BEFORE, llm_hook_metadata):
+                        llm_before_ctx = await HookPipeline.run_llm_before({
+                            **llm_hook_metadata,
+                            "request": {
+                                "messageCount": len(title_messages),
+                                "messages": [serialize_chat_message(message) for message in title_messages],
+                                "toolCount": 0,
+                                "tools": [],
+                                "providerOptions": dict(provider_options),
+                                "providerToolsEnabled": False,
+                            },
+                        })
+                        hook_output = getattr(llm_before_ctx, "output", None) or {}
+                        title_messages, provider_options = apply_hook_request_output(
+                            title_messages,
+                            provider_options,
+                            hook_output,
+                        )
+                        replacements = stream_text_replacements_from_hook_output(hook_output)
+                except Exception as hook_err:
+                    log.error("title.llm_before_hook.error", {
+                        "session_id": session_id,
+                        "error": str(hook_err),
+                    })
+                    raise RuntimeError("title llm_before hook failed; request was not sent") from hook_err
+
+                provider_options.setdefault("max_tokens", 50)
                 async for chunk in provider.chat_stream(
                     model_id,
-                    [
-                        ChatMessage(role="system", content=_CANONICAL_TITLE_PROMPT),
-                        ChatMessage(role="user", content=question),
-                    ],
-                    max_tokens=50,
+                    title_messages,
+                    **provider_options,
                 ):
                     if hasattr(chunk, 'delta') and chunk.delta:
                         title += chunk.delta
+                if replacements:
+                    title = restore_text_with_replacements(title, replacements)
             except Exception as llm_err:
                 log.warn("title.llm_failed", {
                     "session_id": session_id,
                     "error": str(llm_err),
                 })
             
-            # Clean up the generated title
-            title = title.strip().strip('"').strip("'").strip()
-            
-            # Validate title length
-            if len(title) > 50:
-                title = title[:47] + "..."
-            
+            title = cls._sanitize_generated_title(title)
+
             if not title:
                 title = cls._generate_simple_title(question)
             
@@ -233,3 +289,70 @@ class SessionTitle:
             title = "New Chat"
         
         return title
+
+    @classmethod
+    def _sanitize_generated_title(cls, title: str, max_length: int = 50) -> str:
+        """Clean and validate a model-generated title candidate."""
+        title = title.strip().strip('"').strip("'").strip()
+        if not title:
+            return ""
+
+        if cls._looks_like_tool_call_title(title):
+            log.warn("title.rejected_tool_call_candidate", {
+                "candidate": title[:120],
+            })
+            return ""
+
+        if len(title) > max_length:
+            title = title[:max_length - 3] + "..."
+        return title
+
+    @classmethod
+    def _looks_like_tool_call_title(cls, title: str) -> bool:
+        """Return True when a title candidate is actually a tool-call payload."""
+        candidate = title.strip()
+        if not candidate:
+            return False
+
+        for pattern in cls._TOOL_CALL_TITLE_PATTERNS:
+            if pattern.search(candidate):
+                return True
+
+        json_candidate = cls._strip_code_fence(candidate)
+        if not json_candidate.startswith(("{", "[")):
+            return False
+
+        try:
+            parsed = json.loads(json_candidate)
+        except (TypeError, ValueError):
+            return False
+
+        return cls._json_has_tool_call_shape(parsed)
+
+    @staticmethod
+    def _strip_code_fence(text: str) -> str:
+        stripped = text.strip()
+        if not stripped.startswith("```"):
+            return stripped
+
+        lines = stripped.splitlines()
+        if len(lines) >= 2 and lines[-1].strip() == "```":
+            return "\n".join(lines[1:-1]).strip()
+        return stripped
+
+    @classmethod
+    def _json_has_tool_call_shape(cls, value: Any) -> bool:
+        if isinstance(value, dict):
+            keys = {str(key).lower() for key in value.keys()}
+            if {"tool", "args"} <= keys:
+                return True
+            if {"name", "arguments"} <= keys:
+                return True
+            if "function" in keys and ("arguments" in keys or "name" in keys):
+                return True
+            return any(cls._json_has_tool_call_shape(item) for item in value.values())
+
+        if isinstance(value, list):
+            return any(cls._json_has_tool_call_shape(item) for item in value)
+
+        return False

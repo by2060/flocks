@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import textwrap
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -24,6 +25,9 @@ from flocks.agent.agent_factory import (
     scan_and_load,
     inject_dynamic_prompts,
     yaml_to_agent_info,
+    find_yaml_agent,
+    read_yaml_agent,
+    update_yaml_agent,
     delete_yaml_agent,
     _parse_prompt_metadata,
 )
@@ -309,10 +313,10 @@ class TestLoadAgent:
 class TestScanAndLoad:
 
     def test_scans_builtin_agents(self):
-        """Built-in agents directory must yield at least 13 agents."""
+        """Built-in agents directory must yield at least 10 agents."""
         from flocks.agent.agent_factory import _BUILTIN_AGENTS_DIR
         result = scan_and_load(dirs=[_BUILTIN_AGENTS_DIR])
-        assert len(result) >= 13
+        assert len(result) >= 10
 
     def test_all_builtin_agent_names_present(self):
         """Every agent shipped with the package must be discoverable and marked native.
@@ -324,9 +328,9 @@ class TestScanAndLoad:
         from flocks.agent.agent_factory import _BUILTIN_AGENTS_DIR
         result = scan_and_load(dirs=[_BUILTIN_AGENTS_DIR])
         expected = [
-            "rex", "hephaestus", "plan", "explore",
-            "oracle", "librarian", "metis", "momus", "multimodal-looker",
-            "self-enhance", "rex-junior",
+            "rex", "hephaestus", "explore",
+            "oracle", "librarian", "prometheus", "multimodal-looker",
+            "rex-junior",
         ]
         for name in expected:
             assert name in result, f"Built-in agent '{name}' missing from scan"
@@ -417,7 +421,7 @@ class TestInjectDynamicPrompts:
             (helper_path.parent / "__init__.py").touch()
 
         agents = {"dyn": agent}
-        inject_dynamic_prompts(agents, [], [], [], [])
+        inject_dynamic_prompts(agents, [], [], [])
         assert agent.prompt == "injected"
 
     def test_inject_handles_import_error_gracefully(self):
@@ -425,13 +429,13 @@ class TestInjectDynamicPrompts:
         agent = AgentInfo(name="broken", mode="subagent", native=False)
         agent.prompt_builder = "nonexistent.module.path:inject"
         agents = {"broken": agent}
-        inject_dynamic_prompts(agents, [], [], [], [])  # Should not raise
+        inject_dynamic_prompts(agents, [], [], [])  # Should not raise
         assert agent.prompt is None
 
     def test_inject_skips_agents_without_builder(self):
         agent = AgentInfo(name="static", mode="subagent", native=False, prompt="static prompt")
         agents = {"static": agent}
-        inject_dynamic_prompts(agents, [], [], [], [])
+        inject_dynamic_prompts(agents, [], [], [])
         assert agent.prompt == "static prompt"
 
     @pytest.mark.asyncio
@@ -467,13 +471,16 @@ class TestInjectDynamicPrompts:
         assert jr is not None
         assert jr.prompt is not None
         assert len(jr.prompt) > 50
+        assert "Execute implementation tasks directly." in jr.prompt
+        assert "NEVER delegate or spawn other agents" not in jr.prompt
+        assert "for read-only research only" in jr.prompt
 
     @pytest.mark.asyncio
     async def test_static_prompt_agents(self):
         """Built-in agents with prompt.md should have non-empty prompts."""
         from flocks.agent.registry import Agent
         # Only built-in agents (native=True) — not dependent on local plugin installation
-        for name in ["explore", "oracle", "momus", "metis", "self-enhance", "multimodal-looker"]:
+        for name in ["explore", "oracle", "prometheus", "multimodal-looker"]:
             agent = await Agent.get(name)
             assert agent is not None, f"Agent '{name}' not found"
             assert agent.prompt is not None, f"Agent '{name}' should have a prompt from prompt.md"
@@ -624,7 +631,7 @@ class TestAgentConfigOverrides:
         from flocks.agent.agent_factory import scan_and_load
         result = scan_and_load()
         # All 13 built-ins should be present without a whitelist
-        assert len(result) >= 13
+        assert len(result) >= 10
 
 
 # ===========================================================================
@@ -776,6 +783,91 @@ class TestProjectLevelAgentScan:
 
         assert "custom-agent" in result
         assert result["custom-agent"].native is False
+
+    def test_user_plugin_agent_wins_over_project_bundle(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        user_agents_dir = tmp_path / "user_plugins" / "agents"
+        project_dir = tmp_path / "project"
+        project_agents_dir = project_dir / ".flocks" / "plugins" / "agents"
+        self._write_agent(user_agents_dir, "shared-agent")
+        self._write_agent(project_agents_dir, "shared-agent")
+        (user_agents_dir / "shared-agent" / "agent.yaml").write_text(
+            "name: shared-agent\ndescription: user customization\nmode: subagent\n",
+            encoding="utf-8",
+        )
+        (project_agents_dir / "shared-agent" / "agent.yaml").write_text(
+            "name: shared-agent\ndescription: project bundle\nmode: subagent\n",
+            encoding="utf-8",
+        )
+
+        info_log = MagicMock()
+        warn_log = MagicMock()
+        monkeypatch.setattr(_factory_module, "_PLUGIN_AGENTS_DIR", user_agents_dir)
+        monkeypatch.setattr(_factory_module.log, "info", info_log)
+        monkeypatch.setattr(_factory_module.log, "warn", warn_log)
+        monkeypatch.chdir(project_dir)
+
+        result = scan_and_load()
+
+        assert result["shared-agent"].description == "user customization"
+        assert any(
+            call.args and call.args[0] == "agent.factory.lower_priority_skipped"
+            for call in info_log.call_args_list
+        )
+        assert not any(
+            call.args and call.args[0] == "agent.factory.name_conflict"
+            and call.args[1].get("name") == "shared-agent"
+            for call in warn_log.call_args_list
+        )
+
+
+# ===========================================================================
+# Project-level plugin agent CRUD
+# ===========================================================================
+
+class TestProjectLevelYamlCrud:
+    """Project-level plugin agents should be readable and updatable."""
+
+    def _write_project_agent(self, root: Path, name: str) -> Path:
+        agent_dir = root / ".flocks" / "plugins" / "agents" / name
+        agent_dir.mkdir(parents=True)
+        yaml_path = agent_dir / "agent.yaml"
+        yaml_path.write_text(
+            textwrap.dedent(f"""\
+                name: {name}
+                description: Project agent {name}
+                mode: subagent
+                delegatable: true
+            """),
+            encoding="utf-8",
+        )
+        return yaml_path
+
+    def test_find_and_read_project_level_agent(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        yaml_path = self._write_project_agent(tmp_path, "proj-editable")
+        monkeypatch.chdir(tmp_path)
+
+        assert find_yaml_agent("proj-editable") == yaml_path
+        raw = read_yaml_agent("proj-editable")
+        assert raw is not None
+        assert raw["name"] == "proj-editable"
+        assert raw["delegatable"] is True
+
+    def test_update_project_level_agent_yaml(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        yaml_path = self._write_project_agent(tmp_path, "proj-toggle")
+        monkeypatch.chdir(tmp_path)
+
+        result = update_yaml_agent("proj-toggle", {"delegatable": False, "temperature": 0.2})
+
+        assert result is True
+        updated = yaml_path.read_text(encoding="utf-8")
+        assert "delegatable: false" in updated
+        assert "temperature: 0.2" in updated
 
 
 # ===========================================================================

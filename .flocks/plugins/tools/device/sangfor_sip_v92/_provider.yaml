@@ -13,6 +13,7 @@ description_cn: >
   支持拉取受监控IP、服务器资产、终端资产、安全事件、风险业务/终端
   及脆弱性（弱密码、漏洞、明文传输）等数据。
   使用 auth3（SHA1）签名认证，Token 有有效期，过期后自动重新认证。
+docs_url: "https://agentflocks.github.io/flocks-docs/md/modules/devices/sangfor-sip-integration"
 auth:
   type: custom
   secret: sangfor_sip_password
@@ -71,6 +72,13 @@ notes: |
      - api_services.sangfor_sip.platform_name = "your_platform_name"
      - api_services.sangfor_sip.username = "your_username"
      - sangfor_sip_password = "your_password"（secret）
+
+  连通测试地址拼装规则：
+    - 仅填写 `host`（默认）→ 拼装为 `https://{host}:{port}`，
+      端口缺省为 7443（HTTPS）。
+    - 若需以非 HTTPS 方式探测（极少见，仅用于联调环境），
+      请在 `host` 字段中显式写入完整 scheme，例如
+      `http://10.1.2.3`，系统不会再为其加 `https://` 前缀。
 
   `verify_ssl` 由表单底部「SSL 验证」开关控制，下列字段都会被
   识别为 SSL 验证开关，按以下优先级取值：

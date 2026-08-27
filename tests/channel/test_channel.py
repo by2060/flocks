@@ -32,6 +32,7 @@ from flocks.channel.base import (
     ChatType,
     DeliveryResult,
     InboundMessage,
+    NonRetryableChannelError,
     OutboundContext,
 )
 from flocks.config.config import ChannelAccountConfig, ChannelConfig, ConfigInfo
@@ -130,8 +131,11 @@ class TestChannelPluginStatus:
     def test_mark_connected(self):
         ch = _StubChannel()
         ch.reset_status("feishu")
+        ch.mark_disconnected(error="timeout")
         ch.mark_connected()
         assert ch.status.connected is True
+        assert ch.status.last_error is None
+        assert ch.status.error_count == 1
 
     def test_mark_disconnected_without_error(self):
         ch = _StubChannel()
@@ -196,6 +200,7 @@ class TestChannelConfigMerge:
         assert cfg.enabled is False
         assert cfg.group_trigger == "mention"
         assert cfg.default_agent is None
+        assert not hasattr(cfg, "permission_mode")
 
     def test_channel_config_extra_fields(self):
         cfg = ChannelConfig(enabled=True, appId="abc", appSecret="xyz")
@@ -260,13 +265,147 @@ class TestMessageDedup:
         assert dedup.is_duplicate("msg_2") is False
 
 
+class TestParseSlashCommand:
+    """Regression coverage for ``dispatcher._parse_slash_command`` after the
+    PR #321 fix that tightened the channel fallback to bot-mention prefixes
+    only.  Group-IM platforms (WeCom, Feishu) inject short ``- BotName`` or
+    ``@BotName`` prefixes before commands; natural-language messages that
+    happen to contain ``/word`` must NOT be hijacked as slash commands.
+    """
+
+    def test_strict_leading_slash(self):
+        from flocks.channel.inbound.dispatcher import _parse_slash_command
+
+        assert _parse_slash_command("/compact") == ("compact", "")
+        assert _parse_slash_command("/compact focus_arg") == (
+            "compact",
+            "focus_arg",
+        )
+
+    def test_dash_prefix_wecom_style(self):
+        """WeCom group-mention injects ``- BotName`` before the command."""
+        from flocks.channel.inbound.dispatcher import _parse_slash_command
+
+        assert _parse_slash_command("- rex /compact") == ("compact", "")
+        assert _parse_slash_command("- test /compact arg1") == (
+            "compact",
+            "arg1",
+        )
+
+    def test_at_prefix_feishu_style(self):
+        """Feishu group-mention injects ``@BotName`` before the command."""
+        from flocks.channel.inbound.dispatcher import _parse_slash_command
+
+        assert _parse_slash_command("@flocks_bot /compact") == ("compact", "")
+        assert _parse_slash_command("@bot /help") == ("help", "")
+
+    def test_unicode_bot_name_accepted(self):
+        """The bot name may contain Unicode word characters (e.g. CJK)."""
+        from flocks.channel.inbound.dispatcher import _parse_slash_command
+
+        assert _parse_slash_command("- 测试机器人 /compact") == ("compact", "")
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "请解释一下 /help",
+            "I want to know about /status",
+            "prefix /new thanks",
+            "see /tmp/foo.log",  # /tmp does not resolve, must be rejected
+            "hello /help",  # bare word + slash, missing mention prefix
+            "this is a long sentence about /model selection",
+        ],
+    )
+    def test_natural_language_with_slash_word_rejected(self, text: str):
+        """Plain chatter that *contains* a slash-prefixed word must NOT be
+        hijacked as a slash command — the LLM should see the original text.
+        """
+        from flocks.channel.inbound.dispatcher import _parse_slash_command
+
+        assert _parse_slash_command(text) == (None, "")
+
+    def test_unknown_command_rejected_even_with_mention_prefix(self):
+        """Even with a valid bot-mention prefix, an unregistered command name
+        must fall through to the LLM rather than failing dispatch.
+        """
+        from flocks.channel.inbound.dispatcher import _parse_slash_command
+
+        assert _parse_slash_command("- rex /this_is_not_a_command") == (
+            None,
+            "",
+        )
+
+    def test_empty_input(self):
+        from flocks.channel.inbound.dispatcher import _parse_slash_command
+
+        assert _parse_slash_command("") == (None, "")
+        assert _parse_slash_command("   ") == (None, "")
+
+
 class TestFeishuNativeCommands:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("category", "model_auto", "expected"),
+        [
+            ("user", True, True),
+            ("user", False, False),
+            ("task", True, False),
+        ],
+    )
+    async def test_im_loop_uses_supported_persisted_auto_mode(
+        self,
+        monkeypatch,
+        category,
+        model_auto,
+        expected,
+    ):
+        from flocks.channel.inbound.dispatcher import InboundDispatcher
+        from flocks.channel.inbound.session_binding import SessionBinding
+
+        binding = SessionBinding(
+            channel_id="slack",
+            account_id="T1",
+            chat_id="C123",
+            chat_type=ChatType.CHANNEL,
+            thread_id=None,
+            session_id="session_1",
+            agent_id="rex",
+            created_at=0,
+            last_message_at=0,
+        )
+        monkeypatch.setattr(
+            "flocks.session.session.Session.get_by_id",
+            AsyncMock(
+                return_value=SimpleNamespace(
+                    id="session_1",
+                    category=category,
+                    model_auto=model_auto,
+                )
+            ),
+        )
+        run_mock = AsyncMock(return_value=SimpleNamespace(last_message=None))
+        monkeypatch.setattr(
+            "flocks.session.session_loop.SessionLoop.run",
+            run_mock,
+        )
+
+        loop_callbacks = SimpleNamespace()
+        await InboundDispatcher._run_session_loop(binding, loop_callbacks)
+
+        run_mock.assert_awaited_once_with(
+            session_id="session_1",
+            agent_name="rex",
+            callbacks=loop_callbacks,
+            auto_failover=expected,
+        )
+
     @pytest.mark.asyncio
     async def test_status_command_reports_session_state(self, monkeypatch):
         from flocks.channel.inbound.dispatcher import InboundDispatcher
         from flocks.channel.inbound.session_binding import SessionBinding
 
         dispatcher = InboundDispatcher()
+        dispatcher._trigger_command_hook = AsyncMock()
         binding = SessionBinding(
             channel_id="feishu",
             account_id="default",
@@ -336,7 +475,6 @@ class TestFeishuNativeCommands:
         from flocks.channel.inbound.session_binding import SessionBinding
 
         dispatcher = InboundDispatcher()
-        dispatcher._trigger_command_hook = AsyncMock()
         binding = SessionBinding(
             channel_id="feishu",
             account_id="default",
@@ -415,6 +553,7 @@ class TestFeishuNativeCommands:
                     "provider": "anthropic",
                     "model": "claude-sonnet-4-20250514",
                     "model_pinned": True,
+                    "model_auto": False,
                 },
             )
         ]
@@ -493,7 +632,13 @@ class TestFeishuNativeCommands:
             )
         )
         monkeypatch.setattr("flocks.session.session.Session.create", create_mock)
-
+        update_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr("flocks.session.session.Session.update", update_mock)
+        profile_upsert = AsyncMock(return_value=None)
+        monkeypatch.setattr(
+            "flocks.session.execution_profile.upsert_session_execution_profile",
+            profile_upsert,
+        )
         handled = await dispatcher._handle_feishu_native_command(
             binding=binding,
             msg=msg,
@@ -510,6 +655,201 @@ class TestFeishuNativeCommands:
         assert create_kwargs["title"] == "[Feishu] oc_group"
         assert "session_new" in delivered[0]
         assert "已开始全新对话。" in delivered[0]
+        # Starting a new conversation must not archive the previous session.
+        update_mock.assert_not_awaited()
+        profile_upsert.assert_awaited_once()
+        assert profile_upsert.await_args.args[0] == "session_new"
+        assert profile_upsert.await_args.kwargs["patch"]["entry"] == "channel"
+        assert profile_upsert.await_args.kwargs["patch"]["channel_id"] == "feishu"
+        assert profile_upsert.await_args.kwargs["patch"]["account_id"] == "default"
+        # Rebinding only changes the active IM target; it must preserve the
+        # existing session and its history for later WebUI inspection.
+        update_mock.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_new_command_inherits_auto_model_mode(self, monkeypatch):
+        from flocks.channel.inbound.dispatcher import InboundDispatcher
+        from flocks.channel.inbound.session_binding import SessionBinding
+
+        dispatcher = InboundDispatcher()
+        dispatcher._trigger_command_hook = AsyncMock()
+        dispatcher.binding_service.rebind = AsyncMock(
+            return_value=SessionBinding(
+                channel_id="wecom",
+                account_id="default",
+                chat_id="room_1",
+                chat_type=ChatType.DIRECT,
+                thread_id=None,
+                session_id="session_new",
+                agent_id="rex",
+                created_at=0,
+                last_message_at=0,
+            )
+        )
+        binding = SessionBinding(
+            channel_id="wecom",
+            account_id="default",
+            chat_id="room_1",
+            chat_type=ChatType.DIRECT,
+            thread_id=None,
+            session_id="session_old",
+            agent_id="rex",
+            created_at=0,
+            last_message_at=0,
+        )
+        msg = InboundMessage(
+            channel_id="wecom",
+            account_id="default",
+            message_id="msg_1",
+            sender_id="user_1",
+            chat_id="room_1",
+            chat_type=ChatType.DIRECT,
+            text="/new",
+            mention_text="/new",
+        )
+        monkeypatch.setattr(
+            "flocks.channel.outbound.deliver.OutboundDelivery.deliver",
+            AsyncMock(),
+        )
+        monkeypatch.setattr(
+            "flocks.session.session.Session.get_by_id",
+            AsyncMock(
+                return_value=SimpleNamespace(
+                    id="session_old",
+                    project_id="channel",
+                    directory="/tmp/project",
+                    agent="rex",
+                    category="user",
+                    model_auto=True,
+                    model_pinned=False,
+                    provider=None,
+                    model=None,
+                )
+            ),
+        )
+        create_mock = AsyncMock(
+            return_value=SimpleNamespace(id="session_new", agent="rex")
+        )
+        monkeypatch.setattr("flocks.session.session.Session.create", create_mock)
+        monkeypatch.setattr(
+            "flocks.session.session.Session.update",
+            AsyncMock(return_value=None),
+        )
+
+        await dispatcher._handle_session_command(
+            binding=binding,
+            msg=msg,
+            callbacks=dispatcher._build_callbacks(binding, msg),
+            scope_override=None,
+            channel_config=ChannelConfig(enabled=True),
+        )
+
+        create_kwargs = create_mock.await_args.kwargs
+        assert create_kwargs["model_auto"] is True
+        assert create_kwargs["model_pinned"] is False
+        assert "provider" not in create_kwargs
+        assert "model" not in create_kwargs
+
+    @pytest.mark.asyncio
+    async def test_new_command_with_args_sends_args_to_new_session(self, monkeypatch):
+        from flocks.channel.inbound.dispatcher import InboundDispatcher
+        from flocks.channel.inbound.session_binding import SessionBinding
+
+        dispatcher = InboundDispatcher()
+        dispatcher._trigger_command_hook = AsyncMock()
+        append_mock = AsyncMock()
+        run_mock = AsyncMock()
+        monkeypatch.setattr(dispatcher, "_append_user_message", append_mock)
+        monkeypatch.setattr(dispatcher, "_run_agent", run_mock)
+        dispatcher.binding_service.rebind = AsyncMock(
+            return_value=SessionBinding(
+                channel_id="slack",
+                account_id="T1",
+                chat_id="C123",
+                chat_type=ChatType.CHANNEL,
+                thread_id="171.1",
+                session_id="session_new",
+                agent_id="rex",
+                created_at=0,
+                last_message_at=0,
+            )
+        )
+        binding = SessionBinding(
+            channel_id="slack",
+            account_id="T1",
+            chat_id="C123",
+            chat_type=ChatType.CHANNEL,
+            thread_id="171.1",
+            session_id="session_old",
+            agent_id="rex",
+            created_at=0,
+            last_message_at=0,
+        )
+        msg = InboundMessage(
+            channel_id="slack",
+            account_id="T1",
+            message_id="171.1",
+            sender_id="U123",
+            chat_id="C123",
+            chat_type=ChatType.CHANNEL,
+            text="<@UBOT> /new 叫我uuuu",
+            mention_text="/new 叫我uuuu",
+            thread_id="171.1",
+            mentioned=True,
+        )
+
+        delivered: list[str] = []
+
+        async def fake_deliver(ctx, session_id=None):
+            delivered.append(ctx.text)
+
+        monkeypatch.setattr(
+            "flocks.channel.outbound.deliver.OutboundDelivery.deliver",
+            fake_deliver,
+        )
+        monkeypatch.setattr(
+            "flocks.session.session.Session.get_by_id",
+            AsyncMock(
+                return_value=SimpleNamespace(
+                    id="session_old",
+                    project_id="channel",
+                    directory="/tmp/project",
+                    agent="rex",
+                    provider="anthropic",
+                    model="claude-sonnet-4-20250514",
+                    model_pinned=True,
+                )
+            ),
+        )
+        create_mock = AsyncMock(
+            return_value=SimpleNamespace(id="session_new", agent="rex")
+        )
+        monkeypatch.setattr("flocks.session.session.Session.create", create_mock)
+        monkeypatch.setattr(
+            "flocks.session.session.Session.update",
+            AsyncMock(return_value=None),
+        )
+        monkeypatch.setattr(
+            "flocks.channel.inbound.dispatcher._resolve_session_model",
+            AsyncMock(return_value={"providerID": "anthropic", "modelID": "claude"}),
+        )
+
+        handled = await dispatcher._handle_feishu_native_command(
+            binding=binding,
+            msg=msg,
+            channel_config=ChannelConfig(enabled=True),
+            user_text="/new 叫我uuuu",
+            scope_override=None,
+        )
+
+        assert handled is True
+        assert "已开始全新对话。" in delivered[0]
+        assert create_mock.await_args.kwargs["title"] == "[Slack] 叫我uuuu"
+        append_mock.assert_awaited_once()
+        assert append_mock.await_args.args[:3] == ("session_new", "叫我uuuu", msg)
+        assert append_mock.await_args.kwargs["agent"] == "rex"
+        run_mock.assert_awaited_once()
+        assert run_mock.await_args.args[0].session_id == "session_new"
 
     @pytest.mark.asyncio
     async def test_reset_alias_matches_new_semantics(self, monkeypatch):
@@ -651,6 +991,61 @@ class TestFeishuNativeCommands:
         assert "Available / commands:" in delivered[0]
 
     @pytest.mark.asyncio
+    async def test_clear_command_clears_channel_session_history(self, monkeypatch):
+        from flocks.channel.inbound.dispatcher import InboundDispatcher
+        from flocks.channel.inbound.session_binding import SessionBinding
+
+        dispatcher = InboundDispatcher()
+        binding = SessionBinding(
+            channel_id="wecom",
+            account_id="default",
+            chat_id="room_1",
+            chat_type=ChatType.DIRECT,
+            thread_id=None,
+            session_id="session_1",
+            agent_id="rex",
+            created_at=0,
+            last_message_at=0,
+        )
+        msg = InboundMessage(
+            channel_id="wecom",
+            account_id="default",
+            message_id="msg_1",
+            sender_id="user_1",
+            chat_id="room_1",
+            chat_type=ChatType.DIRECT,
+            text="/clear",
+            mention_text="/clear",
+        )
+
+        delivered: list[str] = []
+        clear_history = AsyncMock(return_value=3)
+
+        async def fake_deliver(ctx, session_id=None):
+            delivered.append(ctx.text)
+
+        monkeypatch.setattr(
+            "flocks.channel.outbound.deliver.OutboundDelivery.deliver",
+            fake_deliver,
+        )
+        monkeypatch.setattr(
+            "flocks.server.routes.session._clear_session_history",
+            clear_history,
+        )
+
+        handled = await dispatcher._handle_feishu_native_command(
+            binding=binding,
+            msg=msg,
+            channel_config=ChannelConfig(enabled=True),
+            user_text="/clear",
+            scope_override=None,
+        )
+
+        assert handled is True
+        clear_history.assert_awaited_once_with("session_1")
+        assert delivered == ["已清空当前会话历史，共删除 3 条消息。"]
+
+    @pytest.mark.asyncio
     async def test_append_user_message_stores_feishu_media_part(self, monkeypatch):
         from flocks.channel.inbound.dispatcher import InboundDispatcher
         from flocks.config.config import ChannelConfig
@@ -699,6 +1094,55 @@ class TestFeishuNativeCommands:
         assert stored_part.filename == "diagram.png"
         assert stored_part.mime == "image/png"
         assert stored_part.url == "file:///tmp/diagram.png"
+
+    @pytest.mark.asyncio
+    async def test_append_user_message_accepts_windows_file_uri(self, monkeypatch):
+        from flocks.channel.inbound.dispatcher import InboundDispatcher
+        from flocks.config.config import ChannelConfig
+
+        created_message = SimpleNamespace(id="message_user_1")
+        store_part = AsyncMock()
+        paths_checked: list[str] = []
+
+        def fake_isfile(path: str) -> bool:
+            paths_checked.append(path)
+            return path == "C:/Users/demo/Pictures/channel image.png"
+
+        monkeypatch.setattr(
+            "flocks.session.message.Message.create",
+            AsyncMock(return_value=created_message),
+        )
+        monkeypatch.setattr(
+            "flocks.session.message.Message.store_part",
+            store_part,
+        )
+        monkeypatch.setattr(
+            "flocks.session.message.Message.parts",
+            AsyncMock(return_value=[]),
+        )
+        monkeypatch.setattr("os.path.isfile", fake_isfile)
+
+        await InboundDispatcher._append_user_message(
+            "session_1",
+            "[图片消息]",
+            InboundMessage(
+                channel_id="weixin",
+                account_id="default",
+                message_id="msg_1",
+                sender_id="user_1",
+                chat_type=ChatType.DIRECT,
+                media_url="file:///C:/Users/demo/Pictures/channel%20image.png",
+                media_mime="image/png",
+            ),
+            ChannelConfig(enabled=True),
+        )
+
+        assert paths_checked == ["C:/Users/demo/Pictures/channel image.png"]
+        store_part.assert_awaited_once()
+        stored_part = store_part.await_args.args[2]
+        assert stored_part.type == "file"
+        assert stored_part.filename == "channel image.png"
+        assert stored_part.mime == "image/png"
 
 
 class TestMultimodalInput:
@@ -871,10 +1315,10 @@ class TestMultimodalInput:
 # =====================================================================
 
 class TestCheckAllowlist:
-    def _make_msg(self, *, chat_type=ChatType.DIRECT, sender_id="u1"):
+    def _make_msg(self, *, chat_type=ChatType.DIRECT, sender_id="u1", channel_id="test", raw=None):
         return InboundMessage(
-            channel_id="test", account_id="acc", message_id="m1",
-            sender_id=sender_id, chat_type=chat_type,
+            channel_id=channel_id, account_id="acc", message_id="m1",
+            sender_id=sender_id, chat_type=chat_type, raw=raw,
         )
 
     def test_dm_open_allows_all(self):
@@ -892,6 +1336,23 @@ class TestCheckAllowlist:
         cfg = ChannelConfig(dm_policy="allowlist", allow_from=["u1"])
         assert _check_allowlist(self._make_msg(sender_id="u1"), cfg) is True
 
+    def test_slack_dm_allow_from_without_policy_blocks_unlisted(self):
+        from flocks.channel.inbound.dispatcher import _check_allowlist
+        cfg = ChannelConfig(allow_from=["U_ALLOWED"])
+        msg = self._make_msg(channel_id="slack", sender_id="U_BLOCKED")
+        assert _check_allowlist(msg, cfg) is False
+
+    def test_slack_dm_allow_from_without_policy_passes_listed(self):
+        from flocks.channel.inbound.dispatcher import _check_allowlist
+        cfg = ChannelConfig(allow_from=["U_ALLOWED"])
+        msg = self._make_msg(channel_id="slack", sender_id="U_ALLOWED")
+        assert _check_allowlist(msg, cfg) is True
+
+    def test_non_slack_dm_allow_from_without_policy_stays_open(self):
+        from flocks.channel.inbound.dispatcher import _check_allowlist
+        cfg = ChannelConfig(allow_from=["u2"])
+        assert _check_allowlist(self._make_msg(channel_id="test", sender_id="u1"), cfg) is True
+
     def test_dm_allowlist_empty_blocks_all(self):
         from flocks.channel.inbound.dispatcher import _check_allowlist
         cfg = ChannelConfig(dm_policy="allowlist", allow_from=None)
@@ -907,6 +1368,28 @@ class TestCheckAllowlist:
         from flocks.channel.inbound.dispatcher import _check_allowlist
         cfg = ChannelConfig()
         msg = self._make_msg(chat_type=ChatType.GROUP)
+        assert _check_allowlist(msg, cfg) is True
+
+    def test_whatsapp_dm_allowlist_matches_lid_alias(self):
+        from flocks.channel.inbound.dispatcher import _check_allowlist
+        cfg = ChannelConfig(dm_policy="allowlist", allow_from=["25482795991095@lid"])
+        msg = self._make_msg(channel_id="whatsapp", sender_id="25482795991095")
+        assert _check_allowlist(msg, cfg) is True
+
+    def test_whatsapp_group_allowlist_matches_lid_alias(self):
+        from flocks.channel.inbound.dispatcher import _check_allowlist
+        cfg = ChannelConfig(allow_from=["25482795991095@lid"])
+        msg = self._make_msg(channel_id="whatsapp", chat_type=ChatType.GROUP, sender_id="25482795991095")
+        assert _check_allowlist(msg, cfg) is True
+
+    def test_whatsapp_dm_allowlist_matches_sender_aliases(self):
+        from flocks.channel.inbound.dispatcher import _check_allowlist
+        cfg = ChannelConfig(dm_policy="allowlist", allow_from=["8618803405095"])
+        msg = self._make_msg(
+            channel_id="whatsapp",
+            sender_id="25482795991095",
+            raw={"senderAliases": ["25482795991095@lid", "8618803405095@s.whatsapp.net"]},
+        )
         assert _check_allowlist(msg, cfg) is True
 
 
@@ -1109,6 +1592,17 @@ class TestChannelRegistry:
         reg.register(plugin)
         assert reg.get("test_ch") is plugin
 
+    def test_register_keeps_existing_channel_instance(self):
+        from flocks.channel.registry import ChannelRegistry
+        reg = ChannelRegistry()
+        first = _StubChannel("test_ch", "First")
+        replacement = _StubChannel("test_ch", "Replacement")
+
+        reg.register(first)
+        reg.register(replacement)
+
+        assert reg.get("test_ch") is first
+
     def test_get_by_alias(self):
         from flocks.channel.registry import ChannelRegistry
         reg = ChannelRegistry()
@@ -1183,6 +1677,70 @@ class TestGatewayManagerHelpers:
         assert plugin.status.last_error == "fail"
         assert plugin.status.error_count == 1
 
+    async def test_run_with_reconnect_stops_on_non_retryable_error(self):
+        from flocks.channel.gateway.manager import GatewayManager
+
+        manager = GatewayManager()
+        plugin = _StubChannel()
+        attempts = 0
+        abort_event = asyncio.Event()
+
+        async def _fail_start(config, on_message, abort_event=None):
+            nonlocal attempts
+            attempts += 1
+            raise NonRetryableChannelError("bad credentials")
+
+        plugin.start = _fail_start  # type: ignore[method-assign]
+
+        await manager._run_with_reconnect(
+            channel_id="stub",
+            plugin=plugin,
+            config={},
+            on_message=AsyncMock(),
+            abort_event=abort_event,
+        )
+
+        assert attempts == 1
+        assert plugin.status.connected is False
+        assert plugin.status.last_error == "bad credentials"
+        assert plugin.status.error_count == 1
+
+    async def test_run_with_reconnect_does_not_pre_mark_self_managed_connection(self):
+        from flocks.channel.gateway.manager import GatewayManager
+
+        class _SelfManagedChannel(_StubChannel):
+            def capabilities(self) -> ChannelCapabilities:
+                return ChannelCapabilities(
+                    chat_types=[ChatType.DIRECT],
+                    self_managed_connection=True,
+                )
+
+        manager = GatewayManager()
+        plugin = _SelfManagedChannel()
+        started = asyncio.Event()
+        abort_event = asyncio.Event()
+
+        async def _start(config, on_message, abort_event=None):
+            started.set()
+            await asyncio.sleep(0.75)
+            abort_event.set()
+            raise RuntimeError("handshake failed")
+
+        plugin.start = _start  # type: ignore[method-assign]
+
+        await manager._run_with_reconnect(
+            channel_id="stub",
+            plugin=plugin,
+            config={},
+            on_message=AsyncMock(),
+            abort_event=abort_event,
+        )
+
+        assert started.is_set()
+        assert plugin.status.connected is False
+        assert plugin.status.last_error == "handshake failed"
+        assert plugin.status.error_count == 1
+
     async def test_stop_all_drains_cancelled_tasks(self, monkeypatch):
         from flocks.channel.gateway.manager import GatewayManager
         from flocks.channel.registry import ChannelRegistry
@@ -1213,3 +1771,448 @@ class TestGatewayManagerHelpers:
 
         assert cancelled.is_set()
         assert task.done()
+
+
+class TestMediaFilenameHelpers:
+    def test_sanitize_filename_preserves_unicode_names(self):
+        from flocks.channel.media_filename import sanitize_filename
+
+        assert sanitize_filename("报告 2026.pdf") == "报告 2026.pdf"
+
+    def test_sanitize_filename_removes_path_separators(self):
+        from flocks.channel.media_filename import sanitize_filename
+
+        assert sanitize_filename("../report.bin") == "report.bin"
+
+
+class TestChannelPolicySecurityConfig:
+    @pytest.mark.asyncio
+    async def test_get_channel_config_force_refresh_bypasses_fresh_cache(
+        self, monkeypatch
+    ):
+        from flocks.channel.inbound.dispatcher import (
+            InboundDispatcher,
+            _CachedConfig,
+            _channel_config_cache,
+        )
+
+        _channel_config_cache.clear()
+        _channel_config_cache["weixin"] = _CachedConfig(
+            ChannelConfig(permission_mode="auto-allow-all")
+        )
+
+        fake_config = SimpleNamespace(
+            get_channel_config=lambda _channel_id: ChannelConfig(permission_mode="readonly")
+        )
+        monkeypatch.setattr(
+            "flocks.config.config.Config.get",
+            AsyncMock(return_value=fake_config),
+        )
+
+        cached = await InboundDispatcher._get_channel_config("weixin")
+        refreshed = await InboundDispatcher._get_channel_config(
+            "weixin",
+            force_refresh=True,
+        )
+
+        assert cached.permission_mode == "auto-allow-all"
+        assert refreshed.permission_mode == "readonly"
+        assert _channel_config_cache["weixin"].config.permission_mode == "readonly"
+
+    @pytest.mark.asyncio
+    async def test_session_binding_enforces_visible_agents_for_existing_binding(
+        self, monkeypatch, tmp_path
+    ):
+        from flocks.channel.inbound.session_binding import (
+            SessionBindingService,
+            close_binding_db,
+        )
+        from flocks.storage.storage import Storage
+
+        await Storage.init(tmp_path / "channel-binding-visible-agent.db")
+        monkeypatch.setattr(
+            "flocks.session.session.Session.create",
+            AsyncMock(return_value=SimpleNamespace(id="session_1")),
+        )
+        monkeypatch.setattr(
+            "flocks.session.session.Session.get_by_id",
+            AsyncMock(return_value=SimpleNamespace(id="session_1")),
+        )
+        service = SessionBindingService()
+        msg = InboundMessage(
+            channel_id="feishu",
+            account_id="default",
+            message_id="msg_1",
+            sender_id="ou_user",
+            chat_id="ou_user",
+            chat_type=ChatType.DIRECT,
+            text="hello",
+        )
+
+        try:
+            created = await service.resolve_or_create(
+                msg,
+                default_agent="legacy-agent",
+            )
+            assert created.agent_id == "legacy-agent"
+
+            rebound = await service.resolve_or_create(
+                msg,
+                default_agent="security-agent",
+                visible_agents=["security-agent", "assistant-agent"],
+            )
+            assert rebound.agent_id == "security-agent"
+        finally:
+            await close_binding_db()
+
+
+# ------------------------------------------------------------------
+# Per-channel inbound media downloader routing
+# ------------------------------------------------------------------
+
+class TestDownloadChannelMediaRouting:
+    """The dispatcher's per-channel media hook must resolve to the
+    correct downloader and propagate ``config`` through.
+    """
+
+    @pytest.mark.asyncio
+    async def test_dispatch_to_wecom_downloader(self, monkeypatch):
+        from flocks.channel.inbound import dispatcher as dispatch_mod
+
+        captured = {}
+
+        async def fake_wecom(msg, config):
+            captured["msg"] = msg
+            captured["config"] = config
+            return SimpleNamespace(
+                filename="x.pdf", mime="application/pdf",
+                url="file:///tmp/x.pdf", source={"channel": "wecom"},
+            )
+
+        async def fail(msg, config):
+            raise AssertionError("wrong downloader invoked")
+
+        # The dispatcher uses dynamic lookup via __import__, so the
+        # test-level patch is on the inbound_media module attribute.
+        monkeypatch.setattr(
+            "flocks.channel.builtin.wecom.inbound_media.download_inbound_media",
+            fake_wecom,
+        )
+        # In case the dynamic import resolves to a different attribute
+        # (e.g. cached), also patch the inner module binding.
+        import flocks.channel.builtin.wecom.inbound_media as wecom_inb
+        monkeypatch.setattr(wecom_inb, "download_inbound_media", fake_wecom)
+
+        result = await dispatch_mod._download_channel_media(
+            InboundMessage(
+                channel_id="wecom", account_id="a", message_id="m1",
+                sender_id="u", media_url="https://example.com/x",
+            ),
+            {"botId": "b"},
+        )
+        assert result is not None
+        assert captured["msg"].channel_id == "wecom"
+        assert captured["config"] == {"botId": "b"}
+
+    @pytest.mark.asyncio
+    async def test_dispatch_to_dingtalk_downloader(self, monkeypatch):
+        from flocks.channel.inbound import dispatcher as dispatch_mod
+
+        captured = {}
+
+        async def fake_dingtalk(msg, config):
+            captured["msg"] = msg
+            return SimpleNamespace(
+                filename="y.png", mime="image/png",
+                url="file:///tmp/y.png", source={"channel": "dingtalk"},
+            )
+
+        import flocks.channel.builtin.dingtalk.inbound_media as dt_inb
+        monkeypatch.setattr(dt_inb, "download_inbound_media", fake_dingtalk)
+
+        result = await dispatch_mod._download_channel_media(
+            InboundMessage(
+                channel_id="dingtalk", account_id="a", message_id="m",
+                sender_id="u", media_url="CODE",
+            ),
+            {},
+        )
+        assert result is not None
+        assert captured["msg"].channel_id == "dingtalk"
+
+    @pytest.mark.asyncio
+    async def test_dispatch_to_telegram_downloader(self, monkeypatch):
+        from flocks.channel.inbound import dispatcher as dispatch_mod
+
+        captured = {}
+
+        async def fake_telegram(msg, config):
+            captured["msg"] = msg
+            return SimpleNamespace(
+                filename="z.jpg", mime="image/jpeg",
+                url="file:///tmp/z.jpg", source={"channel": "telegram"},
+            )
+
+        import flocks.channel.builtin.telegram.inbound_media as tg_inb
+        monkeypatch.setattr(tg_inb, "download_inbound_media", fake_telegram)
+
+        result = await dispatch_mod._download_channel_media(
+            InboundMessage(
+                channel_id="telegram", account_id="a", message_id="m",
+                sender_id="u", media_url="telegram://photo/ABC",
+            ),
+            {"botToken": "tok"},
+        )
+        assert result is not None
+        assert captured["msg"].channel_id == "telegram"
+
+    @pytest.mark.asyncio
+    async def test_dispatch_to_slack_downloader(self, monkeypatch):
+        from flocks.channel.inbound import dispatcher as dispatch_mod
+
+        captured = {}
+
+        async def fake_slack(msg, config):
+            captured["msg"] = msg
+            captured["config"] = config
+            return SimpleNamespace(
+                filename="slack.png", mime="image/png",
+                url="file:///tmp/slack.png", source={"channel": "slack"},
+            )
+
+        import flocks.channel.builtin.slack.inbound_media as slack_inb
+        monkeypatch.setattr(slack_inb, "download_inbound_media", fake_slack)
+
+        result = await dispatch_mod._download_channel_media(
+            InboundMessage(
+                channel_id="slack", account_id="T1", message_id="m",
+                sender_id="u", media_url="https://files.slack.com/x",
+            ),
+            {"botToken": "xoxb-test"},
+        )
+        assert result is not None
+        assert captured["msg"].channel_id == "slack"
+        assert captured["config"] == {"botToken": "xoxb-test"}
+
+    @pytest.mark.asyncio
+    async def test_unknown_channel_returns_none(self):
+        from flocks.channel.inbound import dispatcher as dispatch_mod
+
+        result = await dispatch_mod._download_channel_media(
+            InboundMessage(
+                channel_id="unknown", account_id="a", message_id="m",
+                sender_id="u", media_url="https://x/y",
+            ),
+            {},
+        )
+        assert result is None
+
+
+# ------------------------------------------------------------------
+# is_channel_media_placeholder
+# ------------------------------------------------------------------
+
+class TestIsChannelMediaPlaceholder:
+    def test_recognises_channel_placeholders(self):
+        from flocks.channel.inbound.session_binding import is_channel_media_placeholder
+        assert is_channel_media_placeholder("[图片消息]") is True
+        assert is_channel_media_placeholder("[图片消息: screenshot.png]") is True
+        assert is_channel_media_placeholder("[文件消息]") is True
+        assert is_channel_media_placeholder("[文件消息: report.pdf]") is True
+        assert is_channel_media_placeholder("[Image]") is True
+        assert is_channel_media_placeholder("[Attachment]") is True
+        assert is_channel_media_placeholder("[图片]") is True
+        assert is_channel_media_placeholder("[文件]") is True
+
+    def test_does_not_match_normal_text(self):
+        from flocks.channel.inbound.session_binding import is_channel_media_placeholder
+        assert is_channel_media_placeholder("hello") is False
+        assert is_channel_media_placeholder("看这个") is False
+        assert is_channel_media_placeholder("") is False
+        assert is_channel_media_placeholder("[文件消息: x] extra text") is False
+        assert is_channel_media_placeholder("[图片]\n请分析") is False
+        assert is_channel_media_placeholder("not a placeholder [文件消息: x]") is False
+
+
+# ------------------------------------------------------------------
+# Full pipeline: synthetic inbound → dispatcher → FilePart (per channel)
+# ------------------------------------------------------------------
+
+class TestAppendUserMessagePerChannel:
+    @pytest.mark.asyncio
+    async def test_captioned_media_text_is_not_replaced(self, monkeypatch):
+        from flocks.channel.inbound.dispatcher import InboundDispatcher
+        from flocks.session.message import TextPart
+
+        created_message = SimpleNamespace(id="m1")
+        caption = "[图片]: 请识别发票金额"
+        text_part = TextPart(
+            id="part_text",
+            sessionID="s1",
+            messageID="m1",
+            text=caption,
+        )
+        store_part = AsyncMock()
+        monkeypatch.setattr(
+            "flocks.session.message.Message.create",
+            AsyncMock(return_value=created_message),
+        )
+        monkeypatch.setattr(
+            "flocks.session.message.Message.store_part",
+            store_part,
+        )
+        monkeypatch.setattr(
+            "flocks.session.message.Message.parts",
+            AsyncMock(return_value=[text_part]),
+        )
+
+        import flocks.channel.builtin.telegram.inbound_media as tg_inb
+
+        async def fake_download(msg, config):
+            return SimpleNamespace(
+                filename="invoice.jpg",
+                mime="image/jpeg",
+                url="file:///tmp/invoice.jpg",
+                source={"channel": "telegram"},
+            )
+
+        monkeypatch.setattr(tg_inb, "download_inbound_media", fake_download)
+
+        await InboundDispatcher._append_user_message_unchecked(
+            "s1",
+            caption,
+            InboundMessage(
+                channel_id="telegram",
+                account_id="a",
+                message_id="m1",
+                sender_id="u",
+                media_url="telegram://photo/ABC",
+            ),
+            None,
+        )
+
+        assert store_part.await_count == 1
+        assert store_part.await_args.args[2].type == "file"
+
+    @pytest.mark.asyncio
+    async def test_wecom_pipeline_stores_file_part(self, monkeypatch):
+        from flocks.channel.inbound.dispatcher import InboundDispatcher
+        from flocks.config.config import ChannelConfig
+
+        created_message = SimpleNamespace(id="m1")
+        store_part = AsyncMock()
+
+        monkeypatch.setattr(
+            "flocks.session.message.Message.create",
+            AsyncMock(return_value=created_message),
+        )
+        monkeypatch.setattr(
+            "flocks.session.message.Message.store_part",
+            store_part,
+        )
+
+        import flocks.channel.builtin.wecom.inbound_media as wecom_inb
+        async def fake_download(msg, config):
+            return SimpleNamespace(
+                filename="report.pdf", mime="application/pdf",
+                url="file:///tmp/report.pdf",
+                source={"channel": "wecom"},
+            )
+        monkeypatch.setattr(wecom_inb, "download_inbound_media", fake_download)
+
+        await InboundDispatcher._append_user_message(
+            "s1",
+            "[文件消息: report.pdf]",
+            InboundMessage(
+                channel_id="wecom", account_id="a", message_id="m1",
+                sender_id="u", media_url="https://example.com/report.pdf",
+            ),
+            ChannelConfig(enabled=True, botId="b", secret="s"),
+        )
+
+        assert store_part.await_count >= 1
+        stored_part = store_part.await_args_list[0].args[2]
+        assert stored_part.type == "file"
+        assert stored_part.filename == "report.pdf"
+        assert stored_part.mime == "application/pdf"
+        assert stored_part.url == "file:///tmp/report.pdf"
+
+    @pytest.mark.asyncio
+    async def test_dingtalk_pipeline_stores_file_part(self, monkeypatch):
+        from flocks.channel.inbound.dispatcher import InboundDispatcher
+
+        created_message = SimpleNamespace(id="m1")
+        store_part = AsyncMock()
+
+        monkeypatch.setattr(
+            "flocks.session.message.Message.create",
+            AsyncMock(return_value=created_message),
+        )
+        monkeypatch.setattr(
+            "flocks.session.message.Message.store_part",
+            store_part,
+        )
+
+        import flocks.channel.builtin.dingtalk.inbound_media as dt_inb
+        async def fake_download(msg, config):
+            return SimpleNamespace(
+                filename="image.png", mime="image/png",
+                url="file:///tmp/image.png",
+                source={"channel": "dingtalk"},
+            )
+        monkeypatch.setattr(dt_inb, "download_inbound_media", fake_download)
+
+        await InboundDispatcher._append_user_message(
+            "s1",
+            "[图片消息]",
+            InboundMessage(
+                channel_id="dingtalk", account_id="a", message_id="m1",
+                sender_id="u", media_url="CODE_123",
+            ),
+            None,
+        )
+
+        assert store_part.await_count >= 1
+        stored_part = store_part.await_args_list[0].args[2]
+        assert stored_part.type == "file"
+        assert stored_part.filename == "image.png"
+
+    @pytest.mark.asyncio
+    async def test_telegram_pipeline_stores_file_part(self, monkeypatch):
+        from flocks.channel.inbound.dispatcher import InboundDispatcher
+
+        created_message = SimpleNamespace(id="m1")
+        store_part = AsyncMock()
+
+        monkeypatch.setattr(
+            "flocks.session.message.Message.create",
+            AsyncMock(return_value=created_message),
+        )
+        monkeypatch.setattr(
+            "flocks.session.message.Message.store_part",
+            store_part,
+        )
+
+        import flocks.channel.builtin.telegram.inbound_media as tg_inb
+        async def fake_download(msg, config):
+            return SimpleNamespace(
+                filename="photo.jpg", mime="image/jpeg",
+                url="file:///tmp/photo.jpg",
+                source={"channel": "telegram"},
+            )
+        monkeypatch.setattr(tg_inb, "download_inbound_media", fake_download)
+
+        await InboundDispatcher._append_user_message(
+            "s1",
+            "[图片]",
+            InboundMessage(
+                channel_id="telegram", account_id="a", message_id="m1",
+                sender_id="u", media_url="telegram://photo/ABC",
+            ),
+            None,
+        )
+
+        assert store_part.await_count >= 1
+        stored_part = store_part.await_args_list[0].args[2]
+        assert stored_part.type == "file"
+        assert stored_part.filename == "photo.jpg"

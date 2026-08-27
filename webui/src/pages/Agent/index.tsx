@@ -1,47 +1,12 @@
 import { useState, useEffect, useMemo } from 'react';
-import { Bot, Plus, Cpu, RefreshCw, Pencil, Trash2, Shield, Zap } from 'lucide-react';
-
-// ---------------------------------------------------------------------------
-// Color helpers
-// ---------------------------------------------------------------------------
-
-// Muted-but-distinct palette — enough personality without being loud.
-const AGENT_PALETTE = [
-  '#3b82f6', // blue-500
-  '#8b5cf6', // violet-500
-  '#06b6d4', // cyan-500
-  '#10b981', // emerald-500
-  '#f59e0b', // amber-500
-  '#ef4444', // red-500
-  '#ec4899', // pink-500
-  '#6366f1', // indigo-500
-];
-
-function resolveAgentColor(agent: Agent): string {
-  if (agent.color) return agent.color;
-  let h = 0;
-  for (let i = 0; i < agent.name.length; i++) {
-    h = agent.name.charCodeAt(i) + ((h << 5) - h);
-  }
-  return AGENT_PALETTE[Math.abs(h) % AGENT_PALETTE.length];
-}
-
-/** hex → rgba string at `alpha` (0–1). Works for 3-char and 6-char hex. */
-function hexAlpha(hex: string, alpha: number): string {
-  const h = hex.replace('#', '');
-  const full = h.length === 3 ? h.split('').map(c => c + c).join('') : h;
-  const r = parseInt(full.slice(0, 2), 16);
-  const g = parseInt(full.slice(2, 4), 16);
-  const b = parseInt(full.slice(4, 6), 16);
-  return `rgba(${r},${g},${b},${alpha})`;
-}
+import { Bot, Plus, Cpu, RefreshCw, Pencil, Trash2, Shield, Zap, Loader2 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import PageHeader from '@/components/common/PageHeader';
 import LoadingSpinner from '@/components/common/LoadingSpinner';
 import EmptyState from '@/components/common/EmptyState';
 import { useAgents } from '@/hooks/useAgents';
 import { agentAPI, Agent } from '@/api/agent';
-import { getAgentDisplayDescription } from '@/utils/agentDisplay';
+import { getAgentDisplayDescription, getAgentDisplayName } from '@/utils/agentDisplay';
 import AgentSheet from './AgentSheet';
 
 // ============================================================================
@@ -52,6 +17,7 @@ export default function AgentPage() {
   const { t, i18n } = useTranslation('agent');
   const [editingAgent, setEditingAgent] = useState<Agent | null>(null);
   const [showCreateSheet, setShowCreateSheet] = useState(false);
+  const [togglingAgents, setTogglingAgents] = useState<Record<string, boolean>>({});
 
   const { agents, loading, error, refetch } = useAgents();
   const [refreshing, setRefreshing] = useState(false);
@@ -90,10 +56,26 @@ export default function AgentPage() {
     }
   };
 
+  const handleToggleDelegatable = async (agent: Agent, delegatable: boolean) => {
+    if (togglingAgents[agent.name]) return;
+    setTogglingAgents((prev) => ({ ...prev, [agent.name]: true }));
+    try {
+      const response = await agentAPI.setDelegatable(agent.name, delegatable);
+      if (editingAgent?.name === agent.name) {
+        setEditingAgent(response.data);
+      }
+      await refetch(false);
+    } catch (err: any) {
+      alert(t('error.updateFailed', { detail: err.response?.data?.detail ?? err.message }));
+    } finally {
+      setTogglingAgents((prev) => ({ ...prev, [agent.name]: false }));
+    }
+  };
+
   if (loading) {
     return (
       <div className="flex items-center justify-center h-full">
-        <LoadingSpinner />
+        <LoadingSpinner delayMs={180} />
       </div>
     );
   }
@@ -181,6 +163,8 @@ export default function AgentPage() {
                 selectedAgent={editingAgent}
                 onSelect={setEditingAgent}
                 onDelete={handleDelete}
+                togglingAgents={togglingAgents}
+                onToggleDelegatable={handleToggleDelegatable}
               />
             )}
             {subAgents.length > 0 && (
@@ -195,6 +179,8 @@ export default function AgentPage() {
                 onDelete={handleDelete}
                 showSourceFilter
                 paginate
+                togglingAgents={togglingAgents}
+                onToggleDelegatable={handleToggleDelegatable}
               />
             )}
           </>
@@ -308,6 +294,8 @@ interface AgentSectionProps {
   selectedAgent: Agent | null;
   onSelect: (agent: Agent) => void;
   onDelete: (name: string) => void;
+  togglingAgents: Record<string, boolean>;
+  onToggleDelegatable: (agent: Agent, delegatable: boolean) => void;
   showSourceFilter?: boolean;
   paginate?: boolean;
 }
@@ -321,6 +309,8 @@ function AgentSection({
   selectedAgent,
   onSelect,
   onDelete,
+  togglingAgents,
+  onToggleDelegatable,
   showSourceFilter = false,
   paginate = false,
 }: AgentSectionProps) {
@@ -434,6 +424,8 @@ function AgentSection({
                 isSelected={selectedAgent?.name === agent.name}
                 onClick={() => onSelect(agent)}
                 onDelete={onDelete}
+                toggling={!!togglingAgents[agent.name]}
+                onToggleDelegatable={onToggleDelegatable}
               />
             ))}
           </div>
@@ -463,12 +455,23 @@ interface AgentCardProps {
   isSelected: boolean;
   onClick: () => void;
   onDelete: (name: string) => void;
+  toggling: boolean;
+  onToggleDelegatable: (agent: Agent, delegatable: boolean) => void;
 }
 
-function AgentCard({ agent, displayLang, isSelected, onClick, onDelete }: AgentCardProps) {
+function AgentCard({
+  agent,
+  displayLang,
+  isSelected,
+  onClick,
+  onDelete,
+  toggling,
+  onToggleDelegatable,
+}: AgentCardProps) {
   const { t } = useTranslation('agent');
+  const displayName = getAgentDisplayName(agent, displayLang);
   const displayDesc = getAgentDisplayDescription(agent, displayLang);
-  const color = resolveAgentColor(agent);
+  const showDelegatableToggle = agent.mode === 'subagent';
 
   return (
     <div
@@ -482,24 +485,17 @@ function AgentCard({ agent, displayLang, isSelected, onClick, onDelete }: AgentC
       `}
       onClick={onClick}
     >
-      {/* Top accent bar — 3 px strip, full-width, same radius as card */}
-      <div style={{ height: 3, backgroundColor: color }} />
-
       {/* Card body */}
-      <div className="flex-1 px-4 pt-3 pb-3 flex flex-col gap-2 min-w-0">
+      <div className="flex-1 px-4 pt-3 pb-2 flex flex-col gap-2 min-w-0">
         {/* Avatar + Name row */}
         <div className="flex items-start gap-2.5 min-w-0">
-          {/* Colored avatar */}
-          <div
-            className="w-8 h-8 rounded-lg flex items-center justify-center shrink-0 mt-0.5"
-            style={{ backgroundColor: hexAlpha(color, 0.12) }}
-          >
-            <Bot className="w-4 h-4" style={{ color }} />
+          <div className="w-8 h-8 rounded-lg flex items-center justify-center shrink-0 mt-0.5 bg-gray-100">
+            <Bot className="w-4 h-4 text-gray-500" />
           </div>
 
           <div className="min-w-0 flex-1">
             <span className="block text-sm font-semibold text-gray-900 truncate leading-snug">
-              {agent.name.charAt(0).toUpperCase() + agent.name.slice(1)}
+              {displayName}
             </span>
             {/* Badges row: source badge (always shown) + delegatable */}
             <div className="flex items-center gap-1 mt-0.5 flex-wrap">
@@ -507,19 +503,19 @@ function AgentCard({ agent, displayLang, isSelected, onClick, onDelete }: AgentC
               {agent.native
                 ? (
                   <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium
-                                   bg-blue-50 text-blue-600 border border-blue-200">
+                                   bg-blue-50 text-blue-600">
                     {t('badge.native')}
                   </span>
                 )
                 : (
                   <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium
-                                   bg-teal-50 text-teal-600 border border-teal-200">
+                                   bg-teal-50 text-teal-600">
                     {t('badge.custom')}
                   </span>
                 )
               }
               {agent.delegatable && (
-                <span className="inline-flex items-center px-1.5 py-0.5 rounded border border-gray-200 bg-gray-50 text-gray-500 text-[10px] font-medium">
+                <span className="inline-flex items-center px-1.5 py-0.5 rounded bg-gray-50 text-gray-500 text-[10px] font-medium">
                   {t('badge.delegatable')}
                 </span>
               )}
@@ -534,11 +530,8 @@ function AgentCard({ agent, displayLang, isSelected, onClick, onDelete }: AgentC
 
         {/* Model chip */}
         {agent.model && (
-          <div
-            className="self-start inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] text-gray-500"
-            style={{ backgroundColor: hexAlpha(color, 0.08), border: `1px solid ${hexAlpha(color, 0.2)}` }}
-          >
-            <Cpu className="w-3 h-3 shrink-0" style={{ color }} />
+          <div className="self-start inline-flex items-center gap-1 text-[10px] text-gray-400">
+            <Cpu className="w-3 h-3 shrink-0" />
             <span className="truncate max-w-[120px]">
               {agent.model.modelID}
             </span>
@@ -546,9 +539,9 @@ function AgentCard({ agent, displayLang, isSelected, onClick, onDelete }: AgentC
         )}
       </div>
 
-      {/* Footer — edit + delete buttons */}
+      {/* Footer — delete / enable / edit */}
       <div
-        className="border-t border-gray-100 px-3 py-1.5 flex items-center justify-between"
+        className="border-t border-gray-100 px-4 py-2 flex items-center justify-between"
         onClick={(e) => e.stopPropagation()}
       >
         {/* Delete — disabled for built-in agents */}
@@ -576,18 +569,68 @@ function AgentCard({ agent, displayLang, isSelected, onClick, onDelete }: AgentC
           </button>
         )}
 
-        <button
-          type="button"
-          onClick={onClick}
-          title={t('badge.edit')}
-          aria-label={t('badge.edit')}
-          className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-medium text-gray-400
-                     hover:text-slate-700 hover:bg-gray-50 transition-colors"
-        >
-          <Pencil className="w-3 h-3" />
-          {t('badge.edit')}
-        </button>
+        <div className="flex items-center gap-2">
+          {showDelegatableToggle && (
+            <div className="flex items-center gap-1.5">
+              <span className="text-[11px] font-medium text-gray-400">
+                {t('form.enabled')}
+              </span>
+              <ToggleSwitch
+                enabled={!!agent.delegatable}
+                loading={toggling}
+                title={agent.delegatable ? t('form.enabledTip') : t('form.disabledTip')}
+                onChange={(e) => {
+                  e.stopPropagation();
+                  onToggleDelegatable(agent, !agent.delegatable);
+                }}
+              />
+            </div>
+          )}
+
+          <button
+            type="button"
+            onClick={onClick}
+            title={t('badge.edit')}
+            aria-label={t('badge.edit')}
+            className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-medium text-gray-400
+                       hover:text-slate-700 hover:bg-gray-50 transition-colors"
+          >
+            <Pencil className="w-3 h-3" />
+            {t('badge.edit')}
+          </button>
+        </div>
       </div>
     </div>
+  );
+}
+
+function ToggleSwitch({ enabled, loading, title, onChange }: {
+  enabled: boolean;
+  loading: boolean;
+  title?: string;
+  onChange: (e: React.MouseEvent) => void;
+}) {
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={enabled}
+      onClick={onChange}
+      disabled={loading}
+      title={title}
+      className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full border-2 border-transparent
+        transition-colors duration-150 focus:outline-none disabled:cursor-wait
+        ${enabled ? 'bg-slate-500' : 'bg-gray-200'}`}
+    >
+      {loading
+        ? <Loader2 className="absolute inset-0 m-auto w-3 h-3 text-white animate-spin" />
+        : (
+          <span className={`pointer-events-none inline-block h-4 w-4 rounded-full bg-white shadow
+            transform transition-transform duration-150
+            ${enabled ? 'translate-x-4' : 'translate-x-0'}`}
+          />
+        )
+      }
+    </button>
   );
 }

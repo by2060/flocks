@@ -4,7 +4,7 @@ Core agent data models.
 Consolidates:
   - AgentInfo / AgentModel  (previously flocks.agent.core.agent)
   - AgentPromptMetadata / DelegationTrigger / AvailableAgent /
-    AvailableTool / AvailableSkill / AvailableCategory
+    AvailableTool / AvailableSkill
     (previously flocks.agent.prompts.builder.dynamic)
 
 All other modules should import from here; the old locations are kept
@@ -88,13 +88,6 @@ class AvailableSkill:
 
 
 @dataclass
-class AvailableCategory:
-    """Task delegation category (model preset + domain label)."""
-    name: str
-    description: str
-
-
-@dataclass
 class AvailableWorkflow:
     """Workflow available for execution via run_workflow tool."""
     name: str
@@ -118,6 +111,9 @@ class AgentInfo(BaseModel):
     model_config = {"populate_by_name": True}
 
     name: str
+    # Chinese display name for localized UI. The canonical ``name`` remains the
+    # stable identifier used by tools, routing, storage, and @mentions.
+    name_cn: Optional[str] = None
     description: Optional[str] = None
     # Chinese UI label; English ``description`` is used for delegation prompts / tooling.
     description_cn: Optional[str] = None
@@ -151,7 +147,7 @@ class AgentInfo(BaseModel):
     delegatable: Optional[bool] = None
 
     # "module.path:function_name" called during phase-2 prompt injection.
-    # Signature: (agent_info, available_agents, tools, skills, categories) → None
+    # Signature: (agent_info, available_agents, tools, skills, workflows) → None
     # The function sets agent_info.prompt directly.
     prompt_builder: Optional[str] = Field(default=None)
 

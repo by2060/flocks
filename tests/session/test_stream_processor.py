@@ -30,7 +30,7 @@ from flocks.session.streaming.stream_events import (
     ToolCallEvent,
     ToolInputStartEvent,
 )
-from flocks.session.message import MessageRole
+from flocks.session.message import MessageRole, ToolStateError
 
 
 # ---------------------------------------------------------------------------
@@ -58,11 +58,13 @@ def _make_processor(
     text_callback=None,
     reasoning_callback=None,
     event_callback=None,
+    abort_event=None,
 ):
     return StreamProcessor(
         session_id=session_id,
         assistant_message=_make_assistant_msg(session_id),
         agent=_make_agent(),
+        abort_event=abort_event,
         text_delta_callback=text_callback,
         reasoning_delta_callback=reasoning_callback,
         event_publish_callback=event_callback,
@@ -104,10 +106,24 @@ class TestTextAccumulation:
     @pytest.mark.asyncio
     async def test_text_start_creates_text_part(self):
         proc = _make_processor()
-        with patch.object(proc, 'event_publish_callback', None):
+        with (
+            patch.object(proc, 'event_publish_callback', None),
+            patch("flocks.session.streaming.stream_processor.Message.store_part", new=AsyncMock()),
+        ):
             await proc.process_event(TextStartEvent())
         assert proc.current_text_part is not None
         assert proc.current_text_part.type == "text"
+
+    @pytest.mark.asyncio
+    async def test_text_start_persists_placeholder_immediately(self):
+        proc = _make_processor()
+        with patch("flocks.session.streaming.stream_processor.Message.store_part", new=AsyncMock()) as mock_store:
+            await proc.process_event(TextStartEvent())
+
+        mock_store.assert_awaited_once()
+        stored_part = mock_store.call_args.args[2]
+        assert stored_part.type == "text"
+        assert stored_part.text == ""
 
     @pytest.mark.asyncio
     async def test_text_delta_accumulates(self):
@@ -203,6 +219,136 @@ class TestTextAccumulation:
         assert tool_event.input == {"action": "ops_query_audit_log", "cur_page": 1, "page_size": 10}
         assert proc._text_tool_calls_executed is True
         assert proc.get_text_content() == ""
+
+    @pytest.mark.asyncio
+    async def test_text_delta_hides_dsml_tool_call_from_published_text(self):
+        event_callback = AsyncMock()
+        proc = _make_processor(event_callback=event_callback)
+
+        await proc.process_event(TextStartEvent())
+        await proc.process_event(TextDeltaEvent(text="先查询一下"))
+        await proc.process_event(TextDeltaEvent(text="""
+< | DSML | tool_use>
+{"name":"bash","input":{"command":"ls /root/flocks/plugins/skills/ | head -50"}}
+</ | DSML | tool_use>
+"""))
+
+        published_texts = [
+            call.args[1]["part"]["text"]
+            for call in event_callback.await_args_list
+            if call.args[0] == "message.part.updated" and "part" in call.args[1]
+        ]
+        published_deltas = [
+            call.args[1].get("delta", "")
+            for call in event_callback.await_args_list
+            if call.args[0] == "message.part.updated"
+        ]
+
+        assert published_texts[-1] == "先查询一下"
+        assert all("DSML" not in text for text in published_texts)
+        assert all("DSML" not in delta for delta in published_deltas)
+
+    @pytest.mark.asyncio
+    async def test_text_end_parses_deepseek_dsml_json_tool_use(self):
+        proc = _make_processor()
+
+        with (
+            patch("flocks.session.streaming.stream_processor.Message.store_part", new=AsyncMock()),
+            patch.object(proc, "_handle_tool_call", new=AsyncMock()) as mock_handle_tool_call,
+        ):
+            await proc.process_event(TextStartEvent())
+            await proc.process_event(TextDeltaEvent(text="""
+< | DSML | tool_use>
+{"name":"bash","input":{"command":"RUN_ROOT=/root/flocks/workspace/outputs/2026-08-03/risk-agent/ses_03991c1b0ffeb5KNPtPsetG6Jq && mkdir -p $RUN_ROOT/agent-notes"}}
+</ | DSML | tool_use>
+"""))
+            await proc.process_event(TextEndEvent())
+
+        mock_handle_tool_call.assert_awaited_once()
+        tool_event = mock_handle_tool_call.await_args.args[0]
+        assert tool_event.tool_name == "bash"
+        assert tool_event.input == {
+            "command": "RUN_ROOT=/root/flocks/workspace/outputs/2026-08-03/risk-agent/ses_03991c1b0ffeb5KNPtPsetG6Jq && mkdir -p $RUN_ROOT/agent-notes"
+        }
+        assert proc._text_tool_calls_executed is True
+        assert proc.get_text_content() == ""
+
+    @pytest.mark.asyncio
+    async def test_text_end_parses_deepseek_dsml_invoke_tool_calls(self):
+        proc = _make_processor()
+
+        with (
+            patch("flocks.session.streaming.stream_processor.Message.store_part", new=AsyncMock()),
+            patch.object(proc, "_handle_tool_call", new=AsyncMock()) as mock_handle_tool_call,
+        ):
+            await proc.process_event(TextStartEvent())
+            await proc.process_event(TextDeltaEvent(text="""
+<｜DSML｜tool_calls>
+<｜DSML｜invoke name="search">
+<｜DSML｜parameter name="q" string="true">weather</｜DSML｜parameter>
+<｜DSML｜parameter name="limit" string="false">3</｜DSML｜parameter>
+</｜DSML｜invoke>
+</｜DSML｜tool_calls>
+"""))
+            await proc.process_event(TextEndEvent())
+
+        mock_handle_tool_call.assert_awaited_once()
+        tool_event = mock_handle_tool_call.await_args.args[0]
+        assert tool_event.tool_name == "search"
+        assert tool_event.input == {"q": "weather", "limit": 3}
+        assert proc._text_tool_calls_executed is True
+        assert proc.get_text_content() == ""
+
+    @pytest.mark.asyncio
+    async def test_text_end_parses_deepseek_dsml_ascii_pipe_tool_calls(self):
+        proc = _make_processor()
+
+        with (
+            patch("flocks.session.streaming.stream_processor.Message.store_part", new=AsyncMock()),
+            patch.object(proc, "_handle_tool_call", new=AsyncMock()) as mock_handle_tool_call,
+        ):
+            await proc.process_event(TextStartEvent())
+            await proc.process_event(TextDeltaEvent(text="""
+<||DSML||tool_calls>
+[{"tool_name":"bash","parameters":{"command":"pwd"}}]
+</||DSML||tool_calls>
+"""))
+            await proc.process_event(TextEndEvent())
+
+        mock_handle_tool_call.assert_awaited_once()
+        tool_event = mock_handle_tool_call.await_args.args[0]
+        assert tool_event.tool_name == "bash"
+        assert tool_event.input == {"command": "pwd"}
+        assert proc._text_tool_calls_executed is True
+        assert proc.get_text_content() == ""
+
+    @pytest.mark.asyncio
+    async def test_text_placeholder_keeps_text_before_tool_in_stored_order(self):
+        proc = _make_processor()
+        stored_parts = []
+
+        async def fake_store_part(_session_id, _message_id, part):
+            for idx, existing in enumerate(stored_parts):
+                if existing.id == part.id:
+                    stored_parts[idx] = part
+                    break
+            else:
+                stored_parts.append(part)
+            return part
+
+        with patch(
+            "flocks.session.streaming.stream_processor.Message.store_part",
+            new=AsyncMock(side_effect=fake_store_part),
+        ):
+            await proc.process_event(ReasoningStartEvent(id="r-order"))
+            await proc.process_event(ReasoningDeltaEvent(id="r-order", text="plan"))
+            await proc.process_event(ReasoningEndEvent(id="r-order"))
+            await proc.process_event(TextStartEvent())
+            await proc.process_event(TextDeltaEvent(text="answer"))
+            await proc.process_event(ToolInputStartEvent(id="tc-order", tool_name="bash"))
+            await proc.process_event(TextEndEvent())
+
+        assert [part.type for part in stored_parts] == ["reasoning", "text", "tool"]
 
 
 # ---------------------------------------------------------------------------
@@ -356,6 +502,103 @@ class TestToolInputStart:
 
 class TestToolCallExecution:
     @pytest.mark.asyncio
+    async def test_interrupted_tool_persists_and_publishes_metadata(self):
+        events = []
+
+        async def capture_event(event_type, data):
+            events.append((event_type, data))
+
+        proc = _make_processor(event_callback=capture_event)
+        state = ToolCallState(
+            id="tc_interrupted",
+            name="bash",
+            input={"command": "sleep 1"},
+            part_id="part_interrupted",
+            metadata={"title": "Long-running command"},
+        )
+        with patch(
+            "flocks.session.streaming.stream_processor.Message.store_part",
+            new=AsyncMock(),
+        ) as store_part:
+            await proc._finalize_interrupted_tool_call(
+                tool_state=state,
+                tool_name="bash",
+                tool_input=state.input,
+                tool_call_id=state.id,
+                tool_start_time=1,
+            )
+
+        stored_state = store_part.await_args.args[2].state
+        assert isinstance(stored_state, ToolStateError)
+        assert stored_state.metadata["interrupted"] is True
+        assert stored_state.metadata["title"] == "Long-running command"
+        assert events[0][1]["part"]["state"]["metadata"]["interrupted"] is True
+
+    @pytest.mark.asyncio
+    async def test_pre_execution_cancellation_emits_tool_after(self):
+        proc = _make_processor()
+        payload = {"operation": "tool.execute", "tool_execution": {}}
+
+        with (
+            patch(
+                "flocks.session.tool_execution.build_session_tool_execution_payload",
+                new=AsyncMock(return_value=payload),
+            ),
+            patch(
+                "flocks.hooks.pipeline.HookPipeline.run_tool_after",
+                new=AsyncMock(),
+            ) as tool_after,
+        ):
+            await proc._run_pre_execution_tool_after_hook(
+                tool_name="bash",
+                tool_input={"command": "pwd"},
+                tool_call_id="tc_cancelled",
+                tool_start_time=1,
+            )
+
+        tool_after.assert_awaited_once()
+        outcome = tool_after.await_args.args[0]["outcome"]
+        assert outcome["status"] == "cancelled"
+        assert outcome["error_type"] == "CancelledError"
+
+    @pytest.mark.asyncio
+    async def test_sandbox_block_skips_registry_execution(self):
+        proc = _make_processor()
+        execute = AsyncMock()
+
+        with (
+            patch(
+                "flocks.session.streaming.stream_processor.Message.store_part",
+                new=AsyncMock(),
+            ),
+            patch.object(
+                proc,
+                "_resolve_sandbox_meta",
+                new=AsyncMock(return_value={
+                    "blocked": True,
+                    "error": "Sandbox denied tool",
+                    "extra": {},
+                }),
+            ),
+            patch(
+                "flocks.session.streaming.stream_processor.ToolRegistry.execute",
+                new=execute,
+            ),
+        ):
+            await proc.process_event(
+                ToolInputStartEvent(id="tc_sandbox", tool_name="bash")
+            )
+            await proc.process_event(ToolCallEvent(
+                tool_call_id="tc_sandbox",
+                tool_name="bash",
+                input={"command": "pwd"},
+            ))
+
+        execute.assert_not_awaited()
+        assert proc.tool_calls["tc_sandbox"].status == "error"
+        assert proc.tool_calls["tc_sandbox"].error == "Sandbox denied tool"
+
+    @pytest.mark.asyncio
     async def test_tool_call_executes_tool(self):
         proc = _make_processor()
 
@@ -379,6 +622,252 @@ class TestToolCallExecution:
             )
 
         assert "tc_exec" in proc.tool_calls
+
+    @pytest.mark.asyncio
+    async def test_tool_call_passes_session_abort_event_to_tool_context(self):
+        abort_event = asyncio.Event()
+        proc = _make_processor(abort_event=abort_event)
+        seen_abort = {}
+
+        async def _fake_execute(*, tool_name, ctx, **kwargs):
+            seen_abort["event"] = ctx.abort
+            return ToolResult(success=True, output="ok", title=tool_name, metadata={})
+
+        with (
+            patch("flocks.session.streaming.stream_processor.Message.store_part", new=AsyncMock()),
+            patch("flocks.session.streaming.stream_processor.Message.update_part", new=AsyncMock()),
+            patch(
+                "flocks.session.streaming.stream_processor.ToolRegistry.execute",
+                new=AsyncMock(side_effect=_fake_execute),
+            ),
+        ):
+            await proc.process_event(ToolInputStartEvent(id="tc_abort", tool_name="run_workflow"))
+            await proc.process_event(
+                ToolCallEvent(tool_call_id="tc_abort", tool_name="run_workflow", input={"workflow": "wf.json"})
+            )
+
+        assert seen_abort["event"] is abort_event
+
+    @pytest.mark.asyncio
+    async def test_tool_before_rewrite_is_published_in_running_state(self):
+        event_callback = AsyncMock()
+        proc = _make_processor(event_callback=event_callback)
+
+        async def _fake_tool_before(payload):
+            assert payload["tool"]["input"] == {"ip": "[IP_1]"}
+            payload["tool"]["input"] = {"ip": "10.1.2.3"}
+            ctx = MagicMock()
+            ctx.input = payload
+            ctx.output = {}
+            return ctx
+
+        result = ToolResult(success=True, output="ok", title="ip query", metadata={})
+
+        with (
+            patch("flocks.session.streaming.stream_processor.Message.store_part", new=AsyncMock()),
+            patch("flocks.session.streaming.stream_processor.Message.update_part", new=AsyncMock()),
+            patch(
+                "flocks.session.streaming.stream_processor.ToolRegistry.execute",
+                new=AsyncMock(return_value=result),
+            ),
+            patch(
+                "flocks.hooks.pipeline.HookPipeline.run_tool_before",
+                new=AsyncMock(side_effect=_fake_tool_before),
+            ),
+        ):
+            await proc.process_event(ToolInputStartEvent(id="tc_restore_running", tool_name="ip_query"))
+            await proc.process_event(
+                ToolCallEvent(
+                    tool_call_id="tc_restore_running",
+                    tool_name="ip_query",
+                    input={"ip": "[IP_1]"},
+                )
+            )
+
+        running_inputs = [
+            call.args[1]["part"]["state"]["input"]
+            for call in event_callback.await_args_list
+            if (
+                call.args[0] == "message.part.updated"
+                and call.args[1].get("part", {}).get("type") == "tool"
+                and call.args[1]["part"]["state"]["status"] == "running"
+            )
+        ]
+        assert running_inputs == [{"ip": "10.1.2.3"}]
+
+    @pytest.mark.asyncio
+    async def test_tool_before_failure_allows_tool_execution(self):
+        proc = _make_processor()
+        execute_mock = AsyncMock(return_value=ToolResult(success=True, output="executed", title="ip query"))
+
+        with (
+            patch("flocks.session.streaming.stream_processor.Message.store_part", new=AsyncMock()),
+            patch("flocks.session.streaming.stream_processor.Message.update_part", new=AsyncMock()),
+            patch(
+                "flocks.session.streaming.stream_processor.ToolRegistry.execute",
+                new=execute_mock,
+            ),
+            patch(
+                "flocks.hooks.pipeline.HookPipeline.run_tool_before",
+                new=AsyncMock(side_effect=RuntimeError("redaction restore failed")),
+            ),
+        ):
+            await proc.process_event(ToolInputStartEvent(id="tc_hook_fail", tool_name="ip_query"))
+            await proc.process_event(
+                ToolCallEvent(
+                    tool_call_id="tc_hook_fail",
+                    tool_name="ip_query",
+                    input={"ip": "[[V_IP_ADDRESS_1]]"},
+                )
+            )
+
+        execute_mock.assert_awaited_once()
+        state = proc.tool_calls["tc_hook_fail"]
+        assert state.status == "completed"
+        assert state.output == "executed"
+
+    @pytest.mark.asyncio
+    async def test_cancelled_tool_blocks_late_running_metadata_updates(self):
+        event_callback = AsyncMock()
+        proc = _make_processor(event_callback=event_callback)
+        saved_cb = {}
+
+        async def _cancelled_execute(*, tool_name, ctx, **kwargs):
+            saved_cb["cb"] = ctx._metadata_callback
+            raise asyncio.CancelledError()
+
+        with (
+            patch("flocks.session.streaming.stream_processor.Message.store_part", new=AsyncMock()),
+            patch("flocks.session.streaming.stream_processor.Message.update_part", new=AsyncMock()),
+            patch(
+                "flocks.session.streaming.stream_processor.ToolRegistry.execute",
+                new=AsyncMock(side_effect=_cancelled_execute),
+            ),
+        ):
+            await proc.process_event(ToolInputStartEvent(id="tc_cancel", tool_name="run_workflow"))
+            with pytest.raises(asyncio.CancelledError):
+                await proc.process_event(
+                    ToolCallEvent(tool_call_id="tc_cancel", tool_name="run_workflow", input={"workflow": "wf.json"})
+                )
+
+        baseline_calls = len(event_callback.await_args_list)
+        saved_cb["cb"]({
+            "title": "Running workflow: late-update",
+            "metadata": {"phase": "running", "step_index": 99},
+        })
+        await asyncio.sleep(0)
+        assert len(event_callback.await_args_list) == baseline_calls
+
+    @pytest.mark.asyncio
+    async def test_cancelled_tool_preserves_running_metadata_in_error_state(self):
+        proc = _make_processor()
+        store_part = AsyncMock()
+
+        async def _cancelled_execute(*, tool_name, ctx, **kwargs):
+            ctx.metadata({
+                "title": "Inspect child",
+                "metadata": {
+                    "sessionId": "ses_child_cancelled",
+                    "status": "running",
+                },
+            })
+            await asyncio.sleep(0)
+            raise asyncio.CancelledError()
+
+        with (
+            patch(
+                "flocks.session.streaming.stream_processor.Message.store_part",
+                new=store_part,
+            ),
+            patch(
+                "flocks.session.streaming.stream_processor.Message.update_part",
+                new=AsyncMock(),
+            ),
+            patch(
+                "flocks.session.streaming.stream_processor.ToolRegistry.execute",
+                new=AsyncMock(side_effect=_cancelled_execute),
+            ),
+        ):
+            await proc.process_event(
+                ToolInputStartEvent(id="tc_cancel_metadata", tool_name="run_workflow")
+            )
+            with pytest.raises(asyncio.CancelledError):
+                await proc.process_event(
+                    ToolCallEvent(
+                        tool_call_id="tc_cancel_metadata",
+                        tool_name="run_workflow",
+                        input={"workflow": "wf.json"},
+                    )
+                )
+
+        final_part = store_part.await_args_list[-1].args[2]
+        assert isinstance(final_part.state, ToolStateError)
+        assert final_part.state.metadata == {
+            "title": "Inspect child",
+            "sessionId": "ses_child_cancelled",
+            "status": "interrupted",
+            "interrupted": True,
+        }
+
+    @pytest.mark.asyncio
+    async def test_completed_tool_cancels_pending_running_metadata_tasks(self):
+        proc = _make_processor(event_callback=AsyncMock())
+        created_tasks = []
+
+        class _FakeTask:
+            def __init__(self, coro):
+                self._callbacks = []
+                self.cancelled = False
+                coro.close()
+
+            def add_done_callback(self, callback):
+                self._callbacks.append(callback)
+
+            def cancel(self):
+                if self.cancelled:
+                    return
+                self.cancelled = True
+                for callback in list(self._callbacks):
+                    callback(self)
+
+            def result(self):
+                raise asyncio.CancelledError()
+
+        def _fake_create_task(coro):
+            task = _FakeTask(coro)
+            created_tasks.append(task)
+            return task
+
+        async def _successful_execute(*, tool_name, ctx, **kwargs):
+            ctx.metadata({
+                "title": "Running workflow: inflight-update",
+                "metadata": {"phase": "running", "step_index": 1},
+            })
+            return ToolResult(success=True, output="ok", title=tool_name, metadata={})
+
+        with (
+            patch("flocks.session.streaming.stream_processor.Message.store_part", new=AsyncMock()),
+            patch("flocks.session.streaming.stream_processor.Message.update_part", new=AsyncMock()),
+            patch(
+                "flocks.session.streaming.stream_processor.ToolRegistry.execute",
+                new=_successful_execute,
+            ),
+            patch(
+                "flocks.session.streaming.stream_processor.asyncio.create_task",
+                side_effect=_fake_create_task,
+            ),
+        ):
+            await proc.process_event(ToolInputStartEvent(id="tc_inflight", tool_name="run_workflow"))
+            await proc.process_event(
+                ToolCallEvent(
+                    tool_call_id="tc_inflight",
+                    tool_name="run_workflow",
+                    input={"workflow": "wf.json"},
+                )
+            )
+
+        assert len(created_tasks) == 2
+        assert all(task.cancelled for task in created_tasks)
 
     @pytest.mark.asyncio
     async def test_tool_call_skips_tool_span_without_langfuse_generation(self):
@@ -428,6 +917,50 @@ class TestToolCallExecution:
         assert state.status == "error"
 
     @pytest.mark.asyncio
+    async def test_invalid_tool_call_records_parse_error_without_registry_execution(self):
+        event_callback = AsyncMock()
+        proc = _make_processor(event_callback=event_callback)
+        execute_mock = AsyncMock(return_value=ToolResult(success=True, output="should not run", title="invalid"))
+
+        with (
+            patch("flocks.session.streaming.stream_processor.Message.store_part", new=AsyncMock()) as mock_store,
+            patch("flocks.session.streaming.stream_processor.Message.update_part", new=AsyncMock()),
+            patch(
+                "flocks.session.streaming.stream_processor.ToolRegistry.execute",
+                new=execute_mock,
+            ),
+        ):
+            await proc.process_event(
+                ToolCallEvent(
+                    tool_call_id="tc_invalid",
+                    tool_name="invalid",
+                    input={
+                        "tool": "edit",
+                        "error": "Failed to parse tool arguments (123 chars). Please ensure valid JSON.",
+                        "arguments_preview": "{\"file_path\":",
+                    },
+                )
+            )
+
+        execute_mock.assert_not_awaited()
+        state = proc.tool_calls["tc_invalid"]
+        assert state.status == "error"
+        assert "Failed to parse tool arguments for edit" in state.error
+        assert "Failed to parse tool arguments (123 chars)" in state.error
+
+        completed_part = mock_store.await_args_list[-1].args[2]
+        assert completed_part.tool == "edit"
+        assert completed_part.state.status == "error"
+        assert completed_part.state.input["tool"] == "edit"
+        assert completed_part.state.input["arguments_preview"] == "{\"file_path\":"
+        assert completed_part.state.error == state.error
+
+        published_part = event_callback.await_args_list[-1].args[1]["part"]
+        assert published_part["tool"] == "edit"
+        assert published_part["state"]["status"] == "error"
+        assert published_part["state"]["error"] == state.error
+
+    @pytest.mark.asyncio
     async def test_tool_start_callback_called(self):
         callback = AsyncMock()
         proc = _make_processor()
@@ -453,6 +986,68 @@ class TestToolCallExecution:
             )
 
         callback.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_tool_span_records_full_output(self):
+        proc = _make_processor()
+        proc._langfuse_generation = object()
+        long_output = "tool output " * 120
+        span_ctx = MagicMock()
+
+        successful_result = ToolResult(
+            success=True,
+            output=long_output,
+            title="bash",
+            metadata={},
+        )
+
+        with (
+            patch("flocks.session.streaming.stream_processor.Message.store_part", new=AsyncMock()),
+            patch("flocks.session.streaming.stream_processor.Message.update_part", new=AsyncMock()),
+            patch(
+                "flocks.session.streaming.stream_processor.ToolRegistry.execute",
+                new=AsyncMock(return_value=successful_result),
+            ),
+            patch("flocks.session.streaming.stream_processor.span_scope", return_value=span_ctx),
+        ):
+            await proc.process_event(ToolInputStartEvent(id="tc_span_output", tool_name="bash"))
+            await proc.process_event(
+                ToolCallEvent(tool_call_id="tc_span_output", tool_name="bash", input={"command": "ls -la"})
+            )
+
+        assert span_ctx.end.call_count == 1
+        assert span_ctx.end.call_args.kwargs["output"] == long_output
+
+    @pytest.mark.asyncio
+    async def test_tool_span_records_full_error(self):
+        proc = _make_processor()
+        proc._langfuse_generation = object()
+        long_error = "tool error " * 120
+        span_ctx = MagicMock()
+
+        failed_result = ToolResult(
+            success=False,
+            error=long_error,
+            metadata={},
+        )
+
+        with (
+            patch("flocks.session.streaming.stream_processor.Message.store_part", new=AsyncMock()),
+            patch("flocks.session.streaming.stream_processor.Message.update_part", new=AsyncMock()),
+            patch(
+                "flocks.session.streaming.stream_processor.ToolRegistry.execute",
+                new=AsyncMock(return_value=failed_result),
+            ),
+            patch("flocks.session.streaming.stream_processor.span_scope", return_value=span_ctx),
+        ):
+            await proc.process_event(ToolInputStartEvent(id="tc_span_error", tool_name="bash"))
+            await proc.process_event(
+                ToolCallEvent(tool_call_id="tc_span_error", tool_name="bash", input={"command": "false"})
+            )
+
+        assert span_ctx.end.call_count == 1
+        assert span_ctx.end.call_args.kwargs["output"] == long_error
+        assert span_ctx.end.call_args.kwargs["level"] == "ERROR"
 
     @pytest.mark.asyncio
     async def test_tool_error_falls_back_to_metadata_output(self):

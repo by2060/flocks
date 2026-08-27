@@ -10,6 +10,8 @@ Covers:
 - SessionRunner construction and abort behavior (from existing tests)
 """
 
+import httpcore
+import httpx
 import pytest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch, AsyncMock
@@ -31,7 +33,7 @@ from flocks.session.runner import (
     StepResult,
     ToolCall,
 )
-from flocks.session.prompt import SessionPrompt
+from flocks.session.prompt import SessionPrompt, get_prompt_flocks_config_guard
 from flocks.session.core.defaults import DEFAULT_MAX_TOOL_STEPS
 from flocks.session.session import Session, SessionInfo
 from flocks.tool.registry import ToolCategory, ToolInfo
@@ -250,6 +252,70 @@ class TestExceptionToErrorDict:
         exc = Exception("Connection timed out after 30s")
         result = runner._exception_to_error_dict(exc)
         assert result["data"]["isRetryable"] is True
+
+    def test_connection_error_exception_is_retryable(self):
+        runner = _make_runner()
+        exc = Exception("Connection error.")
+        result = runner._exception_to_error_dict(exc)
+        assert result["name"] == "APIError"
+        assert result["data"]["isRetryable"] is True
+        assert result["data"]["displayMessage"] == runner_mod.CONNECTION_ERROR_DISPLAY_MESSAGE
+
+    def test_incomplete_chunked_read_exception_is_retryable_connection_error(self):
+        runner = _make_runner()
+        exc = Exception(
+            "peer closed connection without sending complete message body "
+            "(incomplete chunked read)"
+        )
+        result = runner._exception_to_error_dict(exc)
+        assert result["name"] == "APIError"
+        assert result["data"]["isRetryable"] is True
+        assert result["data"]["displayMessage"] == runner_mod.CONNECTION_ERROR_DISPLAY_MESSAGE
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            httpx.ReadError("", request=httpx.Request("GET", "https://example.test")),
+            httpx.RemoteProtocolError(
+                "",
+                request=httpx.Request("GET", "https://example.test"),
+            ),
+            httpcore.ReadError(),
+            httpcore.RemoteProtocolError(),
+        ],
+    )
+    def test_empty_transport_exception_is_retryable_connection_error(self, exc):
+        runner = _make_runner()
+
+        result = runner._exception_to_error_dict(exc)
+
+        assert result["name"] == "APIError"
+        assert result["data"]["isRetryable"] is True
+        assert result["data"]["isConnectionError"] is True
+        assert result["data"]["displayMessage"] == runner_mod.CONNECTION_ERROR_DISPLAY_MESSAGE
+        assert result["data"]["exceptionType"] == type(exc).__name__
+
+    def test_wrapped_transport_exception_is_retryable_connection_error(self):
+        runner = _make_runner()
+        transport_error = httpcore.ReadError()
+        exc = RuntimeError("stream failed")
+        exc.__cause__ = transport_error
+
+        result = runner._exception_to_error_dict(exc)
+
+        assert result["name"] == "APIError"
+        assert result["data"]["isRetryable"] is True
+        assert result["data"]["isConnectionError"] is True
+        assert result["data"]["exceptionType"] == "RuntimeError"
+        assert result["data"]["transportExceptionType"] == "ReadError"
+
+    def test_empty_non_transport_exception_is_not_retryable(self):
+        runner = _make_runner()
+
+        result = runner._exception_to_error_dict(RuntimeError())
+
+        assert result["name"] == "RuntimeError"
+        assert result["data"].get("isRetryable") is not True
 
     def test_exception_with_status_code_429(self):
         runner = _make_runner()
@@ -553,7 +619,7 @@ class TestBuildTools:
             "flocks.skill.skill.Skill.list_enabled",
             AsyncMock(return_value=[SimpleNamespace(name="agent-builder")]),
         ), patch(
-            "flocks.tool.system.skill_load.build_description",
+            "flocks.tool.skill.skill_load.build_description",
             return_value="Refreshed skill description",
         ):
             tools = await runner._build_callable_tool_schema(agent, [])
@@ -577,6 +643,7 @@ class TestBuildSystemPrompts:
         custom_mock = AsyncMock(return_value=["custom prompt"])
         sandbox_mock = AsyncMock(return_value="sandbox prompt")
         channel_mock = AsyncMock(return_value="channel prompt")
+        device_mock = AsyncMock(return_value="device prompt")
 
         with patch("flocks.session.prompt.SystemPrompt.provider", return_value=["provider prompt"]), \
              patch("flocks.session.prompt.SystemPrompt.environment_stable", env_mock), \
@@ -595,6 +662,8 @@ class TestBuildSystemPrompts:
                 sandbox_prompt_factory=sandbox_mock,
                 channel_context_prompt_factory=channel_mock,
                 tool_catalog_prompt_factory=lambda: "tool catalog",
+                device_asset_prompt_factory=device_mock,
+                device_revision=7,
             )
             prompts2 = await SessionPrompt.build_system_prompts(
                 session_id=session.id,
@@ -609,6 +678,8 @@ class TestBuildSystemPrompts:
                 sandbox_prompt_factory=sandbox_mock,
                 channel_context_prompt_factory=channel_mock,
                 tool_catalog_prompt_factory=lambda: "tool catalog",
+                device_asset_prompt_factory=device_mock,
+                device_revision=7,
             )
 
         assert prompts1 == prompts2
@@ -617,6 +688,7 @@ class TestBuildSystemPrompts:
         custom_mock.assert_awaited_once()
         sandbox_mock.assert_awaited_once()
         channel_mock.assert_awaited_once()
+        device_mock.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_build_system_prompts_orders_stable_prefix_before_runtime_tail(self):
@@ -634,6 +706,7 @@ class TestBuildSystemPrompts:
         }
         sandbox_mock = AsyncMock(return_value="sandbox prompt")
         channel_mock = AsyncMock(return_value="channel prompt")
+        device_mock = AsyncMock(return_value="device prompt")
 
         with patch("flocks.session.prompt.SystemPrompt.provider", return_value=["provider prompt"]), \
              patch.object(SessionPrompt, "_build_tool_guidance_prompt", return_value="tool protocol"), \
@@ -647,20 +720,32 @@ class TestBuildSystemPrompts:
                 agent_prompt=agent.prompt,
                 provider_id=runner.provider_id,
                 model_id=runner.model_id,
-                prompt_tool_names=("bash", "memory_search", "read"),
+                prompt_tool_names=(
+                    "bash",
+                    "edit",
+                    "glob",
+                    "grep",
+                    "memory_search",
+                    "read",
+                    "write",
+                ),
                 memory_bootstrap_data=memory_bootstrap_data,
                 tool_catalog_prompt_factory=lambda: "tool catalog",
+                device_asset_prompt_factory=device_mock,
+                device_revision=3,
                 sandbox_prompt_factory=sandbox_mock,
                 channel_context_prompt_factory=channel_mock,
             )
 
         assert prompts == [
             "provider prompt",
+            get_prompt_flocks_config_guard().strip(),
             "tool protocol",
             "memory guidance",
             "agent prompt",
             "## MEMORY.md\n\nremembered context",
             "tool catalog",
+            "device prompt",
             "env prompt",
             "custom prompt",
             "sandbox prompt",
@@ -681,6 +766,7 @@ class TestBuildSystemPrompts:
         custom_mock = AsyncMock(return_value=["custom prompt"])
         sandbox_mock = AsyncMock(return_value="sandbox prompt")
         channel_mock = AsyncMock(return_value="channel prompt")
+        device_mock = AsyncMock(return_value="device prompt")
 
         catalog_prompts = iter(["tool catalog v1", "tool catalog v2"])
 
@@ -701,6 +787,8 @@ class TestBuildSystemPrompts:
                 sandbox_prompt_factory=sandbox_mock,
                 channel_context_prompt_factory=channel_mock,
                 tool_catalog_prompt_factory=lambda: next(catalog_prompts),
+                device_asset_prompt_factory=device_mock,
+                device_revision=1,
             )
             agent.prompt = "agent prompt v2"
             prompts2 = await SessionPrompt.build_system_prompts(
@@ -716,6 +804,8 @@ class TestBuildSystemPrompts:
                 sandbox_prompt_factory=sandbox_mock,
                 channel_context_prompt_factory=channel_mock,
                 tool_catalog_prompt_factory=lambda: next(catalog_prompts),
+                device_asset_prompt_factory=device_mock,
+                device_revision=1,
             )
 
         assert prompts1 != prompts2
@@ -723,6 +813,126 @@ class TestBuildSystemPrompts:
         assert "agent prompt v2" in prompts2
         assert "tool catalog v1" in prompts1
         assert "tool catalog v2" in prompts2
+        env_mock.assert_called_once()
+        runtime_mock.assert_called_once()
+        custom_mock.assert_awaited_once()
+        sandbox_mock.assert_awaited_once()
+        channel_mock.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_build_system_prompts_reuses_static_device_hint_cache(self):
+        shared_cache = {}
+        session = _make_session("ses_prompts_static_device_hint")
+        runner = SessionRunner(session=session, static_cache=shared_cache)
+        agent = _make_agent(name="rex")
+        agent.prompt = "agent prompt"
+
+        env_mock = MagicMock(return_value=["env prompt"])
+        runtime_mock = MagicMock(return_value=["runtime prompt"])
+        custom_mock = AsyncMock(return_value=["custom prompt"])
+        sandbox_mock = AsyncMock(return_value="sandbox prompt")
+        channel_mock = AsyncMock(return_value="channel prompt")
+        device_mock = AsyncMock(return_value="device prompt")
+
+        with patch("flocks.session.prompt.SystemPrompt.provider", return_value=["provider prompt"]), \
+             patch("flocks.session.prompt.SystemPrompt.environment_stable", env_mock), \
+             patch("flocks.session.prompt.SystemPrompt.runtime_metadata", runtime_mock), \
+             patch("flocks.session.prompt.SystemPrompt.custom", custom_mock):
+            prompts1 = await SessionPrompt.build_system_prompts(
+                session_id=session.id,
+                session_directory=session.directory,
+                agent_name=agent.name,
+                agent_prompt=agent.prompt,
+                provider_id=runner.provider_id,
+                model_id=runner.model_id,
+                prompt_tool_names=("read",),
+                tool_revision=1,
+                static_cache=shared_cache,
+                sandbox_prompt_factory=sandbox_mock,
+                channel_context_prompt_factory=channel_mock,
+                tool_catalog_prompt_factory=lambda: "tool catalog",
+                device_asset_prompt_factory=device_mock,
+            )
+            prompts2 = await SessionPrompt.build_system_prompts(
+                session_id=session.id,
+                session_directory=session.directory,
+                agent_name=agent.name,
+                agent_prompt=agent.prompt,
+                provider_id=runner.provider_id,
+                model_id=runner.model_id,
+                prompt_tool_names=("read",),
+                tool_revision=1,
+                static_cache=shared_cache,
+                sandbox_prompt_factory=sandbox_mock,
+                channel_context_prompt_factory=channel_mock,
+                tool_catalog_prompt_factory=lambda: "tool catalog",
+                device_asset_prompt_factory=device_mock,
+            )
+
+        assert prompts1 == prompts2
+        assert "device prompt" in prompts1
+        env_mock.assert_called_once()
+        runtime_mock.assert_called_once()
+        custom_mock.assert_awaited_once()
+        sandbox_mock.assert_awaited_once()
+        channel_mock.assert_awaited_once()
+        device_mock.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_build_system_prompts_rebuilds_when_device_revision_changes(self):
+        shared_cache = {}
+        session = _make_session("ses_prompts_device_revision")
+        runner = SessionRunner(session=session, static_cache=shared_cache)
+        agent = _make_agent(name="rex")
+        agent.prompt = "agent prompt"
+
+        env_mock = MagicMock(return_value=["env prompt"])
+        runtime_mock = MagicMock(return_value=["runtime prompt"])
+        custom_mock = AsyncMock(return_value=["custom prompt"])
+        sandbox_mock = AsyncMock(return_value="sandbox prompt")
+        channel_mock = AsyncMock(return_value="channel prompt")
+        device_prompts = iter(["device prompt v1", "device prompt v2"])
+
+        with patch("flocks.session.prompt.SystemPrompt.provider", return_value=["provider prompt"]), \
+             patch("flocks.session.prompt.SystemPrompt.environment_stable", env_mock), \
+             patch("flocks.session.prompt.SystemPrompt.runtime_metadata", runtime_mock), \
+             patch("flocks.session.prompt.SystemPrompt.custom", custom_mock):
+            prompts1 = await SessionPrompt.build_system_prompts(
+                session_id=session.id,
+                session_directory=session.directory,
+                agent_name=agent.name,
+                agent_prompt=agent.prompt,
+                provider_id=runner.provider_id,
+                model_id=runner.model_id,
+                prompt_tool_names=("read",),
+                tool_revision=1,
+                static_cache=shared_cache,
+                sandbox_prompt_factory=sandbox_mock,
+                channel_context_prompt_factory=channel_mock,
+                tool_catalog_prompt_factory=lambda: "tool catalog",
+                device_asset_prompt_factory=AsyncMock(side_effect=lambda: next(device_prompts)),
+                device_revision=1,
+            )
+            prompts2 = await SessionPrompt.build_system_prompts(
+                session_id=session.id,
+                session_directory=session.directory,
+                agent_name=agent.name,
+                agent_prompt=agent.prompt,
+                provider_id=runner.provider_id,
+                model_id=runner.model_id,
+                prompt_tool_names=("read",),
+                tool_revision=1,
+                static_cache=shared_cache,
+                sandbox_prompt_factory=sandbox_mock,
+                channel_context_prompt_factory=channel_mock,
+                tool_catalog_prompt_factory=lambda: "tool catalog",
+                device_asset_prompt_factory=AsyncMock(side_effect=lambda: next(device_prompts)),
+                device_revision=2,
+            )
+
+        assert prompts1 != prompts2
+        assert "device prompt v1" in prompts1
+        assert "device prompt v2" in prompts2
         env_mock.assert_called_once()
         runtime_mock.assert_called_once()
         custom_mock.assert_awaited_once()
@@ -777,7 +987,7 @@ class TestBuildSystemPrompts:
         custom_mock.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_build_system_prompts_includes_memory_guidance_when_memory_tools_loaded(self):
+    async def test_build_system_prompts_includes_filesystem_memory_guidance(self):
         session = _make_session("ses_prompts_memory_guidance")
         runner = SessionRunner(
             session=session,
@@ -804,7 +1014,14 @@ class TestBuildSystemPrompts:
                 agent_prompt=agent.prompt,
                 provider_id=runner.provider_id,
                 model_id=runner.model_id,
-                prompt_tool_names=("memory_search", "read"),
+                prompt_tool_names=(
+                    "edit",
+                    "glob",
+                    "grep",
+                    "memory_search",
+                    "read",
+                    "write",
+                ),
                 memory_bootstrap_data=runner._memory_bootstrap_data,
             )
 
@@ -839,7 +1056,7 @@ class TestBuildSystemPrompts:
         assert "PowerShell syntax" not in combined
 
     @pytest.mark.asyncio
-    async def test_build_system_prompts_skips_memory_guidance_without_memory_tools(self):
+    async def test_build_system_prompts_skips_memory_guidance_without_management_tools(self):
         session = _make_session("ses_prompts_no_memory_guidance")
         runner = SessionRunner(
             session=session,
@@ -874,7 +1091,7 @@ class TestBuildSystemPrompts:
         assert "## MEMORY.md\n\nremembered context" in prompts
 
     @pytest.mark.asyncio
-    async def test_build_system_prompts_rebuilds_when_prompt_tool_names_change(self):
+    async def test_filesystem_memory_guidance_depends_on_tool_names(self):
         shared_cache = {}
         session = _make_session("ses_prompts_tool_names")
         runner = SessionRunner(
@@ -903,7 +1120,14 @@ class TestBuildSystemPrompts:
                 agent_prompt=agent.prompt,
                 provider_id=runner.provider_id,
                 model_id=runner.model_id,
-                prompt_tool_names=("memory_search", "read"),
+                prompt_tool_names=(
+                    "edit",
+                    "glob",
+                    "grep",
+                    "memory_search",
+                    "read",
+                    "write",
+                ),
                 tool_revision=1,
                 memory_bootstrap_data=runner._memory_bootstrap_data,
                 static_cache=shared_cache,
@@ -999,6 +1223,49 @@ class TestBuildSystemPrompts:
         assert "plugin_memory" in prompt
         assert "bash" not in prompt
         assert "question" not in prompt
+        formatter_tools = formatter_mock.call_args.kwargs["tools"]
+        assert [tool.name for tool in formatter_tools] == ["plugin_memory"]
+
+    def test_build_tool_catalog_prompt_for_rex_excludes_device_tools(self):
+        runner = _make_runner()
+        agent = _make_agent(name="rex")
+        agent.mode = "primary"
+        catalog_tools = [
+            ToolInfo(
+                name="tdp_event_list",
+                description="List TDP events",
+                category=ToolCategory.CUSTOM,
+                native=False,
+                enabled=True,
+                source="device",
+            ),
+            ToolInfo(
+                name="plugin_memory",
+                description="Access project memory",
+                category=ToolCategory.CUSTOM,
+                native=False,
+                enabled=True,
+            ),
+        ]
+
+        with patch(
+            "flocks.session.runner.SessionRunner._list_catalog_tool_infos",
+            return_value=catalog_tools,
+        ), patch(
+            "flocks.agent.toolset.get_all_enabled_builtin_tool_names",
+            return_value=["bash", "read"],
+        ), patch(
+            "flocks.session.runner.get_always_load_tool_names",
+            return_value={"question", "tool_search"},
+        ), patch(
+            "flocks.command.direct.format_tools_catalog_summary",
+            side_effect=lambda tools, **_: "\n".join(tool.name for tool in tools),
+        ) as formatter_mock:
+            prompt = runner._build_tool_catalog_prompt(agent)
+
+        assert prompt is not None
+        assert "plugin_memory" in prompt
+        assert "tdp_event_list" not in prompt
         formatter_tools = formatter_mock.call_args.kwargs["tools"]
         assert [tool.name for tool in formatter_tools] == ["plugin_memory"]
 
@@ -1284,6 +1551,27 @@ async def test_to_chat_messages_invalidates_shared_cache_when_message_parts_chan
     assert second_messages[1].role == "tool"
     assert second_messages[1].tool_call_id == "call_cache_fix"
     assert second_messages[1].content == "Error: Tool execution was interrupted"
+
+
+@pytest.mark.asyncio
+async def test_to_chat_messages_excludes_ignored_assistant_text():
+    session = await Session.create(
+        project_id="test_runner_ignored_command_output",
+        directory="/tmp/runner-ignored-command-output",
+    )
+    assistant_message = await Message.create(
+        session_id=session.id,
+        role=MessageRole.ASSISTANT,
+        content="Available Tools\n" + ("x" * 400),
+        providerID="builtin",
+        modelID="command",
+        ignored=True,
+    )
+    runner = SessionRunner(session=session, static_cache={})
+
+    chat_messages = await runner._to_chat_messages([assistant_message], [])
+
+    assert chat_messages == []
 
 
 @pytest.mark.asyncio
@@ -1789,10 +2077,122 @@ async def test_to_chat_messages_keeps_reasoning_only_assistant_message(monkeypat
     assert chat_messages[0].reasoning_source == "promoted_reasoning"
 
 
+def test_get_queued_user_message_ids_only_marks_newly_queued_turns():
+    runner = _make_runner("ses_runner_queued_users")
+    runner._step = 3
+
+    queued_user_ids = runner._get_queued_user_message_ids([
+        SimpleNamespace(id="msg_100", role="assistant", finish="stop"),
+        SimpleNamespace(id="msg_200", role="user"),
+        SimpleNamespace(id="msg_300", role="user"),
+        SimpleNamespace(id="msg_400", role="user"),
+    ])
+
+    assert queued_user_ids == {"msg_300", "msg_400"}
+
+
+@pytest.mark.asyncio
+async def test_to_chat_messages_wraps_only_queued_user_messages():
+    session = await Session.create(
+        project_id="test_runner_queued_wrap",
+        directory="/tmp/runner-queued-wrap",
+    )
+    finished_assistant = await Message.create(
+        session_id=session.id,
+        role=MessageRole.ASSISTANT,
+        content="Initial answer",
+    )
+    root_user = await Message.create(
+        session_id=session.id,
+        role=MessageRole.USER,
+        content="Continue fixing the bug",
+    )
+    queued_user = await Message.create(
+        session_id=session.id,
+        role=MessageRole.USER,
+        content="What version is installed?",
+    )
+
+    runner = SessionRunner(session=session, static_cache={})
+    runner._step = 3
+    runner._queued_user_message_ids = {queued_user.id}
+
+    chat_messages = await runner._to_chat_messages(
+        [
+            SimpleNamespace(
+                id=finished_assistant.id,
+                role=MessageRole.ASSISTANT,
+                finish="stop",
+                error=None,
+                compacted=False,
+            ),
+            root_user,
+            queued_user,
+        ],
+        [],
+    )
+
+    user_messages = [message for message in chat_messages if message.role == "user"]
+    assert len(user_messages) == 2
+    assert user_messages[0].content == "Continue fixing the bug"
+    assert isinstance(user_messages[1].content, str)
+    assert user_messages[1].content.startswith("<system-reminder>")
+    assert "What version is installed?" in user_messages[1].content
+
+
+@pytest.mark.asyncio
+async def test_to_chat_messages_skips_reasoning_only_aborted_assistant(monkeypatch):
+    runner = _make_runner("ses_runner_aborted_reasoning_only")
+    runner.provider_id = "alibaba"
+    runner.model_id = "qwen3-max"
+
+    monkeypatch.setattr(
+        runner_mod.Provider,
+        "resolve_model",
+        lambda provider_id, model_id: SimpleNamespace(
+            capabilities=SimpleNamespace(
+                interleaved={
+                    "field": "reasoning_content",
+                    "echo": "tool_calls",
+                    "cross_provider_policy": "promote",
+                }
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        runner_mod.Message,
+        "parts",
+        AsyncMock(return_value=[
+            ReasoningPart(
+                sessionID=runner.session.id,
+                messageID="msg_aborted_reasoning_only",
+                text="This should not leak into replay history.",
+                time=PartTime(start=1),
+            )
+        ]),
+    )
+    monkeypatch.setattr(runner_mod.Message, "get_parts_revision", lambda *_args: 1)
+
+    chat_messages = await runner._to_chat_messages(
+        [
+            SimpleNamespace(
+                id="msg_aborted_reasoning_only",
+                role=MessageRole.ASSISTANT,
+                finish="error",
+                error={"name": "MessageAbortedError"},
+                compacted=False,
+            )
+        ],
+        [],
+    )
+
+    assert chat_messages == []
+
+
 def test_provider_capability_key_includes_interleaved_policy(monkeypatch):
     runner = _make_runner("ses_runner_interleaved_capability_key")
     runner.provider_id = "deepseek"
-    runner.model_id = "deepseek-reasoner"
+    runner.model_id = "deepseek-v4-pro"
 
     monkeypatch.setattr(SessionRunner, "_model_supports_vision", lambda self: False)
     monkeypatch.setattr(
@@ -1864,6 +2264,201 @@ async def test_process_step_creates_assistant_message_with_provider_and_model(mo
 
 
 @pytest.mark.asyncio
+async def test_process_step_invalidates_chat_cache_for_queued_messages(monkeypatch):
+    runner = _make_runner("ses_runner_queued_cache_invalidation")
+    runner._step = 3
+    runner._static_cache["chat_context_cache"] = {
+        "latest": {
+            "system_cache_key": "cached",
+            "message_signatures": [],
+            "chat_messages": [{"role": "user", "content": "stale"}],
+        }
+    }
+    runner.callbacks = RunnerCallbacks(on_error=AsyncMock())
+
+    root_user = SimpleNamespace(id="msg_200", role="user")
+    last_user = UserMessageInfo(
+        id="msg_300",
+        sessionID=runner.session.id,
+        role="user",
+        time={"created": 1_000},
+        agent="rex",
+        model={"providerID": "anthropic", "modelID": "claude-sonnet"},
+    )
+    messages = [
+        SimpleNamespace(id="msg_100", role="assistant", finish="stop"),
+        root_user,
+        last_user,
+    ]
+
+    agent = SimpleNamespace(name="rex", steps=None, mode="primary", prompt="", tools=[])
+    provider = MagicMock()
+    provider.is_configured.return_value = True
+    assistant_msg = SimpleNamespace(id="msg_assistant_queued_cache")
+
+    async def fake_to_chat_messages(_messages, _system_prompts):  # noqa: ANN001
+        assert "chat_context_cache" not in runner._static_cache
+        assert runner._queued_user_message_ids == {last_user.id}
+        return [SimpleNamespace(role="user", content="queued")]
+
+    monkeypatch.setattr(runner_mod.Agent, "get", AsyncMock(return_value=agent))
+    monkeypatch.setattr(runner_mod.Provider, "get", lambda provider_id: provider)
+    monkeypatch.setattr(runner_mod.Provider, "apply_config", AsyncMock(return_value=None))
+    monkeypatch.setattr(runner_mod.SessionPrompt, "build_system_prompts", AsyncMock(return_value=[]))
+    monkeypatch.setattr(runner, "_build_callable_tool_schema", AsyncMock(return_value=[]))
+    monkeypatch.setattr(runner, "_to_chat_messages", fake_to_chat_messages)
+    monkeypatch.setattr(runner_mod.Message, "get_text_content", AsyncMock(return_value="queued"))
+    monkeypatch.setattr(runner_mod.Message, "create", AsyncMock(return_value=assistant_msg))
+    monkeypatch.setattr(runner_mod.Message, "update", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        runner,
+        "_call_llm",
+        AsyncMock(return_value=StepResult(action="stop", content="done")),
+    )
+
+    result = await runner._process_step(messages, last_user)
+
+    assert result.action == "stop"
+    assert result.content == "done"
+
+
+@pytest.mark.asyncio
+async def test_process_step_limits_connection_error_retries(monkeypatch):
+    runner = _make_runner("ses_runner_connection_error")
+    runner.callbacks = RunnerCallbacks(on_error=AsyncMock())
+
+    last_user = UserMessageInfo(
+        id="msg_user_connection_error",
+        sessionID=runner.session.id,
+        role="user",
+        time={"created": 1_000},
+        agent="rex",
+        model={"providerID": "bailian", "modelID": "deepseek-v4-flash"},
+    )
+    agent = SimpleNamespace(name="rex", steps=None, mode="primary", prompt="", tools=[])
+    provider = MagicMock()
+    provider.is_configured.return_value = True
+    assistant_msg = SimpleNamespace(id="msg_assistant_connection_error")
+    update_mock = AsyncMock(return_value=None)
+    warn_log = MagicMock()
+    error_log = MagicMock()
+    call_count = 0
+
+    async def fake_call_llm(*_args, **_kwargs):
+        nonlocal call_count
+        call_count += 1
+        raise Exception("Connection error.")
+
+    monkeypatch.setattr(runner_mod.Agent, "get", AsyncMock(return_value=agent))
+    monkeypatch.setattr(runner_mod.Provider, "get", lambda provider_id: provider)
+    monkeypatch.setattr(runner_mod.Provider, "apply_config", AsyncMock(return_value=None))
+    monkeypatch.setattr(runner_mod.SessionPrompt, "build_system_prompts", AsyncMock(return_value=[]))
+    monkeypatch.setattr(runner, "_build_callable_tool_schema", AsyncMock(return_value=[]))
+    monkeypatch.setattr(
+        runner,
+        "_to_chat_messages",
+        AsyncMock(return_value=[SimpleNamespace(role="user", content="hi")]),
+    )
+    monkeypatch.setattr(runner_mod.Message, "get_text_content", AsyncMock(return_value="hi"))
+    monkeypatch.setattr(runner_mod.Message, "create", AsyncMock(return_value=assistant_msg))
+    monkeypatch.setattr(runner_mod.Message, "update", update_mock)
+    monkeypatch.setattr(runner_mod.SessionRetry, "sleep", AsyncMock(return_value=None))
+    monkeypatch.setattr(runner, "_call_llm", fake_call_llm)
+    monkeypatch.setattr(runner_mod.log, "warn", warn_log)
+    monkeypatch.setattr(runner_mod.log, "error", error_log)
+
+    result = await runner._process_step([last_user], last_user)
+
+    assert call_count == 6
+    assert result.action == "stop"
+    assert result.error == runner_mod.CONNECTION_ERROR_DISPLAY_MESSAGE
+    runner.callbacks.on_error.assert_awaited_with(runner_mod.CONNECTION_ERROR_DISPLAY_MESSAGE)
+
+    final_update = update_mock.await_args_list[-1].kwargs
+    assert final_update["finish"] == "error"
+    assert final_update["error"]["data"]["message"] == "Connection error."
+    assert final_update["error"]["data"]["displayMessage"] == runner_mod.CONNECTION_ERROR_DISPLAY_MESSAGE
+
+    retry_logs = [
+        call for call in warn_log.call_args_list
+        if call.args and call.args[0] == "runner.step.retry"
+    ]
+    max_retry_logs = [
+        call for call in error_log.call_args_list
+        if call.args and call.args[0] == "runner.step.max_retries_exceeded"
+    ]
+    assert len(retry_logs) == 5
+    assert len(max_retry_logs) == 1
+    assert not any(
+        call.args and call.args[0] == "runner.step.error"
+        for call in [*warn_log.call_args_list, *error_log.call_args_list]
+    )
+
+
+@pytest.mark.asyncio
+async def test_process_step_marks_aborted_llm_message_as_error(monkeypatch):
+    runner = _make_runner("ses_runner_aborted_result")
+    runner.callbacks = RunnerCallbacks(on_error=AsyncMock())
+
+    last_user = UserMessageInfo(
+        id="msg_user_aborted_result",
+        sessionID=runner.session.id,
+        role="user",
+        time={"created": 1_000},
+        agent="rex",
+        model={"providerID": "anthropic", "modelID": "claude-sonnet"},
+    )
+    agent = SimpleNamespace(name="rex", steps=None, mode="primary", prompt="", tools=[])
+    provider = MagicMock()
+    provider.is_configured.return_value = True
+    assistant_msg = SimpleNamespace(id="msg_assistant_aborted_result")
+    update_mock = AsyncMock(return_value=None)
+    record_usage_mock = AsyncMock(return_value=None)
+    usage = {"prompt_tokens": 9, "completion_tokens": 4, "total_tokens": 13}
+
+    async def fake_call_llm(*_args, **_kwargs):
+        runner._llm_call_aborted = True
+        return StepResult(
+            action="continue",
+            content="partial answer",
+            tool_calls=[ToolCall(id="call_1", name="read", arguments={})],
+            usage=usage,
+        )
+
+    monkeypatch.setattr(runner_mod.Agent, "get", AsyncMock(return_value=agent))
+    monkeypatch.setattr(runner_mod.Provider, "get", lambda provider_id: provider)
+    monkeypatch.setattr(runner_mod.Provider, "apply_config", AsyncMock(return_value=None))
+    monkeypatch.setattr(runner_mod.SessionPrompt, "build_system_prompts", AsyncMock(return_value=[]))
+    monkeypatch.setattr(runner, "_build_callable_tool_schema", AsyncMock(return_value=[]))
+    monkeypatch.setattr(
+        runner,
+        "_to_chat_messages",
+        AsyncMock(return_value=[SimpleNamespace(role="user", content="hi")]),
+    )
+    monkeypatch.setattr(runner_mod.Message, "get_text_content", AsyncMock(return_value="hi"))
+    monkeypatch.setattr(runner_mod.Message, "create", AsyncMock(return_value=assistant_msg))
+    monkeypatch.setattr(runner_mod.Message, "update", update_mock)
+    monkeypatch.setattr(runner, "_record_usage_if_available", record_usage_mock)
+    monkeypatch.setattr(runner, "_call_llm", fake_call_llm)
+
+    result = await runner._process_step([last_user], last_user)
+
+    assert result.action == "stop"
+    assert result.content == "partial answer"
+    assert any(
+        call.args[1] == assistant_msg.id
+        and call.kwargs.get("finish") == "error"
+        and call.kwargs.get("error", {}).get("name") == "MessageAbortedError"
+        for call in update_mock.await_args_list
+    )
+    assert not any(
+        call.args[1] == assistant_msg.id and call.kwargs.get("finish") in {"stop", "tool-calls"}
+        for call in update_mock.await_args_list
+    )
+    record_usage_mock.assert_awaited_once_with(usage, message_id=assistant_msg.id)
+
+
+@pytest.mark.asyncio
 async def test_call_llm_skips_observability_when_langfuse_inactive(monkeypatch):
     runner = _make_runner("ses_runner_langfuse_inactive")
     runner.callbacks = RunnerCallbacks()
@@ -1932,6 +2527,167 @@ async def test_call_llm_skips_llm_hook_payload_preparation_without_handlers(monk
     deep_copy_mock.assert_not_called()
     run_before_mock.assert_not_awaited()
     run_after_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_process_step_persists_visible_error_when_provider_missing(monkeypatch):
+    runner = _make_runner("ses_runner_missing_provider_error")
+    user = await Message.create(
+        runner.session.id,
+        MessageRole.USER,
+        "hello",
+        agent="rex",
+        model={"providerID": "missing-provider", "modelID": "missing-model"},
+    )
+    messages = await Message.list(runner.session.id)
+    agent = SimpleNamespace(name="rex", tools=[], steps=5, prompt=None)
+    events = []
+    callback_errors = []
+
+    async def publish_event(event_name, payload):
+        events.append((event_name, payload))
+
+    async def on_error(error):
+        callback_errors.append(error)
+
+    monkeypatch.setattr(runner_mod.Agent, "get", AsyncMock(return_value=agent))
+    monkeypatch.setattr(runner_mod.Provider, "get", staticmethod(lambda _provider_id: None))
+
+    runner.provider_id = "missing-provider"
+    runner.model_id = "missing-model"
+    runner.callbacks = RunnerCallbacks(
+        on_error=on_error,
+        event_publish_callback=publish_event,
+    )
+
+    result = await runner._process_step(messages, user)
+    messages_with_parts = await Message.list_with_parts(runner.session.id)
+    assistant = next(item for item in messages_with_parts if item.info.role == MessageRole.ASSISTANT)
+    visible_text_parts = [
+        part for part in assistant.parts
+        if getattr(part, "type", None) == "text" and getattr(part, "text", "").strip()
+    ]
+
+    assert result.action == "stop"
+    assert result.error == runner_mod.CONNECTION_ERROR_DISPLAY_MESSAGE
+    assert callback_errors == [runner_mod.CONNECTION_ERROR_DISPLAY_MESSAGE]
+    assert assistant.info.finish == "error"
+    assert assistant.info.error["name"] == "ProviderUnavailableError"
+    assert visible_text_parts
+    assert visible_text_parts[0].text == runner_mod.CONNECTION_ERROR_DISPLAY_MESSAGE
+    assert any(event_name == "message.part.updated" for event_name, _payload in events)
+
+
+@pytest.mark.asyncio
+async def test_process_step_persists_visible_error_when_provider_not_configured(monkeypatch):
+    runner = _make_runner("ses_runner_unconfigured_provider_error")
+    user = await Message.create(
+        runner.session.id,
+        MessageRole.USER,
+        "hello",
+        agent="rex",
+        model={"providerID": "unconfigured-provider", "modelID": "unconfigured-model"},
+    )
+    messages = await Message.list(runner.session.id)
+    agent = SimpleNamespace(name="rex", tools=[], steps=5, prompt=None)
+    events = []
+    callback_errors = []
+
+    class UnconfiguredProvider:
+        def is_configured(self):
+            return False
+
+    async def publish_event(event_name, payload):
+        events.append((event_name, payload))
+
+    async def on_error(error):
+        callback_errors.append(error)
+
+    monkeypatch.setattr(runner_mod.Agent, "get", AsyncMock(return_value=agent))
+    monkeypatch.setattr(runner_mod.Provider, "get", staticmethod(lambda _provider_id: UnconfiguredProvider()))
+    monkeypatch.setattr(runner_mod.Provider, "apply_config", AsyncMock(return_value=None))
+
+    runner.provider_id = "unconfigured-provider"
+    runner.model_id = "unconfigured-model"
+    runner.callbacks = RunnerCallbacks(
+        on_error=on_error,
+        event_publish_callback=publish_event,
+    )
+
+    result = await runner._process_step(messages, user)
+    messages_with_parts = await Message.list_with_parts(runner.session.id)
+    assistant = next(item for item in messages_with_parts if item.info.role == MessageRole.ASSISTANT)
+    visible_text_parts = [
+        part for part in assistant.parts
+        if getattr(part, "type", None) == "text" and getattr(part, "text", "").strip()
+    ]
+
+    assert result.action == "stop"
+    assert result.error == runner_mod.CONNECTION_ERROR_DISPLAY_MESSAGE
+    assert callback_errors == [runner_mod.CONNECTION_ERROR_DISPLAY_MESSAGE]
+    assert assistant.info.finish == "error"
+    assert assistant.info.error["name"] == "ProviderConfigurationError"
+    assert visible_text_parts
+    assert visible_text_parts[0].text == runner_mod.CONNECTION_ERROR_DISPLAY_MESSAGE
+    assert any(event_name == "message.part.updated" for event_name, _payload in events)
+
+
+@pytest.mark.asyncio
+async def test_process_step_persists_visible_error_when_model_returns_empty_stream(monkeypatch):
+    runner = _make_runner("ses_runner_empty_stream_error")
+    user = await Message.create(
+        runner.session.id,
+        MessageRole.USER,
+        "hello",
+        agent="rex",
+        model={"providerID": "empty-provider", "modelID": "empty-model"},
+    )
+    messages = await Message.list(runner.session.id)
+    agent = SimpleNamespace(name="rex", tools=[], steps=5, prompt=None, model=None)
+    events = []
+
+    class EmptyProvider:
+        def is_configured(self):
+            return True
+
+        async def chat_stream(self, **kwargs):
+            del kwargs
+            if False:
+                yield None
+
+    async def publish_event(event_name, payload):
+        events.append((event_name, payload))
+
+    monkeypatch.setattr(runner_mod.Agent, "get", AsyncMock(return_value=agent))
+    monkeypatch.setattr(runner_mod.Provider, "get", staticmethod(lambda _provider_id: EmptyProvider()))
+    monkeypatch.setattr(runner_mod.Provider, "apply_config", AsyncMock(return_value=None))
+    monkeypatch.setattr(runner_mod.SessionPrompt, "build_system_prompts", AsyncMock(return_value=[]))
+    monkeypatch.setattr(SessionRunner, "_build_callable_tool_schema", AsyncMock(return_value=[]))
+    monkeypatch.setattr(runner_mod.SessionRetry, "sleep", AsyncMock(return_value=None))
+
+    runner.provider_id = "empty-provider"
+    runner.model_id = "empty-model"
+    runner.callbacks = RunnerCallbacks(event_publish_callback=publish_event)
+
+    result = await runner._process_step(messages, user)
+    messages_with_parts = await Message.list_with_parts(runner.session.id)
+    assistant = next(item for item in messages_with_parts if item.info.role == MessageRole.ASSISTANT)
+    visible_text = "\n".join(
+        getattr(part, "text", "")
+        for part in assistant.parts
+        if getattr(part, "type", None) == "text" and getattr(part, "text", "").strip()
+    )
+
+    assert result.action == "stop"
+    assert "returned an empty response" in result.error
+    assert assistant.info.finish == "error"
+    assert assistant.info.error["name"] == "EmptyResponseError"
+    assert "returned an empty response" in visible_text
+    assert any(
+        event_name == "message.part.updated"
+        and "returned an empty response" in _payload["part"]["text"]
+        for event_name, _payload in events
+    )
 
 
 @pytest.mark.asyncio
@@ -2035,6 +2791,59 @@ async def test_process_step_records_usage_after_success(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_process_step_passes_device_hint_factory_into_build_system_prompts(monkeypatch):
+    runner = _make_runner("ses_runner_device_hint_order")
+    runner.callbacks = RunnerCallbacks(on_error=AsyncMock())
+
+    last_user = UserMessageInfo(
+        id="msg_user_device_hint_order",
+        sessionID=runner.session.id,
+        role="user",
+        time={"created": 1_000},
+        agent="rex",
+        model={"providerID": "anthropic", "modelID": "claude-sonnet"},
+    )
+
+    agent = SimpleNamespace(name="rex", steps=None, mode="primary", prompt="", tools=[])
+    provider = MagicMock()
+    provider.is_configured.return_value = True
+    assistant_msg = SimpleNamespace(id="msg_assistant_device_hint_order")
+    build_system_prompts = AsyncMock(return_value=["provider", "tool catalog awareness", "device hint"])
+
+    monkeypatch.setattr(runner_mod.Agent, "get", AsyncMock(return_value=agent))
+    monkeypatch.setattr(runner_mod.Provider, "get", lambda provider_id: provider)
+    monkeypatch.setattr(runner_mod.Provider, "apply_config", AsyncMock(return_value=None))
+    monkeypatch.setattr(runner_mod.SessionPrompt, "build_system_prompts", build_system_prompts)
+    monkeypatch.setattr(runner, "_build_callable_tool_schema", AsyncMock(return_value=[]))
+    device_hint_mock = AsyncMock(return_value="device hint")
+    monkeypatch.setattr(runner, "_build_device_asset_hint", device_hint_mock)
+    monkeypatch.setattr("flocks.tool.device.store.device_revision", lambda: 9)
+    monkeypatch.setattr(
+        runner,
+        "_to_chat_messages",
+        AsyncMock(return_value=[SimpleNamespace(role="user", content="hi")]),
+    )
+    monkeypatch.setattr(runner_mod.Message, "get_text_content", AsyncMock(return_value="hi"))
+    monkeypatch.setattr(runner_mod.Message, "parts", AsyncMock(return_value=[]))
+    monkeypatch.setattr(runner_mod.Message, "create", AsyncMock(return_value=assistant_msg))
+    monkeypatch.setattr(runner_mod.Message, "update", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        runner,
+        "_call_llm",
+        AsyncMock(return_value=StepResult(action="stop", content="done")),
+    )
+
+    result = await runner._process_step([last_user], last_user)
+
+    assert result.content == "done"
+    build_system_prompts.assert_awaited_once()
+    kwargs = build_system_prompts.await_args.kwargs
+    assert kwargs["device_revision"] == 9
+    assert kwargs["device_asset_prompt_factory"] is not None
+    assert await kwargs["device_asset_prompt_factory"]() == "device hint"
+
+
+@pytest.mark.asyncio
 async def test_process_step_empty_retry_records_usage_per_attempt(monkeypatch):
     """Each empty-response attempt records its own usage so that provider
     charges are not lost when the model returns tokens but no content."""
@@ -2094,6 +2903,109 @@ async def test_process_step_empty_retry_records_usage_per_attempt(monkeypatch):
     assert record_mock.await_count == 2
     record_mock.assert_any_await(first_usage, message_id=assistant_msg.id)
     record_mock.assert_any_await(second_usage, message_id=assistant_msg.id)
+
+
+@pytest.mark.asyncio
+async def test_process_step_retries_empty_transport_exception(monkeypatch):
+    runner = _make_runner("ses_runner_transport_retry")
+    runner.callbacks = RunnerCallbacks(on_error=AsyncMock())
+
+    last_user = UserMessageInfo(
+        id="msg_user_transport_retry",
+        sessionID=runner.session.id,
+        role="user",
+        time={"created": 1_000},
+        agent="rex",
+        model={"providerID": "openai", "modelID": "gpt-5"},
+    )
+    agent = SimpleNamespace(name="rex", steps=None, mode="primary", prompt="", tools=[])
+    provider = MagicMock()
+    provider.is_configured.return_value = True
+    assistant_msg = SimpleNamespace(id="msg_assistant_transport_retry")
+    call_llm_mock = AsyncMock(
+        side_effect=[
+            httpcore.ReadError(),
+            StepResult(action="stop", content="recovered"),
+        ]
+    )
+    sleep_mock = AsyncMock(return_value=None)
+
+    monkeypatch.setattr(runner_mod.Agent, "get", AsyncMock(return_value=agent))
+    monkeypatch.setattr(runner_mod.Provider, "get", lambda provider_id: provider)
+    monkeypatch.setattr(runner_mod.Provider, "apply_config", AsyncMock(return_value=None))
+    monkeypatch.setattr(runner_mod.SessionPrompt, "build_system_prompts", AsyncMock(return_value=[]))
+    monkeypatch.setattr(runner, "_build_callable_tool_schema", AsyncMock(return_value=[]))
+    monkeypatch.setattr(
+        runner,
+        "_to_chat_messages",
+        AsyncMock(return_value=[SimpleNamespace(role="user", content="hi")]),
+    )
+    monkeypatch.setattr(runner_mod.Message, "get_text_content", AsyncMock(return_value="hi"))
+    monkeypatch.setattr(runner_mod.Message, "create", AsyncMock(return_value=assistant_msg))
+    monkeypatch.setattr(runner_mod.Message, "update", AsyncMock(return_value=None))
+    monkeypatch.setattr(runner, "_call_llm", call_llm_mock)
+    monkeypatch.setattr(runner_mod.SessionRetry, "sleep", sleep_mock)
+
+    result = await runner._process_step([last_user], last_user)
+
+    assert result.content == "recovered"
+    assert call_llm_mock.await_count == 2
+    sleep_mock.assert_awaited_once()
+    runner.callbacks.on_error.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_process_step_does_not_retry_after_tool_execution_started(monkeypatch):
+    runner = _make_runner("ses_runner_tool_side_effect_no_retry")
+    runner.callbacks = RunnerCallbacks(on_error=AsyncMock())
+
+    last_user = UserMessageInfo(
+        id="msg_user_tool_side_effect_no_retry",
+        sessionID=runner.session.id,
+        role="user",
+        time={"created": 1_000},
+        agent="rex",
+        model={"providerID": "openai", "modelID": "gpt-5"},
+    )
+    agent = SimpleNamespace(name="rex", steps=None, mode="primary", prompt="", tools=[])
+    provider = MagicMock()
+    provider.is_configured.return_value = True
+    assistant_msg = SimpleNamespace(id="msg_assistant_tool_side_effect_no_retry")
+    call_count = 0
+    sleep_mock = AsyncMock(return_value=None)
+
+    async def _call_llm(*_args, **_kwargs):
+        nonlocal call_count
+        call_count += 1
+        runner._attempt_state.tool_execution_started = True
+        raise httpcore.ReadError()
+
+    monkeypatch.setattr(runner_mod.Agent, "get", AsyncMock(return_value=agent))
+    monkeypatch.setattr(runner_mod.Provider, "get", lambda provider_id: provider)
+    monkeypatch.setattr(runner_mod.Provider, "apply_config", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        runner_mod.SessionPrompt,
+        "build_system_prompts",
+        AsyncMock(return_value=[]),
+    )
+    monkeypatch.setattr(runner, "_build_callable_tool_schema", AsyncMock(return_value=[]))
+    monkeypatch.setattr(
+        runner,
+        "_to_chat_messages",
+        AsyncMock(return_value=[SimpleNamespace(role="user", content="hi")]),
+    )
+    monkeypatch.setattr(runner_mod.Message, "get_text_content", AsyncMock(return_value="hi"))
+    monkeypatch.setattr(runner_mod.Message, "create", AsyncMock(return_value=assistant_msg))
+    monkeypatch.setattr(runner_mod.Message, "update", AsyncMock(return_value=None))
+    monkeypatch.setattr(runner_mod.SessionRetry, "sleep", sleep_mock)
+    monkeypatch.setattr(runner, "_call_llm", _call_llm)
+
+    result = await runner._process_step([last_user], last_user)
+
+    assert call_count == 1
+    assert result.action == "stop"
+    assert result.error == runner_mod.CONNECTION_ERROR_DISPLAY_MESSAGE
+    sleep_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio

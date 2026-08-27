@@ -244,8 +244,9 @@ class ModelCapabilitiesV2(BaseModel):
     supports_streaming: bool = True
     supports_tools: bool = True
     supports_vision: bool = False
-    supports_reasoning: bool = False
+    supports_reasoning: bool = True
     interleaved: Optional[Dict[str, Any]] = None
+    thinking_level_map: Optional[Dict[str, Optional[str]]] = None
     supports_temperature: bool = True
     supports_json_mode: bool = False
     supports_structured_output: bool = False

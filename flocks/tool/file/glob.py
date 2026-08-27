@@ -24,6 +24,7 @@ log = Log.create(service="tool.glob")
 
 # Constants
 MAX_FILES = 100
+_ripgrep_fallback_logged = False
 
 
 # Description matching Flocks' glob.txt
@@ -32,7 +33,7 @@ DESCRIPTION = """- Fast file pattern matching tool that works with any codebase 
 - Returns matching file paths sorted by modification time
 - Use this tool when you need to find files by name patterns
 - When you are doing an open-ended search that may require multiple rounds of globbing and grepping, prefer delegating that exploration or use a more specialized search workflow
-- You have the capability to call multiple tools in a single response. It is always better to speculatively perform multiple searches as a batch that are potentially useful."""
+- You may call multiple independent tools in the same response. Prefer separate parallel Glob calls when multiple searches are likely to be useful."""
 
 
 def find_ripgrep() -> Optional[str]:
@@ -153,24 +154,18 @@ async def glob_tool(
         ToolResult with matching files
     """
     try:
-        resolution = await resolve_tool_path(ctx, path or ".")
+        resolution = await resolve_tool_path(
+            ctx,
+            path or ".",
+            allow_host_memory=True,
+            allow_host_skills=True,
+        )
     except ValueError as exc:
         return ToolResult(success=False, error=str(exc), title=path or pattern)
 
     search_path = resolution.resolved_path
     title = resolution.display_path
 
-    # Request permission
-    await ctx.ask(
-        permission="glob",
-        patterns=[resolution.permission_pattern],
-        always=["*"],
-        metadata={
-            "pattern": pattern,
-            "path": search_path,
-        }
-    )
-    
     # Find files
     rg_path = find_ripgrep()
     files: List[Dict[str, Any]] = []
@@ -195,7 +190,10 @@ async def glob_tool(
                     'mtime': mtime
                 })
         else:
-            log.warn("glob.ripgrep_not_found", {"fallback": "python_glob"})
+            global _ripgrep_fallback_logged
+            if not _ripgrep_fallback_logged:
+                _ripgrep_fallback_logged = True
+                log.info("glob.ripgrep_not_found", {"fallback": "python_glob"})
             
             for filepath in fallback_glob(search_path, pattern):
                 if len(files) >= MAX_FILES:
